@@ -3,6 +3,7 @@
 #
 # Usage:
 #   make package              Build .deb package
+#   make install              Install directly from source (no .deb)
 #   make deploy TARGET=root@host        SCP + install on target host
 #   make clean                Remove build artifacts
 #   make version              Show current version
@@ -18,7 +19,7 @@ BUILD_DIR   := build
 PKG_DIR     := $(BUILD_DIR)/$(PKG_NAME)_$(VERSION)_$(ARCH)
 DEB_FILE    := $(PKG_DIR).deb
 
-.PHONY: package clean deploy version
+.PHONY: package clean deploy version install
 
 version:
 	@echo "$(PKG_NAME) $(VERSION)"
@@ -91,6 +92,83 @@ deploy:
 	ssh $(TARGET) "dpkg -i /tmp/$(PKG_NAME)_$(VERSION)_$(ARCH).deb && rm -f /tmp/$(PKG_NAME)_$(VERSION)_$(ARCH).deb"
 	@echo ""
 	@echo "=== Deployed $(PKG_NAME) $(VERSION) to $(TARGET) ==="
+
+install:
+	@echo "=== Installing $(PKG_NAME) $(VERSION) to $(INSTALL_DIR) ==="
+	@test "$$(id -u)" = "0" || { echo "Error: make install must be run as root (use sudo)"; exit 1; }
+
+	# --- Create directory structure ---
+	mkdir -p $(INSTALL_DIR)/modules
+	mkdir -p $(INSTALL_DIR)/lib
+	mkdir -p $(INSTALL_DIR)/transports
+	mkdir -p $(INSTALL_DIR)/cloud_transports
+	mkdir -p $(INSTALL_DIR)/config/template
+
+	# --- Install files with correct permissions ---
+	install -m 750 vmbackup.sh             $(INSTALL_DIR)/
+	install -m 640 modules/*.sh            $(INSTALL_DIR)/modules/
+	install -m 640 lib/*.sh                $(INSTALL_DIR)/lib/
+	install -m 750 transports/*.sh         $(INSTALL_DIR)/transports/
+	install -m 750 cloud_transports/*.sh   $(INSTALL_DIR)/cloud_transports/
+	install -m 640 config/template/*       $(INSTALL_DIR)/config/template/
+	install -m 644 vmbackup.md             $(INSTALL_DIR)/
+
+	# --- Default config: copy template if no existing config ---
+	@if [ ! -d "$(INSTALL_DIR)/config/default" ]; then \
+		mkdir -p $(INSTALL_DIR)/config/default; \
+		install -m 640 config/default/* $(INSTALL_DIR)/config/default/; \
+		echo "Config: created $(INSTALL_DIR)/config/default/ from defaults"; \
+	else \
+		echo "Config: $(INSTALL_DIR)/config/default/ already exists, not overwritten"; \
+	fi
+
+	# --- AppArmor snippet ---
+	mkdir -p /etc/apparmor.d/local/abstractions
+	install -m 644 apparmor/libvirt-qemu.local /etc/apparmor.d/local/abstractions/libvirt-qemu
+
+	# --- systemd units ---
+	install -m 644 systemd/vmbackup.service /lib/systemd/system/
+	install -m 644 systemd/vmbackup.timer   /lib/systemd/system/
+
+	# --- PATH symlink ---
+	ln -sf $(INSTALL_DIR)/vmbackup.sh /usr/local/bin/vmbackup
+
+	# --- Ensure backup group exists ---
+	@if ! getent group backup >/dev/null 2>&1; then \
+		addgroup --system backup; \
+	fi
+
+	# --- Ownership and permissions ---
+	chown -R root:backup $(INSTALL_DIR)
+	chmod 750 $(INSTALL_DIR)
+	mkdir -p /var/log/vmbackup /run/vmbackup
+	chown root:backup /var/log/vmbackup /run/vmbackup
+	chmod 750 /var/log/vmbackup /run/vmbackup
+
+	# --- Reload AppArmor profiles if active ---
+	@if command -v aa-status >/dev/null 2>&1 && aa-status --enabled 2>/dev/null; then \
+		for profile in /etc/apparmor.d/libvirt/libvirt-*; do \
+			case "$$profile" in *.files) continue;; esac; \
+			case "$$(basename $$profile)" in TEMPLATE.qemu) continue;; esac; \
+			apparmor_parser -r "$$profile" 2>/dev/null || true; \
+		done; \
+		echo "AppArmor: reloaded libvirt VM profiles"; \
+	fi
+
+	# --- systemd ---
+	systemctl daemon-reload 2>/dev/null || true
+	@if ! systemctl is-enabled vmbackup.timer >/dev/null 2>&1; then \
+		systemctl enable vmbackup.timer 2>/dev/null || true; \
+	fi
+
+	@echo ""
+	@echo "=== $(PKG_NAME) $(VERSION) installed ==="
+	@echo ""
+	@echo "  Command:       vmbackup --version"
+	@echo "  Timer:         sudo systemctl start vmbackup.timer"
+	@echo "  Manual run:    sudo vmbackup"
+	@echo "  Config:        $(INSTALL_DIR)/config/default/"
+	@echo ""
 
 clean:
 	rm -rf $(BUILD_DIR)

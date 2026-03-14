@@ -82,10 +82,9 @@ The package installs to `/opt/vmbackup/` and sets up:
 ### From Source
 
 ```bash
-git clone https://github.com/doutsis/vmbackup.git
-cd vmbackup
-make package
-sudo dpkg -i build/vmbackup_0.5.0_all.deb
+sudo git clone https://github.com/doutsis/vmbackup.git /opt/vmbackup
+cd /opt/vmbackup
+sudo make install
 ```
 
 ### Uninstall
