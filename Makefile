@@ -98,25 +98,29 @@ install:
 	@test "$$(id -u)" = "0" || { echo "Error: make install must be run as root (use sudo)"; exit 1; }
 
 	# --- Create directory structure ---
+	mkdir -p $(INSTALL_DIR)
 	mkdir -p $(INSTALL_DIR)/modules
 	mkdir -p $(INSTALL_DIR)/lib
 	mkdir -p $(INSTALL_DIR)/transports
 	mkdir -p $(INSTALL_DIR)/cloud_transports
 	mkdir -p $(INSTALL_DIR)/config/template
 
-	# --- Set file permissions ---
-	chmod 750 $(INSTALL_DIR)/vmbackup.sh
-	chmod 640 $(INSTALL_DIR)/modules/*.sh
-	chmod 640 $(INSTALL_DIR)/lib/*.sh
-	chmod 750 $(INSTALL_DIR)/transports/*.sh
-	chmod 750 $(INSTALL_DIR)/cloud_transports/*.sh
-	chmod 640 $(INSTALL_DIR)/config/template/*
-	chmod 644 $(INSTALL_DIR)/vmbackup.md
+	# --- Install files with correct permissions ---
+	install -m 750 vmbackup.sh             $(INSTALL_DIR)/
+	install -m 640 modules/*.sh            $(INSTALL_DIR)/modules/
+	install -m 640 lib/*.sh                $(INSTALL_DIR)/lib/
+	install -m 750 transports/*.sh         $(INSTALL_DIR)/transports/
+	install -m 750 cloud_transports/*.sh   $(INSTALL_DIR)/cloud_transports/
+	install -m 640 config/template/*       $(INSTALL_DIR)/config/template/
+	install -m 644 vmbackup.md             $(INSTALL_DIR)/
 
-	# --- Default config: set permissions (template already in place from clone) ---
-	@if [ -d "$(INSTALL_DIR)/config/default" ]; then \
-		chmod 640 $(INSTALL_DIR)/config/default/*; \
-		echo "Config: set permissions on $(INSTALL_DIR)/config/default/"; \
+	# --- Default config: copy template if no existing config ---
+	@if [ ! -d "$(INSTALL_DIR)/config/default" ]; then \
+		mkdir -p $(INSTALL_DIR)/config/default; \
+		install -m 640 config/default/* $(INSTALL_DIR)/config/default/; \
+		echo "Config: installed defaults to $(INSTALL_DIR)/config/default/"; \
+	else \
+		echo "Config: $(INSTALL_DIR)/config/default/ already exists, not overwritten"; \
 	fi
 
 	# --- AppArmor snippet ---
@@ -132,7 +136,7 @@ install:
 
 	# --- Ensure backup group exists ---
 	@if ! getent group backup >/dev/null 2>&1; then \
-		addgroup --system backup; \
+		groupadd --system backup; \
 	fi
 
 	# --- Ownership and permissions ---

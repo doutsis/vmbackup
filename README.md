@@ -82,8 +82,8 @@ The package installs to `/opt/vmbackup/` and sets up:
 ### From Source
 
 ```bash
-sudo git clone https://github.com/doutsis/vmbackup.git /opt/vmbackup
-cd /opt/vmbackup
+git clone https://github.com/doutsis/vmbackup.git /tmp/vmbackup
+cd /tmp/vmbackup
 sudo make install
 ```
 
