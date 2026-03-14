@@ -1,0 +1,4 @@
+# Allow virtnbdbackup NBD sockets (installed by vmbackup)
+# virtnbdbackup creates Unix sockets in /var/tmp/ for QEMU NBD communication.
+# Without this rule, AppArmor blocks socket access and backups fail.
+/var/tmp/virtnbdbackup.* rwk,

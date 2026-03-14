@@ -1,0 +1,33 @@
+[Unit]
+Description=VM Backup Service
+Documentation=https://github.com/doutsis/vmbackup
+After=libvirtd.service
+Requires=libvirtd.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/vmbackup/vmbackup.sh
+# Uses the 'default' config instance at /opt/vmbackup/config/default/
+# To use a different config instance:
+#   sudo systemctl edit vmbackup.service
+# Then add:
+#   [Service]
+#   ExecStart=
+#   ExecStart=/opt/vmbackup/vmbackup.sh --config-instance myinstance
+TimeoutStartSec=43200
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=5
+
+# Security: restrict file creation permissions
+# Dirs → 750 (rwxr-x---), Files → 640 (rw-r-----)
+# Belt-and-suspenders with umask 027 in vmbackup.sh itself.
+UMask=0027
+
+# Logging goes to journald (accessible via: journalctl -u vmbackup.service)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=vmbackup
+
+[Install]
+WantedBy=multi-user.target
