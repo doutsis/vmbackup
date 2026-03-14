@@ -81,7 +81,7 @@ package: clean
 	@echo "=== Package built: $(DEB_FILE) ==="
 	@echo "    Size: $$(du -h $(DEB_FILE) | cut -f1)"
 	@echo ""
-	@echo "To deploy:  make deploy TARGET=root@REDACTED"
+	@echo "To deploy:  make deploy TARGET=root@host"
 
 deploy:
 	@test -n "$(TARGET)" || { echo "Usage: make deploy TARGET=user@host"; exit 1; }
