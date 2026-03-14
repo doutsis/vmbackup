@@ -104,22 +104,19 @@ install:
 	mkdir -p $(INSTALL_DIR)/cloud_transports
 	mkdir -p $(INSTALL_DIR)/config/template
 
-	# --- Install files with correct permissions ---
-	install -m 750 vmbackup.sh             $(INSTALL_DIR)/
-	install -m 640 modules/*.sh            $(INSTALL_DIR)/modules/
-	install -m 640 lib/*.sh                $(INSTALL_DIR)/lib/
-	install -m 750 transports/*.sh         $(INSTALL_DIR)/transports/
-	install -m 750 cloud_transports/*.sh   $(INSTALL_DIR)/cloud_transports/
-	install -m 640 config/template/*       $(INSTALL_DIR)/config/template/
-	install -m 644 vmbackup.md             $(INSTALL_DIR)/
+	# --- Set file permissions ---
+	chmod 750 $(INSTALL_DIR)/vmbackup.sh
+	chmod 640 $(INSTALL_DIR)/modules/*.sh
+	chmod 640 $(INSTALL_DIR)/lib/*.sh
+	chmod 750 $(INSTALL_DIR)/transports/*.sh
+	chmod 750 $(INSTALL_DIR)/cloud_transports/*.sh
+	chmod 640 $(INSTALL_DIR)/config/template/*
+	chmod 644 $(INSTALL_DIR)/vmbackup.md
 
-	# --- Default config: copy template if no existing config ---
-	@if [ ! -d "$(INSTALL_DIR)/config/default" ]; then \
-		mkdir -p $(INSTALL_DIR)/config/default; \
-		install -m 640 config/default/* $(INSTALL_DIR)/config/default/; \
-		echo "Config: created $(INSTALL_DIR)/config/default/ from defaults"; \
-	else \
-		echo "Config: $(INSTALL_DIR)/config/default/ already exists, not overwritten"; \
+	# --- Default config: set permissions (template already in place from clone) ---
+	@if [ -d "$(INSTALL_DIR)/config/default" ]; then \
+		chmod 640 $(INSTALL_DIR)/config/default/*; \
+		echo "Config: set permissions on $(INSTALL_DIR)/config/default/"; \
 	fi
 
 	# --- AppArmor snippet ---
