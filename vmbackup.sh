@@ -2,6 +2,7 @@
 
 #################################################################################
 # VM Backup Script - Production-Grade Backup Manager for libvirt/KVM VMs
+# Vibe coded by James Doutsis - james@doutsis.com
 # 
 # Features:
 #   - Monthly YYYYMM directory structure with weekly checkpoint consolidation
