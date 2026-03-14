@@ -1,0 +1,12 @@
+[Unit]
+Description=VM Backup Timer
+Documentation=https://github.com/doutsis/vmbackup
+
+[Timer]
+# Run daily at 1:00 AM, with up to 5 minutes random delay to avoid thundering herd
+OnCalendar=*-*-* 01:00:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

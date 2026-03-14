@@ -1,0 +1,47 @@
+#!/bin/bash
+# postrm - runs after package removal
+set -e
+
+case "$1" in
+    remove)
+        # Stop and disable systemd units
+        systemctl stop vmbackup.timer 2>/dev/null || true
+        systemctl disable vmbackup.timer 2>/dev/null || true
+        systemctl stop vmbackup.service 2>/dev/null || true
+        systemctl daemon-reload 2>/dev/null || true
+
+        # Remove symlink
+        rm -f /usr/local/bin/vmbackup
+        echo "vmbackup removed. Config files in /opt/vmbackup/config/ preserved."
+        echo "To fully clean up: rm -rf /opt/vmbackup /var/log/vmbackup"
+        ;;
+    purge)
+        # Stop and disable systemd units
+        systemctl stop vmbackup.timer 2>/dev/null || true
+        systemctl disable vmbackup.timer 2>/dev/null || true
+        systemctl stop vmbackup.service 2>/dev/null || true
+        systemctl daemon-reload 2>/dev/null || true
+
+        # Remove AppArmor snippet if it's ours
+        aa_file="/etc/apparmor.d/local/abstractions/libvirt-qemu"
+        if [[ -f "$aa_file" ]] && grep -q "installed by vmbackup" "$aa_file" 2>/dev/null; then
+            rm -f "$aa_file"
+            # Reload libvirt profiles to remove the rule
+            for profile in /etc/apparmor.d/libvirt/libvirt-*; do
+                [[ "$profile" == *.files ]] && continue
+                [[ "$(basename "$profile")" == "TEMPLATE.qemu" ]] && continue
+                apparmor_parser -r "$profile" 2>/dev/null || true
+            done
+        fi
+
+        # Full cleanup
+        rm -f /usr/local/bin/vmbackup
+        rm -rf /var/log/vmbackup
+        rm -rf /run/vmbackup
+        # Note: /opt/vmbackup/ is removed by dpkg for packaged files,
+        # but user-created config instances will remain
+        echo "vmbackup purged."
+        ;;
+esac
+
+exit 0

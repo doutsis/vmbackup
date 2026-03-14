@@ -1,0 +1,31 @@
+# Archive (historical/resolved docs)
+archive/
+
+# Backup/old files
+*.backup.*
+*.old
+*.dpkg-dist
+*.dpkg-old
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Temporary files
+*.tmp
+*.tmp.*
+
+# Editor
+*.swp
+*.swo
+*~
+
+# Debian packaging build artifacts
+build/
+*.deb
+*.buildinfo
+*.changes
+*.tar.gz
+*.tar.xz
+*.dsc

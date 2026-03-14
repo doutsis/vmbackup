@@ -1,0 +1,15 @@
+Package: vmbackup
+Version: __VERSION__
+Architecture: all
+Maintainer: James Doutsis <james@doutsis.com>
+Depends: bash (>= 5.0), libvirt-daemon-system, qemu-utils, sqlite3, jq, coreutils, util-linux
+Recommends: msmtp, rclone
+Suggests: virtnbdbackup
+Section: admin
+Priority: optional
+Homepage: https://github.com/doutsis/vmbackup
+Description: Production-grade backup manager for libvirt/KVM virtual machines
+ Automated full + incremental backups using virtnbdbackup with monthly directory
+ structure, weekly checkpoint consolidation, per-VM rotation policies, QEMU guest
+ agent integration, SharePoint/cloud replication, email reporting, and configurable
+ retention management. Supports multiple config instances for dev/test/prod.

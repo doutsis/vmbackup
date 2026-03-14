@@ -1,0 +1,91 @@
+#!/bin/bash
+# postinst - runs after package installation
+set -e
+
+case "$1" in
+    configure)
+        # Create symlink in PATH
+        ln -sf /opt/vmbackup/vmbackup.sh /usr/local/bin/vmbackup
+
+        # =====================================================================
+        # SECURITY HARDENING
+        # =====================================================================
+        # Ownership model: root:backup
+        #   - root: full access (runs backups via systemd)
+        #   - backup group: read access (browse backups, view logs)
+        #   - world: no access
+        #
+        # Users who need to browse backups:
+        #   sudo usermod -aG backup <username>
+        # Users who need virsh access (VM status, etc.):
+        #   sudo usermod -aG libvirt <username>
+        # =====================================================================
+
+        # Ensure backup group exists (standard Debian group, GID 34)
+        if ! getent group backup >/dev/null 2>&1; then
+            addgroup --system backup
+        fi
+
+        # Set ownership: root:backup on the entire install tree
+        chown -R root:backup /opt/vmbackup
+        chmod 750 /opt/vmbackup
+
+        # Create log directory
+        mkdir -p /var/log/vmbackup
+        chown root:backup /var/log/vmbackup
+        chmod 750 /var/log/vmbackup
+
+        # Create run directory for lock files
+        mkdir -p /run/vmbackup
+        chown root:backup /run/vmbackup
+        chmod 750 /run/vmbackup
+
+        # AppArmor: reload libvirt VM profiles if AppArmor is active
+        if command -v aa-status &>/dev/null && aa-status --enabled 2>/dev/null; then
+            reload_count=0
+            for profile in /etc/apparmor.d/libvirt/libvirt-*; do
+                [[ "$profile" == *.files ]] && continue
+                [[ "$(basename "$profile")" == "TEMPLATE.qemu" ]] && continue
+                if apparmor_parser -r "$profile" 2>/dev/null; then
+                    reload_count=$((reload_count + 1))
+                fi
+            done
+            if [[ $reload_count -gt 0 ]]; then
+                echo "AppArmor: Reloaded $reload_count libvirt VM profiles (virtnbdbackup socket access)"
+            fi
+        fi
+
+        # Reload systemd to pick up new/updated unit files
+        systemctl daemon-reload 2>/dev/null || true
+
+        # Enable the timer (but don't start it — let the admin decide when)
+        # On first install, the timer won't be running yet.
+        # On upgrade, if it was already running, systemd preserves that state.
+        if ! systemctl is-enabled vmbackup.timer &>/dev/null; then
+            systemctl enable vmbackup.timer 2>/dev/null || true
+        fi
+
+        echo ""
+        echo "=== vmbackup $(cat /opt/vmbackup/vmbackup.sh | grep '^VMBACKUP_VERSION=' | sed 's/.*"\(.*\)"/\1/') installed ==="
+        echo ""
+        echo "  Install path:  /opt/vmbackup/"
+        echo "  Command:       vmbackup --version"
+        echo "  Timer:         systemctl start vmbackup.timer   (daily at 1:00 AM)"
+        echo "  Manual run:    systemctl start vmbackup.service"
+        echo "  Logs:          journalctl -u vmbackup.service"
+        echo ""
+        echo "  Config:        /opt/vmbackup/config/default/    (protected on upgrade)"
+        echo "  Templates:     /opt/vmbackup/config/template/"
+        echo ""
+        echo "  Security:      Files owned root:backup (750/640)"
+        echo "  Browse backups: sudo usermod -aG backup <username>"
+        echo "  virsh access:   sudo usermod -aG libvirt <username>"
+        echo ""
+        echo "  To create a new config instance:"
+        echo "    cp -r /opt/vmbackup/config/template /opt/vmbackup/config/prod"
+        echo "    systemctl edit vmbackup.service  # set --config-instance prod"
+        echo ""
+        ;;
+esac
+
+exit 0
