@@ -1,9 +1,10 @@
 ################################################################################
-# vmbackup - Debian Package Build & Deploy
+# vmbackup - Build, Install & Deploy
 #
 # Usage:
-#   make package              Build .deb package
-#   make install              Install directly from source (no .deb)
+#   make package              Build .deb package (Debian/Ubuntu)
+#   make install              Install from source (any distro)
+#   make uninstall            Remove vmbackup (keeps backup data)
 #   make deploy TARGET=root@host        SCP + install on target host
 #   make clean                Remove build artifacts
 #   make version              Show current version
@@ -19,7 +20,7 @@ BUILD_DIR   := build
 PKG_DIR     := $(BUILD_DIR)/$(PKG_NAME)_$(VERSION)_$(ARCH)
 DEB_FILE    := $(PKG_DIR).deb
 
-.PHONY: package clean deploy version install
+.PHONY: package clean deploy version install uninstall
 
 version:
 	@echo "$(PKG_NAME) $(VERSION)"
@@ -173,3 +174,27 @@ install:
 
 clean:
 	rm -rf $(BUILD_DIR)
+
+uninstall:
+	@echo "=== Uninstalling $(PKG_NAME) from $(INSTALL_DIR) ==="
+	@test "$$(id -u)" = "0" || { echo "Error: make uninstall must be run as root (use sudo)"; exit 1; }
+
+	# --- Stop and disable systemd units ---
+	systemctl stop vmbackup.timer 2>/dev/null || true
+	systemctl stop vmbackup.service 2>/dev/null || true
+	systemctl disable vmbackup.timer 2>/dev/null || true
+
+	# --- Remove installed files ---
+	rm -f /usr/local/bin/vmbackup
+	rm -f /lib/systemd/system/vmbackup.service
+	rm -f /lib/systemd/system/vmbackup.timer
+	rm -f /etc/apparmor.d/local/abstractions/libvirt-qemu
+	rm -rf $(INSTALL_DIR)
+	rm -rf /var/log/vmbackup
+
+	systemctl daemon-reload 2>/dev/null || true
+
+	@echo ""
+	@echo "=== $(PKG_NAME) uninstalled ==="
+	@echo "Backup data was not touched."
+	@echo ""

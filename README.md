@@ -15,12 +15,22 @@ vmbackup is that wrapper. It orchestrates virtnbdbackup across your entire fleet
 
 ## Quick Start
 
+**Debian / Ubuntu:**
+
 ```bash
 wget https://github.com/doutsis/vmbackup/releases/download/v0.5.0/vmbackup_0.5.0_all.deb
 sudo dpkg -i vmbackup_0.5.0_all.deb
 ```
 
-Edit `/opt/vmbackup/config/default/vmbackup.conf` to set your backup path and preferences, then:
+**Any distro (Arch, Fedora, openSUSE, etc.):**
+
+```bash
+git clone https://github.com/doutsis/vmbackup.git
+cd vmbackup
+sudo make install
+```
+
+Then edit `/opt/vmbackup/config/default/vmbackup.conf` to set your backup path and preferences:
 
 ```bash
 sudo vmbackup                            # run a backup now
@@ -64,7 +74,7 @@ vmbackup.sh              ← main script
 
 Requires `bash >= 5.0`, `libvirt-daemon-system`, `qemu-utils`, [virtnbdbackup](https://github.com/abbbi/virtnbdbackup), `sqlite3` and `jq`. Optionally `msmtp` for email reports and `rclone` for cloud replication.
 
-### From .deb Package (Recommended)
+### From .deb Package (Debian / Ubuntu)
 
 Download the latest `.deb` from [Releases](https://github.com/doutsis/vmbackup/releases):
 
@@ -73,28 +83,36 @@ wget https://github.com/doutsis/vmbackup/releases/download/v0.5.0/vmbackup_0.5.0
 sudo dpkg -i vmbackup_0.5.0_all.deb
 ```
 
-The package installs to `/opt/vmbackup/` and sets up:
+### From Source (any distro)
+
+```bash
+git clone https://github.com/doutsis/vmbackup.git
+cd vmbackup
+sudo make install
+```
+
+Both methods install to `/opt/vmbackup/` and set up:
 - `vmbackup` command in PATH
 - `root:backup` ownership with restricted permissions
 - systemd service and timer units
 - AppArmor profile for libvirt/QEMU integration
 
-### From Source
-
-```bash
-git clone https://github.com/doutsis/vmbackup.git /tmp/vmbackup
-cd /tmp/vmbackup
-sudo make install
-```
-
 ### Uninstall
+
+**Debian / Ubuntu (.deb install):**
 
 ```bash
 sudo apt remove vmbackup    # remove but keep config
 sudo apt purge vmbackup     # remove everything including config and logs
 ```
 
-Remove keeps your configuration under `/opt/vmbackup/config/` so you can reinstall later without reconfiguring. Purge deletes config files, logs and the AppArmor profile. Backup data is never touched by either — it lives wherever you configured `BACKUP_PATH`.
+**From source (make install):**
+
+```bash
+sudo make uninstall
+```
+
+Remove keeps your configuration under `/opt/vmbackup/config/` so you can reinstall later without reconfiguring. Purge (or `make uninstall`) deletes config files, logs and the AppArmor profile. Backup data is never touched — it lives wherever you configured `BACKUP_PATH`.
 
 ## Configuration
 
@@ -180,7 +198,7 @@ vmbackup enforces `root:backup` ownership across everything it touches — the i
 
 ### The backup group
 
-The `backup` group (GID 34) is a standard Debian system group. The `.deb` package creates it if it doesn't already exist. All vmbackup files are owned `root:backup` so that root can write backups and members of the `backup` group can read them.
+The `backup` group (GID 34) is a standard system group. Both the `.deb` package and `make install` create it if it doesn't already exist. All vmbackup files are owned `root:backup` so that root can write backups and members of the `backup` group can read them.
 
 To browse backups, check logs or query the SQLite database, add your user to the group:
 
