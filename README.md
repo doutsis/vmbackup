@@ -13,22 +13,6 @@ vmbackup automates virtnbdbackup — scheduling, rotation, retention, chain inte
 - **Per-VM overrides** — retention, compression and exclusion rules per VM when one size doesn't fit
 - **Bash + SQLite** — no Python runtime, no database server, no web UI. Just libvirt, qemu-utils, sqlite3 and jq
 
-## Quick Start
-
-```bash
-# Install from .deb
-sudo dpkg -i vmbackup_0.5.0_all.deb
-
-# Edit configuration
-sudo nano /opt/vmbackup/config/default/vmbackup.conf
-
-# Start the backup timer (daily at 1:00 AM)
-sudo systemctl start vmbackup.timer
-
-# Or run a backup immediately
-sudo systemctl start vmbackup.service
-```
-
 ## How It Works
 
 vmbackup wraps `virtnbdbackup` and manages the full backup lifecycle:
