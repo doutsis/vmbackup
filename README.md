@@ -3,9 +3,9 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Version](https://img.shields.io/github/v/release/doutsis/vmbackup)](https://github.com/doutsis/vmbackup/releases)
 
-Automated backup manager for KVM/libvirt virtual machines, built on [virtnbdbackup](https://github.com/abbbi/virtnbdbackup).
+The backup half of the [vmbackup](https://github.com/doutsis/vmbackup) / [vmrestore](https://github.com/doutsis/vmrestore) ecosystem. Automated backup manager for KVM/libvirt virtual machines, built on [virtnbdbackup](https://github.com/abbbi/virtnbdbackup).
 
-vmbackup automates virtnbdbackup — scheduling, rotation, retention, backup validation, replication and reporting. It works on personal machines, homelabs and production KVM hosts alike.
+vmbackup automates virtnbdbackup — scheduling, rotation, retention, backup validation, replication and reporting. It works on personal machines, homelabs and production KVM hosts alike. For restores, see [vmrestore](https://github.com/doutsis/vmrestore).
 
 ## Why vmbackup
 
@@ -244,6 +244,16 @@ Replication runs after backup completes.  Local and cloud replication operate in
 **Cloud replication** uses rclone to sync to SharePoint, Backblaze, S3 or any rclone-supported backend.
 
 Custom transport endpoints can be added by implementing the transport interface — five functions (`init`, `sync`, `verify`, `cleanup`, `get_free_space`) and a set of metrics globals. See the full transport interface in [vmbackup.md](vmbackup.md#transport-function-contract).
+
+## Restoring
+
+vmbackup and [vmrestore](https://github.com/doutsis/vmrestore) are two halves of one system. vmbackup backs up — vmrestore restores. They share no code and have no runtime coupling, but vmrestore exclusively restores backups created by vmbackup.
+
+vmrestore provides single-command disaster recovery, clone restores and point-in-time recovery — with full identity management, TPM/BitLocker support and pre-flight safety checks.
+
+```bash
+sudo vmrestore --vm my-vm --restore-path /var/lib/libvirt/images
+```
 
 ## Documentation
 

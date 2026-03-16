@@ -1,8 +1,11 @@
 #!/bin/bash
 
 #################################################################################
-# VM Backup Script - Production-Grade Backup Manager for libvirt/KVM VMs
-# Vibe coded by James Doutsis - james@doutsis.com
+# vmbackup — Automated Backup for libvirt/KVM Virtual Machines
+# Vibe coded by James Doutsis — james@doutsis.com
+#
+# Repository:  https://github.com/doutsis/vmbackup
+# Restore:     https://github.com/doutsis/vmrestore
 # 
 # Features:
 #   - Monthly YYYYMM directory structure with weekly checkpoint consolidation

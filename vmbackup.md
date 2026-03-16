@@ -79,6 +79,8 @@
 >
 > Backups are only as good as your restores. All backups are worthless if you cannot recover from them. **vmrestore** might be your answer.
 
+vmbackup and vmrestore are two halves of one system. vmbackup backs up — [vmrestore](https://github.com/doutsis/vmrestore) restores. They share no code, no modules, and have no runtime coupling, but vmrestore exclusively restores backups created by vmbackup. It is standalone in implementation but purpose-built for vmbackup's output.
+
 **vmbackup** is a production-grade but production untested backup manager for libvirt/KVM virtual machines. It wraps `virtnbdbackup` (v2.28+) to provide:
 
 - Incremental/full backup automation with checkpoint tracking
