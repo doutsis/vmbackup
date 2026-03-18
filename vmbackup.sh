@@ -74,7 +74,7 @@ set -o pipefail
 umask 027
 
 # Version - used by Debian packaging and --version flag
-VMBACKUP_VERSION="0.5.0"
+VMBACKUP_VERSION="0.5.1"
 
 # Dry-run mode: show what would happen without executing destructive operations
 DRY_RUN=false
@@ -997,7 +997,7 @@ _log_vm_backup_summary() {
   # Store result for session summary (now includes policy)
   VM_BACKUP_RESULTS+=("$vm_name|$status|$backup_type|$duration_human|$restore_points|$size_human|$error_msg|$policy")
   
-  # Log to SQLite database (parallel to CSV logging)
+  # Log to SQLite database
   if sqlite_is_available 2>/dev/null && [[ "$DRY_RUN" != true ]]; then
     local sqlite_status=$(echo "$status" | tr '[:upper:]' '[:lower:]')
     local backup_method="unknown"
@@ -1857,10 +1857,10 @@ get_checkpoint_depth() {
 }
 
 # Get actual restore point count from data files on disk (current chain only)
-# This counts real backup data files that can be used for restore:
-# - *.full.data (full backup)
-# - *.copy.data (copy-mode full backup)  
-# - *.inc.virtnbdbackup.*.data (incremental backups)
+# This counts logical restore points (backup operations), not individual disk files.
+# A multi-disk VM backed up once = 1 restore point (all disks together).
+# - Full/copy backup present = 1 restore point (regardless of disk count)
+# - Each distinct incremental checkpoint level = 1 additional restore point
 # Parameters: $1 = backup_dir (VM's backup directory)
 # Returns: Number of restorable backup points in the current chain
 get_restore_point_count() {
@@ -1871,27 +1871,30 @@ get_restore_point_count() {
     return
   fi
   
-  # Count data files in the root directory (current chain)
+  # Count logical restore points in the root directory (current chain)
   # Excludes .archives/ which contains archived chains
   local count=0
   
-  # Count full/copy backups (base of chain)
-  local full_count=$(find "$backup_dir" -maxdepth 1 -type f \( -name "*.full.data" -o -name "*.copy.data" \) 2>/dev/null | wc -l)
+  # A full/copy backup = 1 restore point (regardless of how many disks)
+  if find "$backup_dir" -maxdepth 1 -type f \( -name "*.full.data" -o -name "*.copy.data" \) -print -quit 2>/dev/null | grep -q .; then
+    count=1
+  fi
   
-  # Count incremental backups
-  local inc_count=$(find "$backup_dir" -maxdepth 1 -type f -name "*.inc.virtnbdbackup.*.data" 2>/dev/null | wc -l)
+  # Count distinct incremental checkpoint levels
+  # Files: *.inc.virtnbdbackup.N.data — extract unique N values
+  local inc_levels
+  inc_levels=$(find "$backup_dir" -maxdepth 1 -type f -name "*.inc.virtnbdbackup.*.data" 2>/dev/null \
+    | sed -n 's/.*\.inc\.virtnbdbackup\.\([0-9]*\)\.data$/\1/p' \
+    | sort -un | wc -l)
+  count=$((count + inc_levels))
   
-  # Total = full + incrementals
-  # Note: A chain with 1 full + 3 incrementals = 4 restore points
-  count=$((full_count + inc_count))
-  
-  log_debug "vmbackup.sh" "get_restore_point_count" "Dir='$backup_dir' full=$full_count inc=$inc_count total=$count"
+  log_debug "vmbackup.sh" "get_restore_point_count" "Dir='$backup_dir' has_full=$((count > 0 && inc_levels == 0 ? 1 : (count > inc_levels ? 1 : 0))) inc_levels=$inc_levels total=$count"
   echo "$count"
 }
 
 #################################################################################
-# CSV LOGGING HELPER FUNCTIONS
-# These functions calculate metrics for the enhanced CSV schema (v2.0)
+# BACKUP METRIC HELPER FUNCTIONS
+# These functions calculate metrics for backup session logging
 #################################################################################
 
 # Calculate size of THIS backup only (not total directory)
@@ -3611,7 +3614,7 @@ load_chain_validation_module() {
 
 # Archive existing checkpoint chain before new full backup
 # Global tracking variables for chain archival (set by archive_existing_checkpoint_chain)
-# These are read by backup_vm() for CSV logging after archiving occurs in any code path
+# These are read by backup_vm() for session logging after archiving occurs in any code path
 _ARCHIVE_CHAIN_ARCHIVED="false"      # Was a chain archived this backup run?
 _ARCHIVE_RESTORE_POINTS=0            # How many restore points were in the archived chain?
 _ARCHIVE_PATH=""                     # Path to the archived chain
@@ -3669,7 +3672,7 @@ detect_policy_change() {
     log_info "vmbackup.sh" "detect_policy_change" \
       "Policy change detected for $vm_name: $previous_policy → $current_policy"
     
-    # Log to config-events CSV
+    # Log config event to SQLite
     if declare -f log_config_event &>/dev/null; then
       log_config_event "policy_change" "" "$vm_name" "rotation_policy" \
         "$current_policy" "$previous_policy" "$vm_name" "detect_policy_change" \
@@ -3697,7 +3700,7 @@ archive_existing_checkpoint_chain() {
     return 1
   fi
   
-  # Count restore points BEFORE archiving (for CSV tracking)
+  # Count restore points BEFORE archiving (for session logging)
   local restore_point_count
   restore_point_count=$(find "$backup_dir" -maxdepth 1 -name "virtnbdbackup.*.xml" -type f 2>/dev/null | wc -l)
   
@@ -3733,6 +3736,21 @@ archive_existing_checkpoint_chain() {
         "Failed to move metadata file: $metadata_file"
     fi
   done < <(find "$backup_dir" -maxdepth 1 -name "virtnbdbackup.*.xml" -type f 2>/dev/null)
+  
+  # Archive VM config XML files (vmconfig.virtnbdbackup.*.xml)
+  # These are per-checkpoint VM domain XML snapshots written by virtnbdrestore.
+  # Without these, restores must fall back to config/ directory XML (lacks disk paths).
+  local vmconfig_count=0
+  while IFS= read -r vmconfig_file; do
+    if mv "$vmconfig_file" "$chain_archive/"; then
+      ((vmconfig_count++))
+      log_debug "vmbackup.sh" "archive_existing_checkpoint_chain" \
+        "Archived vmconfig: $(basename "$vmconfig_file")"
+    else
+      log_warn "vmbackup.sh" "archive_existing_checkpoint_chain" \
+        "Failed to move vmconfig file: $vmconfig_file"
+    fi
+  done < <(find "$backup_dir" -maxdepth 1 -name "vmconfig.virtnbdbackup.*.xml" -type f 2>/dev/null)
   
   # Archive full backup data file (*.full.data)
   local full_count=0
@@ -3837,6 +3855,21 @@ archive_existing_checkpoint_chain() {
     fi
   fi
   
+  # Archive .tpm-backup-marker if present (gate file for vmrestore TPM restore)
+  # Use cp (not mv) — the marker must remain in the period dir for the next chain's
+  # first backup to detect TPM capability. It will be overwritten each backup cycle.
+  local tpm_marker_archived=0
+  if [[ -f "$backup_dir/.tpm-backup-marker" ]]; then
+    if cp "$backup_dir/.tpm-backup-marker" "$chain_archive/"; then
+      tpm_marker_archived=1
+      log_debug "vmbackup.sh" "archive_existing_checkpoint_chain" \
+        "Archived .tpm-backup-marker (copied)"
+    else
+      log_warn "vmbackup.sh" "archive_existing_checkpoint_chain" \
+        "Failed to copy .tpm-backup-marker"
+    fi
+  fi
+  
   # Archive config subdirectory if present (per-chain VM XML snapshots)
   local config_archived=0
   if [[ -d "$backup_dir/config" ]]; then
@@ -3850,7 +3883,7 @@ archive_existing_checkpoint_chain() {
     fi
   fi
   
-  local total_archived=$((metadata_count + full_count + inc_count + cpt_count + chksum_count + qcow_json_count + nvram_count + tpm_archived + config_archived))
+  local total_archived=$((metadata_count + vmconfig_count + full_count + inc_count + cpt_count + chksum_count + qcow_json_count + nvram_count + tpm_archived + tpm_marker_archived + config_archived))
   log_info "vmbackup.sh" "archive_existing_checkpoint_chain" \
     "Archived chain for VM $vm_name: $total_archived files to $chain_archive"
   
@@ -3859,11 +3892,11 @@ archive_existing_checkpoint_chain() {
     local archive_total_bytes
     archive_total_bytes=$(du -sb "$chain_archive" 2>/dev/null | cut -f1 || echo 0)
     log_file_operation "move" "$vm_name" "$backup_dir" "$chain_archive" \
-      "directory" "Chain archived: ${total_archived} files (${metadata_count} metadata, ${full_count} full, ${inc_count} inc, ${cpt_count} cpt, ${chksum_count} chksum, ${qcow_json_count} qcow.json, ${nvram_count} nvram)" \
+      "directory" "Chain archived: ${total_archived} files (${metadata_count} metadata, ${vmconfig_count} vmconfig, ${full_count} full, ${inc_count} inc, ${cpt_count} cpt, ${chksum_count} chksum, ${qcow_json_count} qcow.json, ${nvram_count} nvram, ${tpm_marker_archived} tpm-marker)" \
       "archive_existing_checkpoint_chain" "true"
   fi
   
-  # Set global tracking variables for CSV logging
+  # Set global tracking variables for session logging
   # These are read by backup_vm() regardless of which code path triggered the archival
   _ARCHIVE_CHAIN_ARCHIVED="true"
   _ARCHIVE_RESTORE_POINTS=$restore_point_count
@@ -3959,9 +3992,9 @@ backup_vm() {
   VM_STATE="unknown"
   QEMU_AGENT_AVAILABLE=0
   VM_WAS_PAUSED=0
-  local csv_backup_method="unknown"          # Backup method: agent/paused/offline
-  local csv_restore_points_before=0          # Restore points before backup
-  local csv_restore_points_after=0           # Restore points after backup
+  local backup_method="unknown"              # Backup method: agent/paused/offline
+  local restore_points_before=0              # Restore points before backup
+  local restore_points_after=0               # Restore points after backup
   
   log_info "vmbackup.sh" "backup_vm" ""
   log_info "vmbackup.sh" "backup_vm" "╔══════════════════════════════════════════════════════════════════════════════╗"
@@ -4029,13 +4062,13 @@ backup_vm() {
   
   # Determine initial backup method based on VM state
   if [[ "$vm_status" == "shut off" ]]; then
-    csv_backup_method="offline"
+    backup_method="offline"
   elif [[ "$has_qemu_agent" == "true" ]]; then
-    csv_backup_method="agent"
+    backup_method="agent"
   else
-    csv_backup_method="paused"  # Will be confirmed when actually paused
+    backup_method="paused"  # Will be confirmed when actually paused
   fi
-  log_debug "vmbackup.sh" "backup_vm" "Method decision: vm_status=$vm_status has_agent=$has_qemu_agent → method=$csv_backup_method"
+  log_debug "vmbackup.sh" "backup_vm" "Method decision: vm_status=$vm_status has_agent=$has_qemu_agent → method=$backup_method"
   
   # Store current agent status persistently for future reference
   # When VM is running, record whether agent is present for when it goes offline
@@ -4369,8 +4402,8 @@ backup_vm() {
   #   - Within same month as last full backup
   #   - virtnbdbackup decides full vs inc based on checkpoint state
   #
-  # CSV LOGGING NOTE:
-  #   The backup_type logged to CSV reflects what we REQUEST here, not what
+  # LOGGING NOTE:
+  #   The backup_type logged reflects what we REQUEST here, not what
   #   virtnbdbackup ultimately decides. For "auto" mode, check restore_points
   #   to determine actual outcome: restore_points=1 means full, >1 means inc.
   #
@@ -4479,8 +4512,8 @@ backup_vm() {
   
   # Capture checkpoint count BEFORE backup (for summary and QEMU management)
   checkpoint_before=$(get_checkpoint_depth "$vm_name")
-  # CSV restore_points tracks actual data files on disk, not virsh checkpoints
-  csv_restore_points_before=$(get_restore_point_count "$backup_dir")
+  # Restore points = logical backup operations on disk, not virsh checkpoint count
+  restore_points_before=$(get_restore_point_count "$backup_dir")
   final_backup_type="$backup_type"
   
   # Handle VM pause/resume if needed (use cached agent check result)
@@ -4491,7 +4524,7 @@ backup_vm() {
       
       if pause_vm "$vm_name"; then
         paused=true
-        csv_backup_method="paused"  # Confirm backup method
+        backup_method="paused"  # Confirm backup method
         VM_WAS_PAUSED=1
         log_info "vmbackup.sh" "backup_vm" "VM paused successfully for backup"
       else
@@ -4522,7 +4555,7 @@ backup_vm() {
     final_error="${error_detail}"
     
     # Build event detail for session summary logging
-    local fail_event_detail=$(build_event_detail "error" "$backup_type" "0" "$csv_restore_points_before" "$csv_backup_method" "$_ARCHIVE_CHAIN_ARCHIVED" "$error_detail")
+    local fail_event_detail=$(build_event_detail "error" "$backup_type" "0" "$restore_points_before" "$backup_method" "$_ARCHIVE_CHAIN_ARCHIVED" "$error_detail")
     
     if [[ "$paused" == "true" ]]; then
       log_warn "vmbackup.sh" "backup_vm" "Resuming paused VM: $vm_name after failed backup"
@@ -4640,20 +4673,20 @@ backup_vm() {
   fi
   
   local final_depth=$(get_checkpoint_depth "$vm_name")
-  # Restore_points tracks actual data files on disk, not virsh checkpoints
-  csv_restore_points_after=$(get_restore_point_count "$backup_dir")
-  log_info "vmbackup.sh" "backup_vm" "Final QEMU checkpoint depth: $final_depth, Restore points on disk: $csv_restore_points_after"
+  # Restore points = logical backup operations, not individual disk files
+  restore_points_after=$(get_restore_point_count "$backup_dir")
+  log_info "vmbackup.sh" "backup_vm" "Final QEMU checkpoint depth: $final_depth, Restore points on disk: $restore_points_after"
   
   # Calculate size metrics for session summary
-  local csv_this_backup_bytes=$(get_this_backup_size "$backup_dir" "$backup_start_epoch")
-  local csv_total_dir_bytes=$(get_total_dir_size "$backup_dir")
+  local this_backup_bytes=$(get_this_backup_size "$backup_dir" "$backup_start_epoch")
+  local total_dir_bytes=$(get_total_dir_size "$backup_dir")
   
   # Build dynamic event detail
-  local csv_event_detail=$(build_event_detail "success" "$backup_type" "$csv_this_backup_bytes" "$csv_restore_points_after" "$csv_backup_method" "$_ARCHIVE_CHAIN_ARCHIVED")
+  local event_detail=$(build_event_detail "success" "$backup_type" "$this_backup_bytes" "$restore_points_after" "$backup_method" "$_ARCHIVE_CHAIN_ARCHIVED")
   
   # Success - set final status and log summary
   final_status="SUCCESS"
-  final_size="$csv_total_dir_bytes"
+  final_size="$total_dir_bytes"
   
   #############################################################################
   # VM-First Integration: Post-backup hook
@@ -4667,11 +4700,11 @@ backup_vm() {
   post_backup_hook "$vm_name" "success" "$final_backup_type" "$final_size" "$backup_duration"
   fi
   
-  # Use csv_restore_points_after (actual data files) for restore_points, not checkpoint_after (virsh count)
-  # NOTE: Pass csv_this_backup_bytes (actual bytes written this run), NOT final_size (total dir size).
+  # Pass restore_points_after (logical backup count), not checkpoint depth (virsh count)
+  # NOTE: Pass this_backup_bytes (actual bytes written this run), NOT final_size (total dir size).
   # total_dir_bytes is separately computed inside sqlite_log_vm_backup via get_total_dir_size().
-  _log_vm_backup_summary "$vm_name" "$backup_start_time" "$backup_start_epoch" "$final_status" "$final_backup_type" "$csv_restore_points_before" "$csv_restore_points_after" "" "$csv_this_backup_bytes" "$vm_policy" "$backup_dir" \
-    "backup_completed" "$csv_event_detail" "${retry_count:-0}" "${_ARCHIVE_RESTORE_POINTS:-0}"
+  _log_vm_backup_summary "$vm_name" "$backup_start_time" "$backup_start_epoch" "$final_status" "$final_backup_type" "$restore_points_before" "$restore_points_after" "" "$this_backup_bytes" "$vm_policy" "$backup_dir" \
+    "backup_completed" "$event_detail" "${retry_count:-0}" "${_ARCHIVE_RESTORE_POINTS:-0}"
   return 0
 }
 
@@ -4812,19 +4845,6 @@ cleanup_on_exit() {
           log_debug "vmbackup.sh" "cleanup_on_exit" "Deleted recovery flag: $(basename "$flag_file")"
         fi
       done <<< "$recovery_flags"
-    fi
-  fi
-  
-  # Clean CSV lock files (created by flock for atomic CSV writes)
-  local csv_dir="${STATE_DIR}/csv"
-  if [[ -d "$csv_dir" ]]; then
-    local csv_locks=$(find "$csv_dir" -name "*.lock" -type f 2>/dev/null)
-    if [[ -n "$csv_locks" ]]; then
-      while IFS= read -r lock_file; do
-        if rm -f "$lock_file"; then
-          log_debug "vmbackup.sh" "cleanup_on_exit" "Deleted CSV lock file: $(basename "$lock_file")"
-        fi
-      done <<< "$csv_locks"
     fi
   fi
   

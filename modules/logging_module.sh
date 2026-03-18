@@ -47,11 +47,6 @@ STATE_BACKUP_KEEP_DAYS="${STATE_BACKUP_KEEP_DAYS:-90}"
 # Logs are captured in state backups before deletion
 LOG_KEEP_DAYS="${LOG_KEEP_DAYS:-30}"
 
-# Legacy CSV file retention (days to keep old CSV files during cleanup)
-# CSV logging was deprecated in schema v1.5 — files are cleaned up after this period
-# Set to 0 to delete immediately, -1 to keep forever (disable cleanup)
-LOG_CSV_KEEP_DAYS="${LOG_CSV_KEEP_DAYS:-90}"
-
 #################################################################################
 # CHAIN LIFECYCLE LOGGING
 #################################################################################
@@ -333,76 +328,6 @@ cleanup_old_logs() {
     if ((deleted_count > 0)); then
         log_info "logging_module.sh" "cleanup_old_logs" \
             "Cleaned up $deleted_count log files ($(numfmt --to=iec-i --suffix=B $deleted_bytes 2>/dev/null || echo "${deleted_bytes}B")) older than ${keep_days} days"
-    fi
-    
-    # Legacy CSV cleanup (deprecated since schema v1.5)
-    local csv_keep_days="${LOG_CSV_KEEP_DAYS:-90}"
-    
-    if [[ "$csv_keep_days" -ge 0 ]] && [[ -d "${STATE_DIR}/csv" ]]; then
-        local csv_deleted=0
-        local csv_bytes=0
-        
-        # Clean daily CSVs (no longer written since v1.5)
-        while IFS= read -r -d '' file; do
-            local size
-            size=$(stat -c%s "$file" 2>/dev/null || echo 0)
-            ((csv_bytes += size))
-            ((csv_deleted++))
-            rm -f "$file"
-        done < <(find "${STATE_DIR}/csv" -name "daily-*.csv" -mtime +"$csv_keep_days" -print0 2>/dev/null)
-        
-        # Clean chain-lifecycle CSVs
-        while IFS= read -r -d '' file; do
-            local size
-            size=$(stat -c%s "$file" 2>/dev/null || echo 0)
-            ((csv_bytes += size))
-            ((csv_deleted++))
-            rm -f "$file"
-        done < <(find "${STATE_DIR}/csv" -name "chain-lifecycle-*.csv" -mtime +"$csv_keep_days" -print0 2>/dev/null)
-        
-        # Clean config-events CSVs
-        while IFS= read -r -d '' file; do
-            local size
-            size=$(stat -c%s "$file" 2>/dev/null || echo 0)
-            ((csv_bytes += size))
-            ((csv_deleted++))
-            rm -f "$file"
-        done < <(find "${STATE_DIR}/csv" -name "config-events-*.csv" -mtime +"$csv_keep_days" -print0 2>/dev/null)
-        
-        # Clean file-operations CSVs
-        while IFS= read -r -d '' file; do
-            local size
-            size=$(stat -c%s "$file" 2>/dev/null || echo 0)
-            ((csv_bytes += size))
-            ((csv_deleted++))
-            rm -f "$file"
-        done < <(find "${STATE_DIR}/csv" -name "file-operations-*.csv" -mtime +"$csv_keep_days" -print0 2>/dev/null)
-        
-        # Clean period CSVs
-        while IFS= read -r -d '' file; do
-            local size
-            size=$(stat -c%s "$file" 2>/dev/null || echo 0)
-            ((csv_bytes += size))
-            ((csv_deleted++))
-            rm -f "$file"
-        done < <(find "${STATE_DIR}/csv" -name "period-*.csv" -mtime +"$csv_keep_days" -print0 2>/dev/null)
-        
-        # Clean retention CSVs
-        while IFS= read -r -d '' file; do
-            local size
-            size=$(stat -c%s "$file" 2>/dev/null || echo 0)
-            ((csv_bytes += size))
-            ((csv_deleted++))
-            rm -f "$file"
-        done < <(find "${STATE_DIR}/csv" -name "retention-*.csv" -mtime +"$csv_keep_days" -print0 2>/dev/null)
-        
-        # Clean stale CSV lock files (always, regardless of keep_days)
-        find "${STATE_DIR}/csv" -name "*.csv.lock" -mtime +1 -delete 2>/dev/null
-        
-        if ((csv_deleted > 0)); then
-            log_info "logging_module.sh" "cleanup_old_logs" \
-                "Cleaned up $csv_deleted legacy CSV files ($(numfmt --to=iec-i --suffix=B $csv_bytes 2>/dev/null || echo "${csv_bytes}B")) older than ${csv_keep_days} days"
-        fi
     fi
 }
 

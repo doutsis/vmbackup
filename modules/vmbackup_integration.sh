@@ -280,9 +280,11 @@ post_backup_hook() {
         fi
         
         # G2/G7: Update chain health in SQLite (success)
+        # Note: $checkpoint is a zero-based index (correct for restore point IDs),
+        # but sqlite_update_chain_health expects a count, so we pass checkpoint+1
         if declare -f sqlite_update_chain_health >/dev/null 2>&1; then
             sqlite_update_chain_health "$vm_name" "$period_id" "$backup_dir" \
-                "active" "$checkpoint" "" "" "$policy"
+                "active" "$((checkpoint + 1))" "" "" "$policy"
         fi
         
     elif [[ "$backup_status" == "failed" ]]; then

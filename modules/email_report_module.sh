@@ -226,7 +226,7 @@ get_total_backup_size() {
     local path="$1"
     local total_bytes=0
     
-    # Sum all total_dir_bytes from today's CSV, or calculate from filesystem
+    # Sum all total_dir_bytes from DB, or calculate from filesystem
     # Using du for accuracy (includes all months)
     total_bytes=$(du -sb "$path" 2>/dev/null | cut -f1)
     
@@ -793,7 +793,7 @@ send_backup_report() {
         echo "WARNING: SQLite query functions not available — email report may have incomplete data" >&2
     fi
     
-    # Build email content (session-scoped DB queries — no CSV needed)
+    # Build email content (session-scoped DB queries)
     local subject=$(build_subject "$start_time" "$end_time" "$date_str")
     local body=$(build_email_body "$start_time" "$end_time" "$date_str")
     
