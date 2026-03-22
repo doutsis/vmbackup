@@ -57,7 +57,7 @@ get_tpm_info() {
 log_tpm() {
     local level="$1"
     local message="$2"
-    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S %Z')
     
     # Bridge to main logging system if available
     case "$level" in
@@ -169,6 +169,10 @@ backup_vm_tpm_incremental() {
     if timeout "$TPM_BACKUP_TIMEOUT" sudo rsync -av --delete "$swtpm_dir/" "$tpm_backup_dir/" 2>/dev/null; then
         sudo chown -R "$(id -u):$(id -g)" "$tpm_backup_dir" 2>/dev/null || true
         log_tpm "INFO" "$vm_name: Incremental TPM backup completed"
+        if declare -f log_file_operation >/dev/null 2>&1; then
+            log_file_operation "copy" "$vm_name" "$swtpm_dir" "$tpm_backup_dir" \
+                "tpm" "Incremental TPM backup (rsync)" "backup_vm_tpm_incremental" "true"
+        fi
         _record_tpm_backup_metadata "$vm_name" "$vm_uuid" "$tpm_backup_dir"
         return 0
     else
@@ -212,6 +216,10 @@ backup_vm_tpm_consistent() {
             sudo rm -f "$tar_file"
             sudo chown -R "$(id -u):$(id -g)" "$tpm_backup_dir" 2>/dev/null || true
             log_tpm "INFO" "$vm_name: Consistent TPM backup completed"
+            if declare -f log_file_operation >/dev/null 2>&1; then
+                log_file_operation "copy" "$vm_name" "$swtpm_dir" "$tpm_backup_dir" \
+                    "tpm" "Consistent TPM backup (tar snapshot)" "backup_vm_tpm_consistent" "true"
+            fi
             _record_tpm_backup_metadata "$vm_name" "$vm_uuid" "$tpm_backup_dir"
             return 0
         fi

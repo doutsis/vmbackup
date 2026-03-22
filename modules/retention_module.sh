@@ -490,7 +490,7 @@ _remove_orphan_period() {
         if declare -f log_retention_action >/dev/null 2>&1; then
             log_retention_action "delete" "$vm_name" "orphan_period" "$period_dir" "$period_id" \
                 "$original_policy" "$max_age" "1" "$age_days" "$freed_bytes" \
-                "" "_remove_orphan_period" "dry_run"
+                "" "_remove_orphan_period" "dry_run" "orphan_retention"
         fi
         return 0
     fi
@@ -502,7 +502,7 @@ _remove_orphan_period() {
         if declare -f log_retention_action >/dev/null 2>&1; then
             log_retention_action "skip" "$vm_name" "orphan_period" "$period_dir" "$period_id" \
                 "$original_policy" "$max_age" "1" "$age_days" "0" \
-                "protected" "_remove_orphan_period" "true"
+                "protected" "_remove_orphan_period" "true" "orphan_retention"
         fi
         return 0
     fi
@@ -516,7 +516,7 @@ _remove_orphan_period() {
         if declare -f log_retention_action >/dev/null 2>&1; then
             log_retention_action "skip" "$vm_name" "orphan_period" "$period_dir" "$period_id" \
                 "$original_policy" "$max_age" "1" "$age_days" "0" \
-                "last_period" "_remove_orphan_period" "true"
+                "last_period" "_remove_orphan_period" "true" "orphan_retention"
         fi
         return 0
     fi
@@ -530,7 +530,7 @@ _remove_orphan_period() {
             if declare -f log_retention_action >/dev/null 2>&1; then
                 log_retention_action "skip" "$vm_name" "orphan_period" "$period_dir" "$period_id" \
                     "$original_policy" "$max_age" "1" "$age_days" "0" \
-                    "unreplicated" "_remove_orphan_period" "true"
+                    "unreplicated" "_remove_orphan_period" "true" "orphan_retention"
             fi
             return 0
         else
@@ -564,12 +564,12 @@ _remove_orphan_period() {
         if declare -f log_retention_action >/dev/null 2>&1; then
             log_retention_action "delete" "$vm_name" "orphan_period" "$period_dir" "$period_id" \
                 "$original_policy" "$max_age" "0" "$age_days" "$freed_bytes" \
-                "" "_remove_orphan_period" "true"
+                "" "_remove_orphan_period" "true" "orphan_retention"
         fi
         
         if declare -f log_file_operation >/dev/null 2>&1; then
             log_file_operation "delete" "$vm_name" "$period_dir" "" \
-                "directory" "Orphan retention (was $original_policy)" "_remove_orphan_period" "true"
+                "directory" "Orphan retention (was $original_policy)" "_remove_orphan_period" "true" "" "$freed_bytes"
         fi
         
         return 0
@@ -592,11 +592,17 @@ _remove_orphan_period() {
 # Args: $1 - vm_name
 #       $2 - period_id
 #       $3 - dry_run
+#       $4 - skip_keep_last (true|false, default: false)
+#            Set true only for --prune all (operator wants everything gone)
+#       $5 - caller (retention|prune, default: retention)
+#            Controls replication behaviour and DB status values
 # Returns: 0 on success, 1 on error
 _remove_period() {
     local vm_name="$1"
     local period_id="$2"
     local dry_run="$3"
+    local skip_keep_last="${4:-false}"
+    local caller="${5:-retention}"
     local safe_name=$(sanitize_vm_name "$vm_name")
     local period_dir="${BACKUP_PATH}${safe_name}/${period_id}"
     
@@ -609,51 +615,51 @@ _remove_period() {
     local age_days=$(calculate_period_age "$period_id" "$policy")
     local freed_bytes=$(du -sb "$period_dir" 2>/dev/null | cut -f1 || echo 0)
     
-    # Dry run mode
-    if [[ "$dry_run" == "true" ]]; then
-        log_info "retention_module.sh" "_remove_period" \
-            "[DRY RUN] Would remove: $period_dir (${freed_bytes} bytes, ${age_days} days old)"
-        log_retention_action "delete" "$vm_name" "period" "$period_dir" "$period_id" \
-            "$policy" "$retention_limit" "$current_count" "$age_days" "$freed_bytes" \
-            "" "_remove_period" "dry_run"
-        return 0
-    fi
-    
     # Protection check: refuse to delete if any chain in this period is protected
     if _is_period_protected "$vm_name" "$period_id"; then
         log_info "retention_module.sh" "_remove_period" \
             "Skipping protected period: $vm_name/$period_id (purge_eligible=0)"
         log_retention_action "skip" "$vm_name" "period" "$period_dir" "$period_id" \
             "$policy" "$retention_limit" "$current_count" "$age_days" "0" \
-            "protected" "_remove_period" "true"
+            "protected" "_remove_period" "true" "$caller"
         return 0
     fi
     
     # Keep-last guard: refuse to delete the last period for a VM
-    local total_periods
-    total_periods=$(find "${BACKUP_PATH}${safe_name}" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l)
-    if [[ "${total_periods:-0}" -le 1 ]]; then
-        log_warn "retention_module.sh" "_remove_period" \
-            "Refusing to delete last period for $vm_name: $period_id"
-        log_retention_action "skip" "$vm_name" "period" "$period_dir" "$period_id" \
-            "$policy" "$retention_limit" "$current_count" "$age_days" "0" \
-            "last_period" "_remove_period" "true"
-        return 0
-    fi
-    
-    # Replication-awareness check: warn or block if period has not been replicated
-    if ! _is_period_replicated "$vm_name" "$period_id"; then
-        local repl_action="${RETENTION_REQUIRE_REPLICATION:-warn}"
-        if [[ "$repl_action" == "block" ]]; then
+    # Can be overridden by skip_keep_last (--prune all)
+    if [[ "$skip_keep_last" != "true" ]]; then
+        local total_periods
+        total_periods=$(find "${BACKUP_PATH}${safe_name}" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l)
+        if [[ "${total_periods:-0}" -le 1 ]]; then
             log_warn "retention_module.sh" "_remove_period" \
-                "Blocking deletion of un-replicated period: $vm_name/$period_id"
+                "Refusing to delete last period for $vm_name: $period_id"
             log_retention_action "skip" "$vm_name" "period" "$period_dir" "$period_id" \
                 "$policy" "$retention_limit" "$current_count" "$age_days" "0" \
-                "unreplicated" "_remove_period" "true"
+                "last_period" "_remove_period" "true" "$caller"
             return 0
-        else
+        fi
+    fi
+    
+    # Replication-awareness check
+    # Prune: always warn-only (operator-initiated, never blocks)
+    # Retention: respect RETENTION_REQUIRE_REPLICATION setting
+    if ! _is_period_replicated "$vm_name" "$period_id"; then
+        if [[ "$caller" == "prune" ]]; then
             log_warn "retention_module.sh" "_remove_period" \
-                "Deleting un-replicated period: $vm_name/$period_id (RETENTION_REQUIRE_REPLICATION=${repl_action})"
+                "Pruning un-replicated period: $vm_name/$period_id (operator-initiated)"
+        else
+            local repl_action="${RETENTION_REQUIRE_REPLICATION:-warn}"
+            if [[ "$repl_action" == "block" ]]; then
+                log_warn "retention_module.sh" "_remove_period" \
+                    "Blocking deletion of un-replicated period: $vm_name/$period_id"
+                log_retention_action "skip" "$vm_name" "period" "$period_dir" "$period_id" \
+                    "$policy" "$retention_limit" "$current_count" "$age_days" "0" \
+                    "unreplicated" "_remove_period" "true" "$caller"
+                return 0
+            else
+                log_warn "retention_module.sh" "_remove_period" \
+                    "Deleting un-replicated period: $vm_name/$period_id (RETENTION_REQUIRE_REPLICATION=${repl_action})"
+            fi
         fi
     fi
     
@@ -662,15 +668,62 @@ _remove_period() {
         log_error "retention_module.sh" "_remove_period" "Safety check failed: $period_dir"
         log_retention_action "error" "$vm_name" "period" "$period_dir" "$period_id" \
             "$policy" "$retention_limit" "$current_count" "$age_days" "0" \
-            "safety_check_failed" "_remove_period" "false"
+            "safety_check_failed" "_remove_period" "false" "$caller"
         return 1
     fi
     
-    # G4: Mark chains in this period as deleted in SQLite BEFORE removal
+    # Dry run mode (after all checks — report reflects what would actually happen)
+    if [[ "$dry_run" == "true" ]]; then
+        log_info "retention_module.sh" "_remove_period" \
+            "[DRY RUN] Would remove: $period_dir (${freed_bytes} bytes, ${age_days} days old)"
+        log_retention_action "delete" "$vm_name" "period" "$period_dir" "$period_id" \
+            "$policy" "$retention_limit" "$current_count" "$age_days" "$freed_bytes" \
+            "" "_remove_period" "dry_run" "$caller"
+        return 0
+    fi
+    
+    # Determine target status based on caller
+    local target_status="deleted"
+    [[ "$caller" == "prune" ]] && target_status="purged"
+    
+    # G4: Mark active chain in chain_health BEFORE removal
     if declare -f sqlite_mark_chain_deleted >/dev/null 2>&1; then
-        sqlite_mark_chain_deleted "$vm_name" "$period_id" "." "retention"
+        sqlite_mark_chain_deleted "$vm_name" "$period_id" "." "$caller" "$target_status"
         log_debug "retention_module.sh" "_remove_period" \
-            "Marked chains as deleted in SQLite: $vm_name/$period_id"
+            "Marked chain as $target_status in chain_health: $vm_name/$period_id"
+    fi
+    
+    # Log chain event for the active chain (Gap 1 fix)
+    # Event name matches target_status: chain_deleted (retention) or chain_purged (prune)
+    # Use active-only bytes (period total minus archives) to avoid inflating the event
+    local active_chain_bytes="$freed_bytes"
+    local _archives_dir="${period_dir}/.archives"
+    if [[ -d "$_archives_dir" ]]; then
+        local _archive_bytes
+        _archive_bytes=$(du -sb "$_archives_dir" 2>/dev/null | cut -f1 || echo 0)
+        active_chain_bytes=$(( freed_bytes - _archive_bytes ))
+        (( active_chain_bytes < 0 )) && active_chain_bytes=0
+    fi
+    if declare -f sqlite_log_chain_event >/dev/null 2>&1; then
+        sqlite_log_chain_event "chain_${target_status}" "$vm_name" "" "$period_id" \
+            "$period_dir" "." "" "$active_chain_bytes" "$caller"
+    fi
+    
+    # Log chain events for each archived chain (Gap 2 fix)
+    if declare -f sqlite_log_chain_event >/dev/null 2>&1; then
+        local archives_dir="${period_dir}/.archives"
+        if [[ -d "$archives_dir" ]]; then
+            local chain_dir
+            for chain_dir in "$archives_dir"/chain-*; do
+                [[ -d "$chain_dir" ]] || continue
+                local chain_name
+                chain_name=$(basename "$chain_dir")
+                local chain_bytes
+                chain_bytes=$(du -sb "$chain_dir" 2>/dev/null | cut -f1 || echo 0)
+                sqlite_log_chain_event "chain_${target_status}" "$vm_name" "$chain_name" "$period_id" \
+                    "$chain_dir" ".archives/$chain_name" "" "$chain_bytes" "$caller"
+            done
+        fi
     fi
     
     # Actually remove
@@ -680,17 +733,227 @@ _remove_period() {
         log_error "retention_module.sh" "_remove_period" "Failed to remove: $period_dir"
         log_retention_action "error" "$vm_name" "period" "$period_dir" "$period_id" \
             "$policy" "$retention_limit" "$current_count" "$age_days" "0" \
-            "rm_failed" "_remove_period" "false"
+            "rm_failed" "_remove_period" "false" "$caller"
         return 1
     }
     
     log_retention_action "delete" "$vm_name" "period" "$period_dir" "$period_id" \
         "$policy" "$retention_limit" "$current_count" "$age_days" "$freed_bytes" \
-        "" "_remove_period" "true"
+        "" "_remove_period" "true" "$caller"
     
     log_file_operation "delete" "$vm_name" "$period_dir" "" \
-        "directory" "Retention cleanup" "_remove_period" "true"
+        "directory" "${caller^} cleanup" "_remove_period" "true" "" "$freed_bytes"
     
+    # Log period_deleted lifecycle event (Gap 3 fix)
+    if declare -f log_period_lifecycle >/dev/null 2>&1; then
+        log_period_lifecycle "period_deleted" "$vm_name" "$period_id" "$policy" \
+            "$period_dir" "" "" "0" "0" "$freed_bytes" "" "" "0"
+    fi
+    
+    return 0
+}
+
+#################################################################################
+# ARCHIVE CHAIN REMOVAL (for --prune)
+#################################################################################
+
+# Remove a single archived chain directory from .archives/
+# Args: $1 - vm_name
+#       $2 - period_id
+#       $3 - chain_name (e.g. chain-2026-03-09)
+#       $4 - dry_run (true|false)
+#       $5 - caller (prune|retention, default: prune)
+# Returns: 0 on success, 1 on error
+_remove_archive_chain() {
+    local vm_name="$1"
+    local period_id="$2"
+    local chain_name="$3"
+    local dry_run="${4:-false}"
+    local caller="${5:-prune}"
+    local safe_name=$(sanitize_vm_name "$vm_name")
+    local chain_dir="${BACKUP_PATH}${safe_name}/${period_id}/.archives/${chain_name}"
+    
+    if [[ ! -d "$chain_dir" ]]; then
+        log_error "retention_module.sh" "_remove_archive_chain" \
+            "Archive chain not found: $chain_dir"
+        return 1
+    fi
+    
+    local freed_bytes
+    freed_bytes=$(du -sb "$chain_dir" 2>/dev/null | cut -f1 || echo 0)
+    local policy=$(get_vm_rotation_policy "$vm_name")
+    
+    if [[ "$dry_run" == "true" ]]; then
+        log_info "retention_module.sh" "_remove_archive_chain" \
+            "[DRY RUN] Would remove archive chain: $chain_dir (${freed_bytes} bytes)"
+        echo "$freed_bytes"
+        return 0
+    fi
+    
+    # Safety check
+    if ! _is_safe_to_remove "$chain_dir"; then
+        log_error "retention_module.sh" "_remove_archive_chain" \
+            "Safety check failed: $chain_dir"
+        return 1
+    fi
+    
+    # Log chain event BEFORE removal — event name derived from caller
+    local target_status="purged"
+    [[ "$caller" == "retention" ]] && target_status="deleted"
+    if declare -f sqlite_log_chain_event >/dev/null 2>&1; then
+        sqlite_log_chain_event "chain_${target_status}" "$vm_name" "$chain_name" "$period_id" \
+            "$chain_dir" ".archives/$chain_name" "" "$freed_bytes" "$caller"
+    fi
+    
+    log_info "retention_module.sh" "_remove_archive_chain" \
+        "Removing archive chain: $chain_dir"
+    
+    rm -rf "$chain_dir" || {
+        log_error "retention_module.sh" "_remove_archive_chain" \
+            "Failed to remove: $chain_dir"
+        log_retention_action "error" "$vm_name" "archive_chain" "$chain_dir" "$period_id" \
+            "$policy" "0" "0" "0" "0" "rm_failed" "_remove_archive_chain" "false" "$caller"
+        return 1
+    }
+    
+    log_retention_action "delete" "$vm_name" "archive_chain" "$chain_dir" "$period_id" \
+        "$policy" "0" "0" "0" "$freed_bytes" "" "_remove_archive_chain" "true" "$caller"
+    
+    log_file_operation "delete" "$vm_name" "$chain_dir" "" \
+        "directory" "${caller^} archive chain removal" "_remove_archive_chain" "true" "" "$freed_bytes"
+    
+    echo "$freed_bytes"
+    return 0
+}
+
+# Remove all archives within a period (keep active chain)
+# Args: $1 - vm_name
+#       $2 - period_id
+#       $3 - dry_run (true|false)
+#       $4 - caller (prune|retention, default: prune)
+# Returns: 0 on success, 1 on error (partial removal still returns 1)
+_remove_archives_in_period() {
+    local vm_name="$1"
+    local period_id="$2"
+    local dry_run="${3:-false}"
+    local caller="${4:-prune}"
+    local safe_name=$(sanitize_vm_name "$vm_name")
+    local archives_dir="${BACKUP_PATH}${safe_name}/${period_id}/.archives"
+    
+    if [[ ! -d "$archives_dir" ]]; then
+        log_debug "retention_module.sh" "_remove_archives_in_period" \
+            "No archives directory: $archives_dir"
+        return 0
+    fi
+    
+    local total_freed=0
+    local chain_count=0
+    local fail_count=0
+    local chain_dir
+    
+    for chain_dir in "$archives_dir"/chain-*; do
+        [[ -d "$chain_dir" ]] || continue
+        local chain_name
+        chain_name=$(basename "$chain_dir")
+        local result rc
+        result=$(_remove_archive_chain "$vm_name" "$period_id" "$chain_name" "$dry_run" "$caller")
+        rc=$?
+        if [[ $rc -eq 0 ]]; then
+            total_freed=$(( total_freed + ${result:-0} ))
+            (( chain_count++ ))
+        else
+            (( fail_count++ ))
+        fi
+    done
+    
+    if [[ "$dry_run" != "true" && $chain_count -gt 0 ]]; then
+        # Remove the empty .archives directory if all chains removed
+        if [[ $fail_count -eq 0 ]]; then
+            rmdir "$archives_dir" 2>/dev/null
+        fi
+        # Rebuild manifest once after all chains removed (not per-chain)
+        if declare -f rebuild_chain_manifest >/dev/null 2>&1; then
+            rebuild_chain_manifest "$vm_name"
+        fi
+    fi
+    
+    log_info "retention_module.sh" "_remove_archives_in_period" \
+        "Archives in $vm_name/$period_id: removed=$chain_count failed=$fail_count freed=${total_freed} bytes"
+    
+    echo "$total_freed"
+    [[ $fail_count -gt 0 ]] && return 1
+    return 0
+}
+
+# Remove all data for a VM (all periods, all archives, VM directory)
+# This is the nuclear option — zero backup data remains after this.
+# Args: $1 - vm_name
+#       $2 - dry_run (true|false)
+#       $3 - caller (prune, default: prune)
+# Returns: 0 on success, 1 on error (partial removal)
+_remove_vm_all() {
+    local vm_name="$1"
+    local dry_run="${2:-false}"
+    local caller="${3:-prune}"
+    local safe_name=$(sanitize_vm_name "$vm_name")
+    local vm_dir="${BACKUP_PATH}${safe_name}"
+    
+    if [[ ! -d "$vm_dir" ]]; then
+        log_error "retention_module.sh" "_remove_vm_all" \
+            "VM directory not found: $vm_dir"
+        return 1
+    fi
+    
+    local total_freed=0
+    local period_count=0
+    local fail_count=0
+    
+    # Iterate all period directories and remove each via _remove_period
+    local period_dir
+    for period_dir in "$vm_dir"/*/; do
+        [[ -d "$period_dir" ]] || continue
+        local period_id
+        period_id=$(basename "$period_dir")
+        
+        # Skip non-period dirs (e.g. _state, .hidden)
+        [[ "$period_id" == _* || "$period_id" == .* ]] && continue
+        
+        local period_bytes
+        period_bytes=$(du -sb "$period_dir" 2>/dev/null | cut -f1 || echo 0)
+        
+        if _remove_period "$vm_name" "$period_id" "$dry_run" "true" "$caller"; then
+            # Verify deletion actually happened (protection may skip with rc=0)
+            if [[ ! -d "$period_dir" ]] || [[ "$dry_run" == "true" ]]; then
+                total_freed=$(( total_freed + ${period_bytes:-0} ))
+            fi
+            (( period_count++ ))
+        else
+            (( fail_count++ ))
+        fi
+    done
+    
+    # Remove the VM directory itself (should be empty now)
+    if [[ "$dry_run" != "true" && $fail_count -eq 0 ]]; then
+        if [[ -d "$vm_dir" ]]; then
+            # Only remove if empty (safety)
+            local remaining
+            remaining=$(find "$vm_dir" -mindepth 1 -maxdepth 1 -not -name 'chain-manifest.json' 2>/dev/null | wc -l)
+            if [[ "$remaining" -eq 0 ]]; then
+                rm -rf "$vm_dir"
+                log_info "retention_module.sh" "_remove_vm_all" \
+                    "Removed VM directory: $vm_dir"
+            else
+                log_warn "retention_module.sh" "_remove_vm_all" \
+                    "VM directory not empty after period removal ($remaining items remain): $vm_dir"
+            fi
+        fi
+    fi
+    
+    log_info "retention_module.sh" "_remove_vm_all" \
+        "VM $vm_name: periods_removed=$period_count failed=$fail_count freed=${total_freed} bytes"
+    
+    echo "$total_freed"
+    [[ $fail_count -gt 0 ]] && return 1
     return 0
 }
 

@@ -93,7 +93,7 @@ cloud_log() {
     local level="$1"
     local message="$2"
     local timestamp
-    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S %Z')
     
     # Map to numeric level for comparison
     local -A levels=([debug]=0 [info]=1 [warn]=2 [error]=3)
@@ -704,12 +704,12 @@ run_cloud_replication_batch() {
         return 1
     fi
     
-    CLOUD_REPLICATION_START_TIME=$(date -u '+%Y-%m-%d %H:%M:%S')
+    CLOUD_REPLICATION_START_TIME=$(date '+%Y-%m-%d %H:%M:%S %Z')
     
     # Check for pre-existing cancellation request
     if type is_replication_cancelled &>/dev/null && is_replication_cancelled; then
         cloud_log_warn "Replication cancellation flag detected before start - skipping all cloud replication"
-        CLOUD_REPLICATION_END_TIME=$(date -u '+%Y-%m-%d %H:%M:%S')
+        CLOUD_REPLICATION_END_TIME=$(date '+%Y-%m-%d %H:%M:%S %Z')
         cloud_replication_release_lock
         return 1
     fi
@@ -765,12 +765,12 @@ run_cloud_replication_batch() {
         n=$((n + 1))
     done
     
-    CLOUD_REPLICATION_END_TIME=$(date -u '+%Y-%m-%d %H:%M:%S')
+    CLOUD_REPLICATION_END_TIME=$(date '+%Y-%m-%d %H:%M:%S %Z')
     
     # Calculate duration
     local start_epoch end_epoch duration
-    start_epoch=$(date -d "${CLOUD_REPLICATION_START_TIME} UTC" '+%s' 2>/dev/null) || start_epoch=0
-    end_epoch=$(date -d "${CLOUD_REPLICATION_END_TIME} UTC" '+%s' 2>/dev/null) || end_epoch=0
+    start_epoch=$(date -d "$CLOUD_REPLICATION_START_TIME" '+%s' 2>/dev/null) || start_epoch=0
+    end_epoch=$(date -d "$CLOUD_REPLICATION_END_TIME" '+%s' 2>/dev/null) || end_epoch=0
     duration=$((end_epoch - start_epoch))
     
     # Log summary
@@ -942,10 +942,15 @@ get_cloud_replication_summary() {
         echo "Destinations:"
         for status in "${CLOUD_REPLICATION_DEST_STATUS[@]}"; do
             # Parse: name|status|bytes|files|duration|message
-            local name dest_status
+            local name dest_status dest_message
             name=$(echo "$status" | cut -d'|' -f1)
             dest_status=$(echo "$status" | cut -d'|' -f2)
-            echo "  • $name: $dest_status"
+            dest_message=$(echo "$status" | cut -d'|' -f6)
+            if [[ -n "$dest_message" ]]; then
+                echo "  • $name: $dest_status - $dest_message"
+            else
+                echo "  • $name: $dest_status"
+            fi
         done
     fi
     

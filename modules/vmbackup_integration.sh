@@ -280,11 +280,14 @@ post_backup_hook() {
         fi
         
         # G2/G7: Update chain health in SQLite (success)
-        # Note: $checkpoint is a zero-based index (correct for restore point IDs),
-        # but sqlite_update_chain_health expects a count, so we pass checkpoint+1
+        # Use disk-based restore point count (not manifest-based $checkpoint) because
+        # rebuilt manifests only track checkpoints created after the rebuild, missing
+        # pre-existing ones. get_restore_point_count() counts actual .data files.
         if declare -f sqlite_update_chain_health >/dev/null 2>&1; then
+            local disk_restore_points
+            disk_restore_points=$(get_restore_point_count "$backup_dir")
             sqlite_update_chain_health "$vm_name" "$period_id" "$backup_dir" \
-                "active" "$((checkpoint + 1))" "" "" "$policy"
+                "active" "${disk_restore_points:-$((checkpoint + 1))}" "" "" "$policy"
         fi
         
     elif [[ "$backup_status" == "failed" ]]; then

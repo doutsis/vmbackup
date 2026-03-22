@@ -52,8 +52,8 @@
 
 # Module identification
 readonly SQLITE_MODULE_NAME="sqlite_module"
-readonly SQLITE_MODULE_VERSION="1.7"
-readonly SQLITE_SCHEMA_VERSION="1.7"
+readonly SQLITE_MODULE_VERSION="1.9"
+readonly SQLITE_SCHEMA_VERSION="1.9"
 
 # Ensure module is only loaded once
 if [[ "${_SQLITE_MODULE_LOADED:-}" == "1" ]]; then
@@ -70,7 +70,13 @@ declare -g SQLITE_MODULE_AVAILABLE=0
 # UTILITY HELPERS
 #=============================================================================
 
-# Escape single quotes for SQL strings
+# Escape single quotes for SQL strings.
+# Single-quote doubling ('→'') is the ONLY escape needed for SQLite string
+# literals. Unlike MySQL/PostgreSQL, SQLite does not interpret backslash
+# sequences (\n, \t, etc.) inside quoted strings. NUL bytes cannot appear
+# in bash variables (truncated at NUL), so they are not a concern.
+# VM names are further sanitised by sanitize_vm_name() ([a-zA-Z0-9._-])
+# before reaching any path- or key-derived SQL value.
 # Usage: escaped=$(_sql_escape "$value")
 _sql_escape() {
     printf '%s' "${1//\'/\'\'}"
@@ -299,8 +305,6 @@ MIGRATE_1_4_IDX_EOF
             sqlite3 "$SQLITE_DB_PATH" "ALTER TABLE vm_backups ADD COLUMN event_detail TEXT;" 2>/dev/null
 
         # replication_vms extensions
-        echo "$_rv_cols" | grep -qx 'bytes_transferred' || \
-            sqlite3 "$SQLITE_DB_PATH" "ALTER TABLE replication_vms ADD COLUMN bytes_transferred INTEGER DEFAULT 0;" 2>/dev/null
         echo "$_rv_cols" | grep -qx 'status' || \
             sqlite3 "$SQLITE_DB_PATH" "ALTER TABLE replication_vms ADD COLUMN status TEXT;" 2>/dev/null
 
@@ -421,7 +425,8 @@ CREATE TABLE IF NOT EXISTS retention_events (
     freed_bytes       INTEGER DEFAULT 0,
     preserve_reason   TEXT,
     triggered_by      TEXT,
-    success           INTEGER DEFAULT 1
+    success           INTEGER DEFAULT 1,
+    action_source     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_retention_events_session ON retention_events(session_id);
 CREATE INDEX IF NOT EXISTS idx_retention_events_vm ON retention_events(vm_name);
@@ -464,6 +469,51 @@ MIGRATE_1_5_EOF
         log_info "$SQLITE_MODULE_NAME" "_sqlite_migrate_schema" \
             "Schema migrated to v1.7 (added marked_at, marked_by, purged_at to chain_health)"
     fi
+
+    # Migration: 1.7 -> 1.8 (action_source column on retention_events)
+    if [[ "$current_version" < "1.8" ]]; then
+        log_info "$SQLITE_MODULE_NAME" "_sqlite_migrate_schema" \
+            "Migrating schema from v$current_version to v1.8 (retention audit: action_source)"
+
+        local _re_cols_18
+        _re_cols_18=$(sqlite3 "$SQLITE_DB_PATH" "SELECT name FROM pragma_table_info('retention_events');" 2>/dev/null)
+
+        echo "$_re_cols_18" | grep -qx 'action_source' || \
+            sqlite3 "$SQLITE_DB_PATH" "ALTER TABLE retention_events ADD COLUMN action_source TEXT;" 2>/dev/null
+
+        sqlite3 "$SQLITE_DB_PATH" "UPDATE schema_info SET value = '1.8' WHERE key = 'version';" 2>/dev/null
+        if [[ $? -ne 0 ]]; then
+            log_error "$SQLITE_MODULE_NAME" "_sqlite_migrate_schema" \
+                "Schema migration v$current_version→v1.8 FAILED"
+            return 1
+        fi
+
+        log_info "$SQLITE_MODULE_NAME" "_sqlite_migrate_schema" \
+            "Schema migrated to v1.8 (added action_source to retention_events)"
+    fi
+
+    # Migration: 1.8 -> 1.9 (drop unused bytes_transferred from replication_vms)
+    if [[ "$current_version" < "1.9" ]]; then
+        log_info "$SQLITE_MODULE_NAME" "_sqlite_migrate_schema" \
+            "Migrating schema from v$current_version to v1.9 (drop unused column)"
+
+        local _rv_cols_19
+        _rv_cols_19=$(sqlite3 "$SQLITE_DB_PATH" "SELECT name FROM pragma_table_info('replication_vms');" 2>/dev/null)
+
+        if echo "$_rv_cols_19" | grep -qx 'bytes_transferred'; then
+            sqlite3 "$SQLITE_DB_PATH" "ALTER TABLE replication_vms DROP COLUMN bytes_transferred;" 2>/dev/null
+        fi
+
+        sqlite3 "$SQLITE_DB_PATH" "UPDATE schema_info SET value = '1.9' WHERE key = 'version';" 2>/dev/null
+        if [[ $? -ne 0 ]]; then
+            log_error "$SQLITE_MODULE_NAME" "_sqlite_migrate_schema" \
+                "Schema migration v$current_version→v1.9 FAILED"
+            return 1
+        fi
+
+        log_info "$SQLITE_MODULE_NAME" "_sqlite_migrate_schema" \
+            "Schema migrated to v1.9 (dropped bytes_transferred from replication_vms)"
+    fi
 }
 
 # Create database schema (tables and indexes)
@@ -477,7 +527,7 @@ CREATE TABLE IF NOT EXISTS schema_info (
     key   TEXT PRIMARY KEY,
     value TEXT
 );
-INSERT OR REPLACE INTO schema_info (key, value) VALUES ('version', '1.7');
+INSERT OR REPLACE INTO schema_info (key, value) VALUES ('version', '1.9');
 INSERT OR REPLACE INTO schema_info (key, value) VALUES ('created', datetime('now'));
 
 /* A backup session (one vmbackup.sh invocation) */
@@ -560,7 +610,6 @@ CREATE TABLE IF NOT EXISTS replication_vms (
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id   INTEGER NOT NULL REFERENCES replication_runs(id),
     vm_name  TEXT NOT NULL,
-    bytes_transferred INTEGER DEFAULT 0,
     status   TEXT,
     UNIQUE(run_id, vm_name)
 );
@@ -715,7 +764,8 @@ CREATE TABLE IF NOT EXISTS retention_events (
     freed_bytes       INTEGER DEFAULT 0,
     preserve_reason   TEXT,
     triggered_by      TEXT,
-    success           INTEGER DEFAULT 1
+    success           INTEGER DEFAULT 1,
+    action_source     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_retention_events_session ON retention_events(session_id);
 CREATE INDEX IF NOT EXISTS idx_retention_events_vm ON retention_events(vm_name);
@@ -1425,7 +1475,8 @@ ON CONFLICT(vm_name, period_id) DO UPDATE SET
     broken_at = $broken_at,
     break_reason = $break_reason,
     last_backup = '$now',
-    updated_at = '$now';
+    updated_at = '$now',
+    purged_at = CASE WHEN '$chain_status' IN ('active','broken') THEN NULL ELSE purged_at END;
 SQL_EOF
     local rc=$?
     if [[ $rc -ne 0 ]]; then
@@ -1531,20 +1582,35 @@ SQL_EOF
 #   $1 - vm_name
 #   $2 - period_id
 #   $3 - chain_location (use '.' for legacy/unknown)
-#   $4 - reason (retention|space_cleanup)
+#   $4 - reason (retention|prune|space_cleanup)
+#   $5 - target_status (deleted|purged, default: deleted)
+#        'deleted' = retention removed this chain
+#        'purged'  = operator removed via --prune
 # Returns: 0 on success, 1 on failure
 sqlite_mark_chain_deleted() {
     [[ "${DRY_RUN:-false}" == true ]] && return 0
     local vm_name="$1" period_id="$2"
     local chain_location="${3:-.}" reason="${4:-retention}"
+    local target_status="${5:-deleted}"
     
     [[ "$SQLITE_MODULE_AVAILABLE" -ne 1 ]] && return 1
+    
+    # Validate target_status
+    case "$target_status" in
+        deleted|purged) ;;
+        *) target_status="deleted" ;;
+    esac
     
     local esc_vm=$(_sql_escape "$vm_name")
     local esc_period=$(_sql_escape "$period_id")
     local esc_location=$(_sql_escape "$chain_location")
     local esc_reason=$(_sql_escape "$reason")
+    local esc_status=$(_sql_escape "$target_status")
     local now=$(date -u '+%Y-%m-%d %H:%M:%S')
+    
+    # Set the appropriate timestamp column based on target status
+    local ts_col="deleted_at"
+    [[ "$target_status" == "purged" ]] && ts_col="purged_at"
     
     sqlite3 "$SQLITE_DB_PATH" << SQL_EOF
 INSERT INTO chain_health (vm_name, period_id, chain_location, chain_status, created_at, updated_at)
@@ -1552,17 +1618,17 @@ VALUES ('$esc_vm', '$esc_period', '$esc_location', 'active', '$now', '$now')
 ON CONFLICT(vm_name, period_id) DO NOTHING;
 
 UPDATE chain_health SET
-    chain_status = 'deleted', restorable_count = 0,
-    break_reason = '$esc_reason', deleted_at = '$now',
+    chain_status = '$esc_status', restorable_count = 0,
+    break_reason = '$esc_reason', ${ts_col} = '$now',
     marked_by = '$esc_reason', updated_at = '$now'
 WHERE vm_name = '$esc_vm' AND period_id = '$esc_period'
   AND chain_status NOT IN ('deleted', 'purged');
 SQL_EOF
     local rc=$?
     if [[ $rc -ne 0 ]]; then
-        log_error "$SQLITE_MODULE_NAME" "sqlite_mark_chain_deleted" "Failed to mark chain deleted: vm=$vm_name period=$period_id (exit=$rc)"
+        log_error "$SQLITE_MODULE_NAME" "sqlite_mark_chain_deleted" "Failed to mark chain $target_status: vm=$vm_name period=$period_id (exit=$rc)"
     else
-        log_debug "$SQLITE_MODULE_NAME" "sqlite_mark_chain_deleted" "Marked deleted: vm=$vm_name period=$period_id reason=$reason"
+        log_debug "$SQLITE_MODULE_NAME" "sqlite_mark_chain_deleted" "Marked $target_status: vm=$vm_name period=$period_id reason=$reason"
     fi
     return $rc
 }
@@ -2167,6 +2233,7 @@ sqlite_log_period_event() {
 #   $11 - preserve_reason (optional)
 #   $12 - triggered_by (optional)
 #   $13 - success (1/0, optional, default 1)
+#   $14 - action_source (optional: prune|retention|orphan_retention)
 # Returns: 0 on success, 1 on failure
 sqlite_log_retention_event() {
     local action="$1"
@@ -2182,6 +2249,7 @@ sqlite_log_retention_event() {
     local preserve_reason="${11:-}"
     local triggered_by="${12:-}"
     local success="${13:-1}"
+    local action_source="${14:-}"
     
     [[ "$SQLITE_MODULE_AVAILABLE" -ne 1 ]] && return 1
     
@@ -2197,10 +2265,15 @@ sqlite_log_retention_event() {
         *) success=0 ;;
     esac
     
+    # Build action_source SQL value
+    local action_source_val="NULL"
+    [[ -n "$action_source" ]] && action_source_val="'$(_sql_escape "$action_source")'"
+    
     local sql="INSERT INTO retention_events (
         session_id, timestamp, vm_name, action, target_type, target_path,
         target_period, rotation_policy, retention_limit, current_count,
-        age_days, freed_bytes, preserve_reason, triggered_by, success
+        age_days, freed_bytes, preserve_reason, triggered_by, success,
+        action_source
     ) VALUES (
         $session_val,
         '$timestamp',
@@ -2216,7 +2289,8 @@ sqlite_log_retention_event() {
         $freed_bytes,
         '$(_sql_escape "$preserve_reason")',
         '$(_sql_escape "$triggered_by")',
-        $success
+        $success,
+        $action_source_val
     );"
     
     if ! _sql_exec "$sql"; then

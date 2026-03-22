@@ -662,8 +662,27 @@ replicate_batch() {
         fi
         
         # Space check
+        # For mirror mode: the destination already holds a previous sync, so
+        # rsync only transfers the delta. The real question is whether the
+        # destination has enough total capacity (free + already-synced data)
+        # to hold the full source. For accumulate mode: each sync adds data,
+        # so the full source_size is genuinely required as free space.
         if [[ $source_size -gt 0 ]]; then
-            if ! _check_destination_space "$dest_path" "$source_size" "$dest_name"; then
+            local effective_required=$source_size
+            if [[ "$sync_mode" == "mirror" ]]; then
+                local dest_existing
+                dest_existing=$(du -sb "$dest_path" 2>/dev/null | cut -f1) || dest_existing=0
+                if [[ -n "$dest_existing" ]] && [[ "$dest_existing" =~ ^[0-9]+$ ]] && [[ $dest_existing -gt 0 ]]; then
+                    effective_required=$((source_size - dest_existing))
+                    [[ $effective_required -lt 0 ]] && effective_required=0
+                    local delta_human
+                    delta_human=$(numfmt --to=iec-i --suffix=B "$effective_required" 2>/dev/null || echo "$effective_required bytes")
+                    local existing_human
+                    existing_human=$(numfmt --to=iec-i --suffix=B "$dest_existing" 2>/dev/null || echo "$dest_existing bytes")
+                    log_debug "replication_local_module.sh" "replicate_batch" "Mirror mode: dest already has $existing_human, effective delta: $delta_human"
+                fi
+            fi
+            if ! _check_destination_space "$dest_path" "$effective_required" "$dest_name"; then
                 log_error "replication_local_module.sh" "replicate_batch" "Insufficient space at: $dest_name"
                 REPLICATION_DEST_STATUS["$dest_name"]="skipped"
                 REPLICATION_DEST_ERROR["$dest_name"]="Insufficient space"
@@ -956,8 +975,12 @@ get_replication_summary() {
             # Show error message for failed destinations
             summary+="${dest_name}: ${status_icon} - ${error}\n"
         else
-            # Skipped/disabled - just show status
-            summary+="${dest_name}: ${status_icon}\n"
+            # Skipped/disabled - show status and reason if available
+            if [[ -n "$error" ]]; then
+                summary+="${dest_name}: ${status_icon} - ${error}\n"
+            else
+                summary+="${dest_name}: ${status_icon}\n"
+            fi
         fi
     done
     

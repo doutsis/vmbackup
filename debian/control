@@ -2,9 +2,8 @@ Package: vmbackup
 Version: __VERSION__
 Architecture: all
 Maintainer: James Doutsis <james@doutsis.com>
-Depends: bash (>= 5.0), libvirt-daemon-system, qemu-utils, sqlite3, jq, coreutils, util-linux
+Depends: bash (>= 5.0), libvirt-daemon-system, qemu-utils, sqlite3, jq, coreutils, util-linux, virtnbdbackup (>= 2.28)
 Recommends: msmtp, rclone
-Suggests: virtnbdbackup
 Section: admin
 Priority: optional
 Homepage: https://github.com/doutsis/vmbackup

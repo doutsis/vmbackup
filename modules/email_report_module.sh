@@ -402,6 +402,77 @@ build_email_body() {
     duration_seconds=$((end_epoch - start_epoch))
     duration_text=$(format_duration "$duration_seconds")
     
+    # Replicate-only session — build simplified body without VM details
+    local _session_status=""
+    if declare -f sqlite_query_session_summary >/dev/null 2>&1; then
+        local _summary_row
+        _summary_row=$(sqlite_query_session_summary 2>/dev/null)
+        [[ -n "$_summary_row" ]] && _session_status="${_summary_row##*|}"
+    fi
+    if [[ "$_session_status" == "replication_only" || ( "$_session_status" == "failed" && "${_summary_row%%|*}" == "0" ) ]]; then
+        # Build replication sections (reuse standard logic)
+        local local_replication_section="" cloud_replication_section=""
+        if [[ "$db_available" -eq 0 ]] && declare -f sqlite_query_session_vm_backups >/dev/null 2>&1; then
+            db_available=1
+        fi
+        if declare -f sqlite_query_session_replication >/dev/null 2>&1; then
+            local local_details="" cloud_details=""
+            while IFS='|' read -r ep_name ep_type transport ep_status ep_bytes \
+                               ep_files ep_dur ep_dest ep_error; do
+                [[ -z "$ep_name" ]] && continue
+                local si="✓"; case "$ep_status" in failed) si="✗" ;; disabled) si="○" ;; esac
+                local bf=$(format_bytes "$ep_bytes") df=$(format_duration "$ep_dur")
+                local line="$si $ep_name ($transport): "
+                if [[ "$ep_status" == "success" ]]; then line+="$bf in $df"
+                elif [[ "$ep_status" == "disabled" ]]; then line+="disabled"
+                else line+="$ep_status"; [[ -n "$ep_error" ]] && line+=" - $ep_error"; fi
+                if [[ "$ep_type" == "local" ]]; then local_details+="$line"$'\n'
+                else cloud_details+="$line"$'\n'; fi
+            done < <(sqlite_query_session_replication 2>/dev/null)
+            [[ -n "$local_details" ]] && local_replication_section="
+--- LOCAL REPLICATION ---
+${local_details}"
+            [[ -n "$cloud_details" ]] && cloud_replication_section="
+--- CLOUD REPLICATION ---
+${cloud_details}"
+        fi
+        [[ -z "$local_replication_section" ]] && local_replication_section="
+--- LOCAL REPLICATION ---
+Not configured"
+        [[ -z "$cloud_replication_section" ]] && cloud_replication_section="
+--- CLOUD REPLICATION ---
+Not configured"
+
+        local total_backup_bytes=$(get_total_backup_size "$EMAIL_BACKUP_PATH")
+        local available_bytes=$(get_available_space "$EMAIL_BACKUP_PATH")
+        local total_disk_bytes; total_disk_bytes=$(df -B1 --output=size "$EMAIL_BACKUP_PATH" 2>/dev/null | tail -1 | tr -d ' ')
+        local total_backup_fmt=$(format_bytes "$total_backup_bytes")
+        local available_fmt=$(format_bytes "$available_bytes")
+        local available_pct=""
+        if [[ -n "$total_disk_bytes" ]] && [[ "$total_disk_bytes" =~ ^[0-9]+$ ]] && [[ "$total_disk_bytes" -gt 0 ]]; then
+            available_pct=" ($((available_bytes * 100 / total_disk_bytes))% free)"
+        fi
+
+        body="Replication-Only Report
+--------------------
+Host: $EMAIL_HOSTNAME
+Date: $date_str
+Started: $start_time
+Finished: $end_time
+Duration: $duration_text
+
+No backups were performed — this was a replication-only session.
+
+--- STORAGE ($EMAIL_BACKUP_PATH) ---
+Used: $total_backup_fmt
+Free: $available_fmt$available_pct
+$local_replication_section$cloud_replication_section
+
+Log: vmbackup-$date_str.txt"
+        echo "$body"
+        return
+    fi
+
     # Query VM backup records from database (session-scoped)
     local db_available=0
     if declare -f sqlite_query_session_vm_backups >/dev/null 2>&1; then
@@ -681,6 +752,15 @@ build_subject() {
         summary_row=$(sqlite_query_session_summary 2>/dev/null)
         if [[ -n "$summary_row" ]]; then
             IFS='|' read -r _total _success _failed _skipped _excluded _bytes _status <<< "$summary_row"
+            # Replicate-only session — distinct subject line
+            if [[ "$_status" == "replication_only" ]]; then
+                echo "Replication Only — $(hostname -s) — OK"
+                return
+            elif [[ "$_status" == "failed" && "$_total" == "0" ]]; then
+                # Replicate-only that failed
+                echo "Replication Only — $(hostname -s) — FAILED"
+                return
+            fi
             success_count=${_success:-0}
             failed_count=${_failed:-0}
             skipped_count=${_skipped:-0}

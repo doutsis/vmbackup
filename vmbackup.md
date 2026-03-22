@@ -1,73 +1,75 @@
 # vmbackup Documentation
 
+
 ## Table of Contents
 1. [Overview](#overview)
 2. [Installation](#installation)
-3. [Security & Permissions](#security--permissions)
-   - [Permission Model](#permission-model)
-   - [Access Groups](#access-groups)
-   - [File Permissions Summary](#file-permissions-summary)
-   - [TPM & BitLocker Key Security](#tpm--bitlocker-key-security)
-   - [Config File Protection (conffiles)](#config-file-protection-conffiles)
-4. [Architecture](#architecture)
-   - [Directory Structure](#directory-structure)
-   - [File Reference](#file-reference)
-   - [External Modules](#external-modules)
-   - [Data Flow](#data-flow)
-5. [Replication Architecture](#replication-architecture)
-   - [Local Replication](#local-replication-replication_local_modulesh)
-   - [Cloud Replication](#cloud-replication-replication_cloud_modulesh)
-   - [Transport Drivers](#transport-drivers-transportssh)
-   - [Transport Function Contract](#transport-function-contract)
-   - [Transport Metrics Contract](#transport-metrics-contract-v10)
-   - [Implementing a New Transport](#implementing-a-new-transport)
-6. [Configuration](#configuration)
+   - [Prerequisites](#prerequisites)
+   - [Dependencies](#dependencies)
+   - [AppArmor Configuration](#apparmor-configuration-debianubuntu)
+   - [Scheduling](#scheduling)
+3. [Configuration](#configuration)
+   - [Quick Setup Guide](#quick-setup-guide)
+   - [Configuration Reference](#configuration-reference)
    - [Configuration Instances](#configuration-instances)
    - [Core Settings](#core-settings)
    - [Priority & Performance Tuning](#priority--performance-tuning)
    - [virtnbdbackup Options](#virtnbdbackup-options)
    - [Checkpoint Management](#checkpoint-management)
+   - [FSTRIM Optimisation](#fstrim-optimisation)
    - [Timeout & Monitoring](#timeout--monitoring)
    - [Unified Logging System](#unified-logging-system)
-7. [VM State Handling](#vm-state-handling)
-8. [Checkpoint System](#checkpoint-system)
-9. [Backup Types & Strategies](#backup-types--strategies)
-10. [Rotation Policies](#rotation-policies)
+4. [VM State Handling](#vm-state-handling)
+5. [Backup Types & Strategies](#backup-types--strategies)
+6. [Checkpoint System](#checkpoint-system)
+7. [Rotation Policies](#rotation-policies)
    - [Policy Types](#policy-types)
    - [Period ID Generation](#period-id-generation)
    - [Retention Settings](#retention-settings)
    - [Accumulate Policy Limits](#accumulate-policy-limits)
    - [Per-VM Policy Configuration](#per-vm-policy-configuration)
-11. [Archive Chain Management](#archive-chain-management)
-    - [Archive Structure](#archive-structure)
-    - [Archive Naming Convention](#archive-naming-convention)
-    - [Files Moved During Archive](#files-moved-during-archive)
-    - [Archive Triggers](#archive-triggers)
-12. [Directory Structure Evolution: Three-Month Extrapolation](#directory-structure-evolution-three-month-extrapolation)
-    - [Month 1: February 2026](#month-1-february-2026)
-    - [Month 2: March 2026](#month-2-march-2026)
-    - [Month 3: April 2026](#month-3-april-2026)
-    - [Storage Summary Table](#storage-summary-table)
-    - [Policy Change Limitation: Orphaned Period Folders](#policy-change-limitation-orphaned-period-folders)
-13. [Backup Lifecycle & Retention Management](#backup-lifecycle--retention-management)
+8. [Archive Chain Management](#archive-chain-management)
+9. [Directory Structure Evolution: Three-Month Extrapolation](#directory-structure-evolution-three-month-extrapolation)
+10. [Backup Lifecycle & Retention Management](#backup-lifecycle--retention-management)
     - [Automated Retention System](#automated-retention-system)
     - [Database Audit Trail](#database-audit-trail)
-    - [Proposed Interactive Operations Model](#proposed-interactive-operations-model)
-14. [Failure Detection & Self-Remediation](#failure-detection--self-remediation)
-15. [TPM Module Integration](#tpm-module-integration)
-16. [Host Configuration Backup](#host-configuration-backup)
-17. [Reports & Queries](#reports--queries)
-18. [SQLite Logging System](#sqlite-logging-system)
+    - [On-Demand Cleanup (`--prune`)](#on-demand-cleanup---prune)
+    - [Standalone Replication (`--replicate-only`)](#standalone-replication---replicate-only)
+11. [Failure Detection & Self-Remediation](#failure-detection--self-remediation)
+12. [Security & Permissions](#security--permissions)
+    - [Permission Model](#permission-model)
+    - [Access Groups](#access-groups)
+    - [File Permissions Summary](#file-permissions-summary)
+    - [TPM & BitLocker Key Security](#tpm--bitlocker-key-security)
+    - [Config File Protection (conffiles)](#config-file-protection-conffiles)
+13. [Architecture](#architecture)
+    - [Directory Structure](#directory-structure)
+    - [File Reference](#file-reference)
+    - [External Modules](#external-modules)
+    - [Data Flow](#data-flow)
+14. [TPM Module Integration](#tpm-module-integration)
+15. [Host Configuration Backup](#host-configuration-backup)
+16. [Reports & Queries](#reports--queries)
+17. [SQLite Logging System](#sqlite-logging-system)
     - [Database Schema](#database-schema)
     - [Chain Health Tracking](#chain-health-tracking)
     - [Query Functions](#query-functions)
-19. [Session Summary & Tracking](#session-summary--tracking)
-20. [Email Reporting System](#email-reporting-system)
-21. [Interrupt Recovery](#interrupt-recovery)
-22. [File Inventory](#file-inventory)
+18. [Session Summary & Tracking](#session-summary--tracking)
+19. [Email Reporting System](#email-reporting-system)
+20. [Interrupt Recovery](#interrupt-recovery)
+21. [File Inventory](#file-inventory)
+22. [Replication Architecture](#replication-architecture)
+    - [Local Replication](#local-replication-replication_local_modulesh)
+    - [Cloud Replication](#cloud-replication-replication_cloud_modulesh)
+    - [Transport Drivers](#transport-drivers-transportssh)
+    - [Transport Function Contract](#transport-function-contract)
+    - [Transport Metrics Contract](#transport-metrics-contract)
+    - [Implementing a New Transport](#implementing-a-new-transport)
 23. [Function Reference](#function-reference)
     - [Module Specifications](#module-specifications)
 24. [Known Issues & Mitigations](#known-issues--mitigations)
+    - [VirtIO discard_granularity & Windows TRIM Performance](#virtio-discard_granularity--windows-trim-performance)
+    - [QEMU Agent Hang on FSTRIM Interruption](#qemu-agent-hang-on-fstrim-interruption)
 
 ---
 
@@ -95,114 +97,16 @@ vmbackup and vmrestore are two halves of one system. vmbackup backs up — [vmre
 - Rotation policies (daily, weekly, monthly, accumulate, never)
 - Accurate session tracking with separate counts for backed-up, excluded, skipped, and failed VMs
 
-### Core Dependencies
-
-| Tool | Purpose | Required |
-|------|---------|----------|
-| `virtnbdbackup` | NBD-based incremental VM backup | Yes |
-| `virsh` | Libvirt VM management | Yes |
-| `qemu-img` | Disk image operations | Yes |
-| `ionice` | I/O priority control | Recommended |
-| `swtpm` | Software TPM emulation | For TPM VMs |
-| QEMU Guest Agent | Filesystem quiescing | For online VMs |
-| `msmtp` | Email notifications | For email reports |
-| `sqlite3` | SQLite database logging | For database logging |
-| `rsync` | Replication sync | For replication |
-| `rclone` | Cloud replication | For cloud replication |
-
-### AppArmor Configuration (Debian/Ubuntu)
-
-On Debian/Ubuntu systems with AppArmor enabled, QEMU is restricted from creating virtnbdbackup's NBD sockets in `/var/tmp/` by default. This causes backups to fail with:
-
-```
-Failed to bind socket to /var/tmp/virtnbdbackup.XXXX: Permission denied
-```
-
-**Detection:** `vmbackup.sh` detects a missing AppArmor override during `check_dependencies()` and logs an error with remediation commands. The backup will **not proceed** until the override is installed.
-
-**Fix via .deb package (recommended):**
-
-The `.deb` package installs the AppArmor snippet automatically to `/etc/apparmor.d/local/abstractions/libvirt-qemu` and reloads all libvirt VM profiles during `postinst`. No manual action is required when installing via the package.
-
-**Manual fix:**
-```bash
-sudo mkdir -p /etc/apparmor.d/local/abstractions
-echo '# Allow virtnbdbackup NBD sockets (installed by vmbackup)
-/var/tmp/virtnbdbackup.* rwk,' | sudo tee /etc/apparmor.d/local/abstractions/libvirt-qemu
-
-# Reload all libvirt VM profiles
-for f in /etc/apparmor.d/libvirt/libvirt-*; do
-  [[ "$f" == *.files || "$(basename "$f")" == "TEMPLATE.qemu" ]] && continue
-  sudo apparmor_parser -r "$f"
-done
-```
-
-> **Note:** If `VIRTNBD_SCRATCH_DIR` is changed from the default `/var/tmp`, the AppArmor rule path must match.
-
-### Scheduling
-
-The backup script should be scheduled via **systemd timer** (recommended) or cron. You must create these files during deployment.
-
-#### Example systemd Timer
-
-Create `/etc/systemd/system/vmbackup.timer`:
-```ini
-[Unit]
-Description=VM Backup Timer
-
-[Timer]
-OnCalendar=*-*-* 02:00:00
-Persistent=true
-RandomizedDelaySec=300
-
-[Install]
-WantedBy=timers.target
-```
-
-#### Example systemd Service
-
-Create `/etc/systemd/system/vmbackup.service`:
-```ini
-[Unit]
-Description=VM Backup Service
-After=libvirtd.service
-Requires=libvirtd.service
-
-[Service]
-Type=oneshot
-ExecStart=/path/to/vmbackup.sh
-# Or for a specific config instance:
-# ExecStart=/path/to/vmbackup.sh --config-instance production
-TimeoutStartSec=14400
-Nice=10
-IOSchedulingClass=best-effort
-IOSchedulingPriority=5
-
-[Install]
-WantedBy=multi-user.target
-```
-
-#### Enable and Start
-
-```bash
-# Enable and start the timer
-sudo systemctl daemon-reload
-sudo systemctl enable vmbackup.timer
-sudo systemctl start vmbackup.timer
-
-# Verify timer is active
-systemctl list-timers vmbackup.timer
-
-# Manual run
-sudo systemctl start vmbackup.service
-
-# View logs
-journalctl -u vmbackup.service -n 100
-```
 
 ---
 
 ## Installation
+
+### Prerequisites
+
+vmbackup is a wrapper around `virtnbdbackup` — it **will not function without it**. Install virtnbdbackup first:
+
+> **[virtnbdbackup installation instructions](https://github.com/abbbi/virtnbdbackup?tab=readme-ov-file#installation)**
 
 ### .deb Package (Recommended)
 
@@ -267,21 +171,22 @@ nano /opt/vmbackup/config/default/vmbackup.conf
 
 ### Dependencies
 
-**Required** (installed automatically by `.deb`):
-- `bash` (≥5.0)
-- `libvirt-daemon-system`
-- `qemu-utils`
-- `sqlite3`
-- `jq`
-- `coreutils`
-- `util-linux`
+| Tool | Package | Required | Notes |
+|------|---------|----------|-------|
+| `virtnbdbackup` | [virtnbdbackup](https://github.com/abbbi/virtnbdbackup) ≥2.28 | **Yes** | The backup engine that vmbackup wraps — install from upstream before vmbackup |
+| `bash` | `bash` ≥5.0 | **Yes** | |
+| `virsh` | `libvirt-daemon-system` | **Yes** | Libvirt VM management |
+| `qemu-img` | `qemu-utils` | **Yes** | Disk image operations |
+| `sqlite3` | `sqlite3` | **Yes** | Activity logging database |
+| `jq` | `jq` | **Yes** | JSON parsing |
+| `ionice` | `util-linux` | **Yes** | I/O priority control |
+| `swtpm` | `swtpm` | For TPM VMs | Software TPM emulation |
+| QEMU Guest Agent | `qemu-guest-agent` (in guest) | For online VMs | Filesystem quiescing and FSTRIM |
+| `msmtp` | `msmtp` | For email reports | Email notifications |
+| `rsync` | `rsync` | For replication | Local replication sync |
+| `rclone` | `rclone` | For cloud replication | Cloud replication |
 
-**Recommended:**
-- `msmtp` — email notifications
-- `rclone` — cloud replication
-
-**Suggested:**
-- `virtnbdbackup` — the backup engine (install separately from upstream)
+All required packages except `virtnbdbackup` are installed automatically by the `.deb` package. `virtnbdbackup` must be installed from [upstream](https://github.com/abbbi/virtnbdbackup?tab=readme-ov-file#installation) first — it is not available in standard distro repositories.
 
 ### User & Group Setup
 
@@ -302,7 +207,104 @@ The `backup` group (GID 34) is a standard Debian system group. The `.deb` packag
 
 > **Note:** Group membership changes require a new login session. Running `newgrp backup` in an existing shell applies the group for that shell only.
 
-### Post-Install Configuration
+
+### AppArmor Configuration (Debian/Ubuntu)
+
+On Debian/Ubuntu systems with AppArmor enabled, QEMU is restricted from creating virtnbdbackup's NBD sockets in `/var/tmp/` by default. This causes backups to fail with:
+
+```
+Failed to bind socket to /var/tmp/virtnbdbackup.XXXX: Permission denied
+```
+
+**Detection:** `vmbackup.sh` detects a missing AppArmor override during `check_dependencies()` and logs an error with remediation commands. The backup will **not proceed** until the override is installed.
+
+**Fix via .deb package (recommended):**
+
+The `.deb` package installs the AppArmor snippet automatically to `/etc/apparmor.d/local/abstractions/libvirt-qemu` and reloads all libvirt VM profiles during `postinst`. No manual action is required when installing via the package.
+
+**Manual fix:**
+```bash
+sudo mkdir -p /etc/apparmor.d/local/abstractions
+echo '# Allow virtnbdbackup NBD sockets (installed by vmbackup)
+/var/tmp/virtnbdbackup.* rwk,' | sudo tee /etc/apparmor.d/local/abstractions/libvirt-qemu
+
+# Reload all libvirt VM profiles
+for f in /etc/apparmor.d/libvirt/libvirt-*; do
+  [[ "$f" == *.files || "$(basename "$f")" == "TEMPLATE.qemu" ]] && continue
+  sudo apparmor_parser -r "$f"
+done
+```
+
+> **Note:** If `VIRTNBD_SCRATCH_DIR` is changed from the default `/var/tmp`, the AppArmor rule path must match.
+
+
+### Scheduling
+
+The backup script should be scheduled via **systemd timer** (recommended) or cron. You must create these files during deployment.
+
+#### Example systemd Timer
+
+Create `/etc/systemd/system/vmbackup.timer`:
+```ini
+[Unit]
+Description=VM Backup Timer
+
+[Timer]
+OnCalendar=*-*-* 02:00:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
+```
+
+#### Example systemd Service
+
+Create `/etc/systemd/system/vmbackup.service`:
+```ini
+[Unit]
+Description=VM Backup Service
+After=libvirtd.service
+Requires=libvirtd.service
+
+[Service]
+Type=oneshot
+ExecStart=/path/to/vmbackup.sh
+# Or for a specific config instance:
+# ExecStart=/path/to/vmbackup.sh --config-instance production
+TimeoutStartSec=14400
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+#### Enable and Start
+
+```bash
+# Enable and start the timer
+sudo systemctl daemon-reload
+sudo systemctl enable vmbackup.timer
+sudo systemctl start vmbackup.timer
+
+# Verify timer is active
+systemctl list-timers vmbackup.timer
+
+# Manual run
+sudo systemctl start vmbackup.service
+
+# View logs
+journalctl -u vmbackup.service -n 100
+```
+
+
+---
+
+## Configuration
+
+### Quick Setup Guide
 
 After installing the `.deb` package, the `config/default/` directory contains **template configuration** with safe defaults (features disabled, placeholder values). You must configure at minimum `vmbackup.conf` before running backups.
 
@@ -350,7 +352,9 @@ This means:
 - `DEFAULT_ROTATION_POLICY` — default retention policy for all VMs (`monthly` is the default)
 - `RETENTION_MONTHS` / `RETENTION_WEEKS` / `RETENTION_DAYS` — how many periods to keep
 - `PROCESS_PRIORITY`, `IO_PRIORITY_CLASS`, `IO_PRIORITY_LEVEL` — resource usage tuning
-- `ENABLE_FSTRIM` — set to `true` to trim VM disks before backup (reduces size, requires QEMU guest agent)
+- `ENABLE_FSTRIM` — trim VM disks before backup (reduces size, requires QEMU guest agent). Enabled by default.
+- `FSTRIM_MINIMUM` — minimum TRIM extent (bytes). Default `1048576` (1 MiB). Linux only; Windows ignores this.
+- `FSTRIM_EXCLUDE_FILE` — file containing VM name patterns to exclude from FSTRIM
 - `ENABLE_AUTO_RECOVERY_ON_CHECKPOINT_CORRUPTION` — set to `"yes"` for unattended self-healing
 
 Most settings have sensible defaults baked into `vmbackup.sh` — the config file only needs to contain values you want to **override**.
@@ -416,7 +420,7 @@ Configures rsync-based replication to local/NAS/remote storage after backups com
 2. Configure at least one destination:
    - Set `DEST_1_ENABLED="yes"`
    - Set `DEST_1_PATH` to your replication target (local mount, NFS, etc.)
-   - Choose `DEST_1_TRANSPORT`: `local`, `ssh`, or `smb` (see [Transport Drivers](#transport-drivers-transportssh) — only `local` is currently implemented)
+   - Choose `DEST_1_TRANSPORT`: `local` (rsync to any mounted path — local disk, NFS, virtiofs, pre-mounted CIFS). Additional transports can be added by implementing the [transport contract](#transport-function-contract).
 3. For SSH transport, also set `DEST_N_HOST`, `DEST_N_USER`, `DEST_N_PORT`, `DEST_N_SSH_KEY`
 
 If you don't need local replication, set `REPLICATION_ENABLED="no"` (this is the template default). Individual destinations can be toggled with `DEST_N_ENABLED` when the master switch is on.
@@ -496,412 +500,10 @@ sudo nano /opt/vmbackup/config/production/vmbackup.conf
 sudo vmbackup --config-instance production --dry-run
 ```
 
----
 
-## Security & Permissions
+### Configuration Reference
 
-### Permission Model
 
-vmbackup uses **SGID (setgid)** on backup directories so that every new file and subdirectory automatically inherits the `backup` group. No post-hoc `chown` or `chgrp` is needed on individual files.
-
-| Layer | Mechanism | Effect |
-|-------|-----------|--------|
-| **vmbackup.sh** | `umask 027` | Files: `640` (`rw-r-----`), Dirs: `750` (`rwxr-x---`) |
-| **vmbackup.sh** | `ensure_backup_path_sgid()` | BACKUP_PATH gets `root:backup 2750` on first run |
-| **vmbackup.sh** | `set_backup_permissions()` | Applies `root:backup` + SGID to directories (recursive sweep) |
-| **systemd** | `UMask=0027` | Belt-and-suspenders with script umask |
-| **Makefile/dpkg** | `install -m 750/640` | Installed files are not world-accessible |
-| **postinst** | `chown -R root:backup /opt/vmbackup` | Group ownership set on install/upgrade |
-
-### How SGID Works
-
-When a directory has the SGID bit set (mode `2750`, shown as `drwxr-s---`):
-
-1. New **files** created inside inherit the directory's **group** (not the creating process's group)
-2. New **subdirectories** inherit both the group **and** the SGID bit — propagation is automatic
-3. Combined with `umask 027`, files are created as `root:backup 640` and dirs as `root:backup 2750`
-
-This means vmbackup only needs to set SGID once on `BACKUP_PATH` — all subsequent `mkdir`, `touch`, file redirects, and `virtnbdbackup` output automatically inherit `backup` group ownership.
-
-### First-Run Setup
-
-See [BACKUP_PATH Setup](#backup_path-setup) in the Installation section. In short: `mkdir -p` the directory and vmbackup handles the rest.
-
-On first run, `ensure_backup_path_sgid()` detects the directory lacks SGID or backup group ownership and automatically applies `root:backup 2750`. This runs before `init_logging()` so all subdirectories (`_state/`, `_state/logs/`, `_state/temp/`) are created under the correct group.
-
-### Access Groups
-
-See [User & Group Setup](#user--group-setup) in the Installation section for setup instructions.
-
-| Group | Purpose | Grant command |
-|-------|---------|---------------|
-| `backup` | Read access to all backups, logs, configs, and scripts | `sudo usermod -aG backup <username>` |
-| `libvirt` | Read-only virsh access (VM status, `virsh list`, etc.) | `sudo usermod -aG libvirt <username>` |
-
-**Example — grant full read access:**
-
-```bash
-sudo usermod -aG backup myuser
-sudo usermod -aG libvirt myuser
-# Log out and back in for group membership to take effect
-```
-
-### What Runs as Root
-
-vmbackup.sh runs as root via systemd (required for libvirt, virtnbdbackup, and TPM access). All child processes — including virtnbdbackup — inherit the `umask 027`. Because BACKUP_PATH and its subdirectories have SGID set, all new files are created as `root:backup 640` automatically.
-
-### Permission Enforcement Architecture
-
-Two functions handle permissions:
-
-**`ensure_backup_path_sgid()`** — runs once at the start of `main()`, before `init_logging()`:
-- Checks if `BACKUP_PATH` has `backup` group ownership and SGID bit
-- If not, applies `chown root:backup` and `chmod 2750`
-- Ensures all subsequent directory creation inherits the correct group
-- Logs to stderr since the logging system isn't initialised yet
-
-**`set_backup_permissions()`** — the recursive sweep and safety net:
-
-| Mode | Invocation | Behaviour |
-|------|-----------|-----------|
-| **Single-target** | `set_backup_permissions "/path"` | `chown root:backup` + `chmod g+s` on the named path |
-| **Recursive** | `set_backup_permissions "/path" --recursive` | Uses `find` to apply `chown root:backup` and `chmod g+s` to the entire tree |
-
-**Recursive mode** excludes `tpm-state/` directories (TPM private keys must stay `root:root 600`):
-
-```bash
-find "$target_path" \
-  -not -path '*/tpm-state/*' -not -path '*/tpm-state' \
-  -exec chown root:backup {} +
-find "$target_path" -type d \
-  -not -path '*/tpm-state/*' -not -path '*/tpm-state' \
-  -exec chmod g+s {} +
-```
-
-The function is a **no-op** if the `backup` group does not exist on the system (checked via `getent group backup`). All operations suppress errors (`2>/dev/null || true`) so NFS or filesystem permission failures do not abort the backup.
-
-**File modes are never changed by `set_backup_permissions()`** — modes are controlled exclusively by:
-- `umask 027` (set at script top, inherited by all child processes including virtnbdbackup)
-- Explicit `chmod` calls for security-sensitive files (e.g., `chmod 600` for BitLocker keys, `chmod 640` for TPM metadata)
-- `chmod g-s` on `tpm-state/` directories to strip SGID (TPM keys must not inherit backup group)
-
-### Permission Enforcement Points
-
-SGID handles group inheritance automatically. `set_backup_permissions()` is only called in 5 places as bootstrap and safety nets:
-
-| Source File | Function | Target | Mode | Purpose |
-|-------------|----------|--------|------|---------|
-| `vmbackup.sh` | `main()` → `ensure_backup_path_sgid()` | `BACKUP_PATH` | Single | First-run bootstrap |
-| `vmbackup.sh` | `init_logging()` | `STATE_DIR`, log dir, `TEMP_DIR` | Single | Bootstrap before recursive sweep |
-| `vmbackup.sh` | `check_backup_destination()` | `BACKUP_PATH` (full tree) | Recursive | Session-start sweep — catches anything created outside vmbackup |
-| `vmbackup.sh` | `perform_backup()` | Per-VM backup dir | Recursive | Safety net after virtnbdbackup (external tool) |
-| `modules/tpm_backup_module.sh` | TPM backup functions | `tpm-state/` dirs | `chmod g-s` | Strip SGID so TPM keys stay `root:root` |
-
-No modules or library files call `set_backup_permissions()`. All file/directory ownership in modules is handled by SGID inheritance from the parent directory.
-
-### File Permissions Summary
-
-| Path | Owner:Group | Mode | Contents |
-|------|-------------|------|----------|
-| `/opt/vmbackup/` | `root:backup` | `750` | Install tree |
-| `/opt/vmbackup/vmbackup.sh` | `root:backup` | `750` | Main script |
-| `/opt/vmbackup/modules/*.sh` | `root:backup` | `640` | Business logic modules |
-| `/opt/vmbackup/lib/*.sh` | `root:backup` | `640` | Shared libraries |
-| `/opt/vmbackup/transports/*.sh` | `root:backup` | `750` | Transport drivers |
-| `/opt/vmbackup/config/default/*.conf` | `root:backup` | `640` | Instance config (conffiles) |
-| `/var/log/vmbackup/` | `root:backup` | `750` | Log directory |
-| `/run/vmbackup/` | `root:backup` | `750` | Lock files |
-| `$BACKUP_PATH/` | `root:backup` | `2750` | Backup data root (SGID) |
-| `$BACKUP_PATH/<vm>/` | `root:backup` | `2750` | Per-VM backup dirs (SGID inherited) |
-| `$BACKUP_PATH/<vm>/config/` | `root:backup` | `2750` | VM libvirt XML snapshots |
-| `$BACKUP_PATH/<vm>/chain-manifest.json` | `root:backup` | `640` | Backup chain metadata |
-| `$BACKUP_PATH/<vm>/.chain-*/` | `root:backup` | `2750` | Archived chain dirs |
-| `$BACKUP_PATH/<vm>/tpm-state/` | `root:root` | `750` | TPM state root (SGID stripped) |
-| `$BACKUP_PATH/<vm>/tpm-state/tpm2/` | `root:root` | `600` | TPM private keys |
-| `$BACKUP_PATH/<vm>/tpm-state/BACKUP_METADATA.txt` | `root:root` | `640` | TPM backup metadata |
-| `$BACKUP_PATH/<vm>/tpm-state/bitlocker-recovery-keys.txt` | `root:root` | `600` | BitLocker recovery keys |
-| `$BACKUP_PATH/__HOST_CONFIG__/` | `root:backup` | `2750` | Host config archive dir |
-| `$BACKUP_PATH/__HOST_CONFIG__/*.tar.gz` | `root:backup` | `600` | libvirt secrets (mode-restricted) |
-| `$BACKUP_PATH/_state/` | `root:backup` | `2750` | State directory root |
-| `$BACKUP_PATH/_state/backups/` | `root:backup` | `2750` | Backup state files |
-| `$BACKUP_PATH/_state/locks/` | `root:backup` | `2750` | Per-VM lock files |
-| `$BACKUP_PATH/_state/email/` | `root:backup` | `2750` | Email debug output |
-
-### TPM & BitLocker Key Security
-
-TPM state files and BitLocker recovery keys contain sensitive cryptographic material and receive special handling that **overrides** the SGID permission model:
-
-- **TPM state directories** (`tpm-state/`): After creation, SGID is explicitly stripped with `chmod g-s` so the directory does not propagate `backup` group ownership. Contents remain `root:root`.
-- **TPM private keys** (`tpm-state/tpm2/`): Backed up via `sudo cp` from swtpm directories (`tss:tss` owned). After copy, files remain `root:root 600` — the `set_backup_permissions --recursive` call on the parent VM dir explicitly **excludes** `tpm-state/` via `find -not -path` filters.
-- **TPM metadata** (`tpm-state/BACKUP_METADATA.txt`): Written with explicit `chmod 640` — group-readable because it contains only informational text (swtpm version, backup timestamp, recovery instructions), not key material.
-- **BitLocker recovery keys**: Written with explicit `chmod 600` and `chown root:root` — these remain root-only even within the backup group-readable tree.
-
-The net result is that a user in the `backup` group can browse the backup tree, read VM configs and logs, but **cannot** read TPM private keys, BitLocker recovery keys, or libvirt secret material.
-
-### Multi-Instance BACKUP_PATH
-
-Each config instance defines its own `BACKUP_PATH`. The `.deb` package does **not** create `BACKUP_PATH` — the user creates it with `mkdir -p` and vmbackup applies SGID automatically on first run via `ensure_backup_path_sgid()`.
-
-### Config File Protection (conffiles)
-
-The following files are declared as `conffiles` in the `.deb` package. dpkg will **not** overwrite them on upgrade if they have been modified:
-
-- `/opt/vmbackup/config/default/vmbackup.conf`
-- `/opt/vmbackup/config/default/vm_overrides.conf`
-- `/opt/vmbackup/config/default/email.conf`
-- `/opt/vmbackup/config/default/exclude_patterns.conf`
-- `/opt/vmbackup/config/default/replication_cloud.conf`
-- `/opt/vmbackup/config/default/replication_local.conf`
-- `/etc/apparmor.d/local/abstractions/libvirt-qemu`
-
-User-created config instances (e.g., `config/prod/`) are not managed by dpkg and are never touched during upgrade.
-
-### NFS Backup Destinations
-
-When `BACKUP_PATH` is on an NFS mount, be aware of `root_squash` (the NFS default):
-
-| NFS Export Option | Effect on vmbackup |
-|---|---|
-| `root_squash` (default) | All `chgrp backup` calls silently fail — files owned by `nobody:nogroup` |
-| `no_root_squash` | `chgrp backup` works normally — correct `root:backup` ownership |
-
-**If your backup destination is NFS, you must export it with `no_root_squash`** for the security model to function. Example NFS server export:
-
-```
-/mnt/backups  10.0.0.0/24(rw,sync,no_subtree_check,no_root_squash)
-```
-
-Without `no_root_squash`, vmbackup will still run successfully but all files will be owned by `nobody:nogroup` and the `backup` group access model provides no benefit.
-
-For local replication destinations on NFS, the same applies. See `replication_local.conf` for per-destination notes.
-
-### Security-Sensitive Paths
-
-The following paths within `BACKUP_PATH` are intentionally excluded from the `backup` group ownership model and remain `root:root`:
-
-| Path | Mode | Contents | Reason |
-|---|---|---|---|
-| `__HOST_CONFIG__/*.tar.gz` | 600 | libvirt/QEMU config including `/var/lib/libvirt/secrets/` | Contains secret material |
-| `*/tpm-state/tpm2/*` | 600 | TPM private key material (`tpm2-00.permall`) | Encryption keys |
-| `*/tpm-state/BACKUP_METADATA.txt` | 640 | TPM backup metadata and recovery instructions | Non-sensitive (group-readable) |
-
----
-
-## Architecture
-
-```mermaid
-flowchart TD
-    subgraph main["vmbackup.sh Main"]
-        A["Configuration<br/>Instance Load"] --> B["Dependencies<br/>Check"]
-        B --> C["Session Init<br/>Lock Cleanup"]
-
-        C --> vm_loop
-
-        subgraph vm_loop["Per-VM Loop"]
-            D["Policy Check<br/>(Hook)"] --> E["State Validate<br/>(Cache)"]
-            E --> F["Backup Type<br/>Decision"]
-            F --> G["Execute<br/>Backup"]
-            G --> H["Post-Backup<br/>Hook"]
-        end
-
-        vm_loop --> I["Retention<br/>Cleanup"]
-        I --> J["Replication<br/>(Optional)"]
-        J --> K["Session<br/>Summary"]
-        K --> L["SQLite Logging<br/>Module"]
-        K --> M["Email Report<br/>Module"]
-    end
-```
-
-### Directory Structure
-
-Installed layout from the `.deb` package:
-
-```
-/opt/vmbackup/
-├── vmbackup.sh                      # Main entry point
-│
-├── modules/                         # Business logic modules
-│   ├── vmbackup_integration.sh      # Module loader, lifecycle hooks
-│   ├── rotation_module.sh           # Rotation policies
-│   ├── logging_module.sh            # SQLite lifecycle logging
-│   ├── chain_manifest_module.sh     # JSON manifest for restore points
-│   ├── retention_module.sh          # Per-VM retention enforcement
-│   ├── email_report_module.sh       # Email notifications
-│   ├── replication_local_module.sh  # Multi-destination local replication
-│   ├── replication_cloud_module.sh  # Cloud replication via rclone
-│   ├── fstrim_optimization_module.sh # Pre-backup FSTRIM
-│   └── tpm_backup_module.sh         # TPM state backup
-│
-├── lib/                             # Infrastructure utilities
-│   ├── sqlite_module.sh             # SQLite database layer
-│   ├── chain_validation.sh          # Backup chain integrity checks
-│   ├── transfer_utils.sh            # Replication file-transfer helpers
-│   ├── logging.sh                   # Shared logging functions
-│   └── vm_lock.sh                   # Per-VM lock management
-│
-├── transports/                      # Local replication drivers
-│   ├── transport_local.sh
-│   ├── transport_ssh.sh
-│   └── transport_smb.sh
-│
-├── cloud_transports/                # Cloud replication drivers
-│   ├── cloud_transport_sharepoint.sh
-│   └── sharepoint_auth.sh
-│
-└── config/                          # Configuration instances
-    ├── default/                     # Production defaults
-    └── template/                    # Documented templates
-
-/lib/systemd/system/
-├── vmbackup.service                 # Backup service (oneshot)
-└── vmbackup.timer                   # Daily timer (01:00)
-
-/etc/apparmor.d/local/abstractions/
-└── libvirt-qemu                     # virtnbdbackup socket access rule
-```
-
-### File Reference
-
-#### Core Scripts
-
-| File | Purpose |
-|------|---------|
-| `vmbackup.sh` | Main backup orchestrator - VM discovery, backup execution, session management |
-
-#### Business Logic Modules (modules/)
-
-| File | Purpose |
-|------|---------|
-| `modules/vmbackup_integration.sh` | Loads modules, provides pre/post backup hooks, period boundary detection |
-| `modules/rotation_module.sh` | Rotation policies (daily/weekly/monthly/accumulate), period ID generation |
-| `modules/retention_module.sh` | Per-VM retention enforcement, orphan cleanup, age-based deletion |
-| `modules/chain_manifest_module.sh` | JSON manifest for restore points, chain tracking |
-| `modules/logging_module.sh` | SQLite lifecycle logging (log_chain_lifecycle, log_period_lifecycle, log_file_operation, log_retention_action, log_config_event) |
-| `modules/email_report_module.sh` | Email notifications with backup summary and log attachment |
-| `modules/replication_local_module.sh` | Multi-destination local replication (local/SSH/SMB) |
-| `modules/replication_cloud_module.sh` | Cloud replication via rclone (SharePoint, Backblaze) |
-| `modules/fstrim_optimization_module.sh` | Pre-backup FSTRIM to reduce backup size |
-| `modules/tpm_backup_module.sh` | TPM state backup for BitLocker/Secure Boot VMs + BitLocker key extraction |
-
-#### Infrastructure Utilities (lib/)
-
-| File | Purpose |
-|------|---------|
-| `lib/sqlite_module.sh` | SQLite database layer - sessions, VM backups, chain health tracking |
-| `lib/chain_validation.sh` | Validates backup chain integrity before restore |
-| `lib/transfer_utils.sh` | Common file transfer utilities for replication |
-| `lib/logging.sh` | Shared logging functions (log_info, log_warn, log_error) |
-| `lib/vm_lock.sh` | Per-VM lock management (prevents concurrent backups) |
-
-#### Transport Drivers (transports/)
-
-See [Transport Drivers](#transport-drivers-transportssh) in the Replication Architecture section for the full contract and implementation guide.
-
-| File | Purpose | Status |
-|------|---------|--------|
-| `transports/transport_local.sh` | Local filesystem rsync replication | **Production** |
-| `transports/transport_ssh.sh` | SSH/rsync remote replication | **Stub** — not implemented |
-| `transports/transport_smb.sh` | SMB/CIFS mount + rsync replication | **Stub** — not implemented |
-
-#### Cloud Transport Drivers (cloud_transports/)
-
-| File | Purpose | Status |
-|------|---------|--------|
-| `cloud_transports/cloud_transport_sharepoint.sh` | SharePoint Online via rclone | **Production** |
-| `cloud_transports/sharepoint_auth.sh` | SharePoint rclone auth helper (CLI flags, instance discovery) | **Production** |
-
-#### Configuration (config/)
-
-| Directory | Purpose |
-|-----------|---------|
-| `config/default/` | Production configuration files (used by default) |
-| `config/template/` | Fully documented template configs for new deployments |
-
-Each config directory contains:
-- `vmbackup.conf` - Main backup settings
-- `vm_overrides.conf` - Per-VM rotation policy overrides
-- `exclude_patterns.conf` - VM exclusion patterns
-- `email.conf` - Email notification settings
-- `replication_local.conf` - Local replication destinations
-- `replication_cloud.conf` - Cloud replication settings
-
-### External Modules
-
-All modules reside in the `modules/` subdirectory.
-
-| Module | File | Purpose |
-|--------|------|---------|
-| Integration | `modules/vmbackup_integration.sh` | Module loader, pre/post backup hooks, archival |
-| Rotation | `modules/rotation_module.sh` | Rotation policies, period boundaries |
-| Retention | `modules/retention_module.sh` | Per-VM retention enforcement |
-| Chain Manifest | `modules/chain_manifest_module.sh` | JSON manifest for restore points |
-| Logging | `modules/logging_module.sh` | SQLite lifecycle logging |
-| Email Report | `modules/email_report_module.sh` | Email notifications with log attachment |
-| Local Replication | `modules/replication_local_module.sh` | Local/SSH/SMB offsite backup |
-| Cloud Replication | `modules/replication_cloud_module.sh` | SharePoint/Backblaze cloud backup |
-| FSTRIM | `modules/fstrim_optimization_module.sh` | Pre-backup TRIM optimization |
-| TPM Backup | `modules/tpm_backup_module.sh` | Backup TPM state for BitLocker/Secure Boot |
-
-### Data Flow
-
-```mermaid
-flowchart TD
-    A["VM Discovery"] --> B["Pre-Backup Hook"]
-
-    subgraph B_detail["Pre-Backup Hook"]
-        B1["Policy Check<br/>(vm_overrides.conf)"]
-        B2["Period Boundary Detection<br/>(rotation_module.sh)"]
-        B3["Archival Decision"]
-    end
-
-    B --> C["State Validation"]
-
-    subgraph C_detail["State Validation"]
-        C1["Phase 1: Directory existence"]
-        C2["Phase 2: Checkpoint health"]
-        C3["Phase 3: Chain continuity"]
-        C4["Phase 4: Manifest consistency"]
-        C5["Phase 5: Disk alignment"]
-    end
-
-    C --> D["Backup Type Decision"]
-
-    subgraph D_detail["Backup Type Decision"]
-        D1["full — new chain"]
-        D2["auto — virtnbdbackup decides"]
-        D3["copy — offline incremental"]
-    end
-
-    D --> E["FSTRIM Optimization<br/>(if running + agent)"]
-    E --> F["Execute Backup"]
-
-    subgraph F_detail["Execute Backup"]
-        F1["virtnbdbackup<br/>(primary)"]
-        F2["TPM backup<br/>(if applicable)"]
-    end
-
-    F --> G["Post-Backup Hook"]
-
-    subgraph G_detail["Post-Backup Hook"]
-        G1["Manifest update"]
-        G2["SQLite logging<br/>(sqlite_module.sh)"]
-        G3["Retention cleanup"]
-    end
-
-    G --> H["Replication<br/>(optional)"]
-
-    subgraph H_detail["Replication"]
-        H1["Local — rsync to NAS"]
-        H2["Cloud — rclone to<br/>SharePoint / B2"]
-    end
-
-    H --> I["Session Summary"]
-    I --> J["Email report<br/>(if enabled)"]
-```
-
----
-
-## Configuration
 
 ### Configuration Instances
 
@@ -923,6 +525,7 @@ config/
 │   ├── vmbackup.conf                 # Main settings + replication order
 │   ├── vm_overrides.conf             # Per-VM rotation policies
 │   ├── exclude_patterns.conf         # Glob patterns to exclude VMs
+│   ├── fstrim_exclude.conf           # VM patterns to exclude from FSTRIM
 │   ├── email.conf                    # Email notification settings
 │   ├── replication_local.conf        # Local/NAS replication destinations
 │   └── replication_cloud.conf        # Cloud replication destinations
@@ -931,6 +534,7 @@ config/
 │   ├── vmbackup.conf
 │   ├── vm_overrides.conf
 │   ├── exclude_patterns.conf
+│   ├── fstrim_exclude.conf
 │   ├── email.conf
 │   ├── replication_local.conf
 │   └── replication_cloud.conf
@@ -939,6 +543,7 @@ config/
     ├── vmbackup.conf                 # Full documentation of all options
     ├── vm_overrides.conf
     ├── exclude_patterns.conf
+    ├── fstrim_exclude.conf
     ├── email.conf
     ├── replication_local.conf
     └── replication_cloud.conf
@@ -1016,10 +621,19 @@ ENABLE_AUTO_RECOVERY_ON_CHECKPOINT_CORRUPTION="warn"  # yes|warn|no
 
 #################################################################################
 # FSTRIM OPTIMIZATION
+# Pre-backup TRIM via QEMU guest agent. Reclaims free space inside guest
+# filesystems so qcow2 images compress better and incrementals are smaller.
+# Requires a running QEMU guest agent inside each VM.
 #################################################################################
-ENABLE_FSTRIM=false
+ENABLE_FSTRIM=true
 FSTRIM_TIMEOUT=300
 FSTRIM_WINDOWS_TIMEOUT=600
+FSTRIM_MINIMUM=1048576        # Minimum TRIM extent size in bytes (Linux only;
+                              # Windows ignores this). 0 = trim everything.
+                              # 1048576 (1 MiB) is a good default that skips
+                              # trivially small extents.
+FSTRIM_EXCLUDE_FILE="fstrim_exclude.conf"  # File with VM name patterns to
+                              # exclude from FSTRIM (one pattern per line).
 
 #################################################################################
 # OFFLINE VM HANDLING
@@ -1061,7 +675,7 @@ VM_POLICY["template-win11"]="never"       # Exclude from backups
 
 #### exclude_patterns.conf — Pattern-Based Exclusions
 
-Exclude VMs matching glob patterns.
+Exclude VMs by name using wildcard patterns.
 
 ```bash
 EXCLUDE_PATTERN=()
@@ -1072,6 +686,40 @@ EXCLUDE_PATTERN+=("*-template")       # Exclude template VMs
 EXCLUDE_PATTERN+=("*-clone-*")        # Exclude clones
 EXCLUDE_PATTERN+=("tmp-*")            # Exclude temporary VMs
 ```
+
+#### fstrim_exclude.conf — FSTRIM Exclusions
+
+Exclude specific VMs from pre-backup FSTRIM. One glob pattern per line. `#` comments and blank lines are ignored. VMs matching any pattern are silently skipped (status logged as `"excluded"`).
+
+**Why exclude a VM from FSTRIM?**
+- **Database servers** — TRIM can cause latency spikes on write-heavy workloads (e.g. PostgreSQL, MySQL with `O_DIRECT`)
+- **Legacy guest OS or drivers** — older Windows guests (≤ Win 7) or outdated VirtIO drivers may not handle `guest-fstrim` correctly
+- **Filesystems that do not support TRIM** — XFS on older kernels, ZFS, ext2, or any filesystem mounted without `discard` support
+- **Raw or passthrough disks** — TRIM has no effect on raw block devices or host-passthrough storage; the attempt is harmless but pointless
+- **Known QEMU agent issues** — VMs where the guest agent is installed but `guest-fstrim` hangs or returns errors
+
+VMs without a QEMU guest agent are already skipped automatically — this file is for VMs that *have* an agent but should still be excluded.
+
+```bash
+# Glob patterns (not regex). One per line.
+#
+# Pattern syntax:
+#   *        - Matches any characters
+#   ?        - Matches single character
+#   [abc]    - Matches any character in brackets
+
+# Database servers — TRIM can cause latency spikes under heavy I/O
+# db-prod-pg
+# db-reporting-*
+
+# Legacy Windows guests with outdated VirtIO drivers
+# legacy-win7-*
+
+# VMs with known guest agent issues
+# old-centos6
+```
+
+This file is referenced by the `FSTRIM_EXCLUDE_FILE` setting in `vmbackup.conf` (default: `fstrim_exclude.conf`, resolved relative to the config instance directory). See [FSTRIM Optimisation](#fstrim-optimisation) in the configuration reference.
 
 #### email.conf — Notifications
 
@@ -1107,7 +755,7 @@ REPLICATION_MIN_FREE_PERCENT=10
 #=============================================================================
 DEST_1_ENABLED="no"
 DEST_1_NAME="local-backup"
-DEST_1_TRANSPORT="local"                # local|ssh|smb
+DEST_1_TRANSPORT="local"                # Transport driver (ships with local; extensible)
 DEST_1_PATH="/mnt/backups"
 DEST_1_SYNC_MODE="mirror"             # mirror (--delete) | accumulate
 DEST_1_BWLIMIT="0"                    # KB/s, 0=unlimited
@@ -1118,7 +766,7 @@ DEST_1_VERIFY="size"                  # none|size|checksum
 #=============================================================================
 DEST_2_ENABLED="no"
 DEST_2_NAME="offsite-ssh"
-DEST_2_TRANSPORT="ssh"
+DEST_2_TRANSPORT="ssh"                  # Scaffold — not yet implemented
 DEST_2_HOST="backup.example.com"
 DEST_2_USER="backupuser"
 DEST_2_PORT="22"
@@ -1476,6 +1124,18 @@ IO_PRIORITY_LEVEL=4
 | `CHECKPOINT_MAX_DEPTH_WARN` | `10` | Log warning if chain exceeds this depth. |
 | `ENABLE_AUTO_RECOVERY_ON_CHECKPOINT_CORRUPTION` | `warn` | `yes`=auto-fix, `warn`=log only, `no`=fail |
 
+### FSTRIM Optimisation
+
+Pre-backup TRIM via the QEMU guest agent. Reclaims free space inside guest filesystems so qcow2 images compress better and incrementals are smaller. Requires a running QEMU guest agent inside the VM.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ENABLE_FSTRIM` | `true` | Enable pre-backup FSTRIM. Set `false` to disable globally. |
+| `FSTRIM_TIMEOUT` | `300` | Timeout in seconds for Linux / unknown guests (5 minutes). |
+| `FSTRIM_WINDOWS_TIMEOUT` | `600` | Timeout in seconds for Windows guests (10 minutes). Windows TRIM is significantly slower unless the VirtIO `discard_granularity` XML fix is applied — see [Known Issue](#virtio-discard_granularity--windows-trim-performance). |
+| `FSTRIM_MINIMUM` | `1048576` | Minimum TRIM extent in bytes (Linux only; Windows ignores this). `0` = trim everything. Default 1 MiB skips trivially small extents. |
+| `FSTRIM_EXCLUDE_FILE` | `fstrim_exclude.conf` | File containing VM name patterns to exclude from FSTRIM. Resolved relative to the config instance directory. See [fstrim_exclude.conf](#fstrim_excludeconf--fstrim-exclusions). |
+
 ### Timeout & Monitoring
 
 | Variable | Default | Description |
@@ -1618,6 +1278,36 @@ Treated identically to running VMs. The script's pause/resume logic handles back
 
 ---
 
+## Backup Types & Strategies
+
+### Backup Type Decision Matrix
+
+| Condition | Backup Type | Command Flag |
+|-----------|-------------|--------------|
+| Month boundary (new month) | `full` | `virtnbdbackup --full` |
+| Day 01 AND no existing valid data | `full` | `virtnbdbackup --full` |
+| Day 01 AND existing valid chain | `auto` | `virtnbdbackup --auto` |
+| Recovery flag present | `full` | `virtnbdbackup --full` |
+| Offline VM with changes | `copy` | `virtnbdbackup --copy` |
+| First backup ever | `full` | `virtnbdbackup --full` |
+| Normal daily backup | `auto` | `virtnbdbackup --auto` |
+
+### Retry Strategy
+
+```mermaid
+flowchart TD
+    A["Backup Attempt"] --> B{"Result?"}
+    B -->|Success| C["Complete"]
+    B -->|Failure| D{"Backup type?"}
+    D -->|AUTO| E["Convert to FULL<br/>Retry"]
+    E --> A
+    D -->|FULL| F{"Retries left?"}
+    F -->|Yes| G["Archive chain<br/>Re-validate<br/>Wait"] --> A
+    F -->|No| H["Failed"]
+```
+
+---
+
 ## Checkpoint System
 
 ### Checkpoint Storage Locations
@@ -1653,36 +1343,6 @@ The `validate_backup_state()` function performs 5-phase validation:
 | `broken_chain` | Checkpoint/bitmap mismatch | Archive chain → FULL |
 | `missing_backup_data` | Checkpoints but no .data files | FULL backup |
 | `incomplete_backup` | Partial `.partial` files | Clean partial → FULL |
-
----
-
-## Backup Types & Strategies
-
-### Backup Type Decision Matrix
-
-| Condition | Backup Type | Command Flag |
-|-----------|-------------|--------------|
-| Month boundary (new month) | `full` | `virtnbdbackup --full` |
-| Day 01 AND no existing valid data | `full` | `virtnbdbackup --full` |
-| Day 01 AND existing valid chain | `auto` | `virtnbdbackup --auto` |
-| Recovery flag present | `full` | `virtnbdbackup --full` |
-| Offline VM with changes | `copy` | `virtnbdbackup --copy` |
-| First backup ever | `full` | `virtnbdbackup --full` |
-| Normal daily backup | `auto` | `virtnbdbackup --auto` |
-
-### Retry Strategy
-
-```mermaid
-flowchart TD
-    A["Backup Attempt"] --> B{"Result?"}
-    B -->|Success| C["Complete"]
-    B -->|Failure| D{"Backup type?"}
-    D -->|AUTO| E["Convert to FULL<br/>Retry"]
-    E --> A
-    D -->|FULL| F{"Retries left?"}
-    F -->|Yes| G["Archive chain<br/>Re-validate<br/>Wait"] --> A
-    F -->|No| H["Failed"]
-```
 
 ---
 
@@ -1832,7 +1492,7 @@ Example (27 restore points):
 
 This section demonstrates how the backup directory structure evolves over three months with multiple policy changes, using a VM named `prod-webserver` as an example.
 
-### Configuration Reference
+### Example Configuration
 
 From `config/templates/vmbackup.conf`:
 ```bash
@@ -2438,59 +2098,249 @@ WHERE vm_name = 'web-server' AND period_id = '202607';
 -- Row is NEVER deleted — it serves as a permanent tombstone
 ```
 
-### Proposed Interactive Operations Model
+### On-Demand Cleanup (`--prune`)
 
-Three tiers of file management, escalating in destructiveness:
+Standalone on-demand cleanup of backup data — archives, periods, or entire VMs — without running a backup session. Addresses the gap where automated retention only runs inside `post_backup_hook()` after each successful backup.
 
-#### Tier 1: Inspect (Read-Only)
+#### Usage
 
-Read-only inspection. Browse VMs, view chain health, check period ages and sizes. No state changes.
-
-#### Tier 2: Mark (Soft-Delete, DB-Only)
-
-| Operation | DB Change | Disk Change | Reversible |
-|-----------|-----------|-------------|------------|
-| **Mark for deletion** | `chain_status='marked'`, `deleted_at=NOW()` | None | Yes — unmark reverts |
-| **Unmark** | `chain_status='active'`, `deleted_at=NULL` | None | N/A |
-| **Protect** | `purge_eligible=0` | None | Yes — unprotect reverts |
-| **Unprotect** | `purge_eligible=1` | None | N/A |
-
-All Tier 2 operations log to `retention_events` with `triggered_by='manual'` (versus `'_remove_period'` for automated retention). All are reversible until a Tier 3 sweep runs.
-
-#### Tier 3: Sweep (Destructive, Disk + DB)
-
-| Operation | What it does | Safety Requirements |
-|-----------|-------------|---------------------|
-| **Purge marked** | `rm -rf` everything with `chain_status='marked'` | Dry-run first, confirmation prompt, log to `file_operations` |
-| **Purge orphans** | Delete old-policy period dirs exceeding age threshold | Interactive version of `run_orphan_retention_for_vm()` |
-| **Purge VM** | Delete *all* data for a VM (files + DB rows → tombstones) | Double confirmation, refuse if VM is still in vmlist |
-| **Compact** | Remove empty period dirs, clean up `.incomplete` / stale locks | Low-risk housekeeping |
-
-#### Proposed State Transitions
-
-```mermaid
-stateDiagram-v2
-    [*] --> active
-    active --> archived : archive
-    active --> broken : break
-    archived --> marked : mark
-    broken --> marked : mark
-    marked --> archived : unmark
-    marked --> purged : sweep
+```bash
+sudo vmbackup --prune <target> [--vm <name>] [--dry-run] [--yes] [--config-instance <name>]
 ```
 
-> **Notes:**
-> - `marked` is a NEW state (distinct from current `deleted`)
-> - `purged` = files gone, tombstone remains permanently
-> - `deleted` (existing) stays as-is for backward compat with current retention
-> - Protection (`purge_eligible=0`) is orthogonal — any state except `purged` can be protected
+#### Targets
 
-#### Architecture: Where Each Layer Lives
+| Target | What it deletes | Requires `--vm` | Example |
+|--------|----------------|:---:|---------|
+| `list` | Nothing — read-only discovery view | No (all VMs) or Yes (single VM detail) | `--prune list` |
+| `archives` | All `.archives/` dirs across all periods | No (all VMs) or Yes (one VM) | `--prune archives --vm my-vm` |
+| `archives:<period>` | `.archives/` in a specific period only | Yes | `--prune archives:202603 --vm my-vm` |
+| `chain:<name>` | One specific archived chain directory | Yes | `--prune chain:chain-2026-01-14 --vm my-vm` |
+| `period:<period_id>` | Entire period directory (active chain + archives + config) | Yes | `--prune period:202603 --vm my-vm` |
+| `all` | Everything for a VM (all periods, entire VM directory) | Yes | `--prune all --vm my-vm` |
 
-| Layer | Responsibility | Rationale |
-|-------|---------------|-----------|
-| **Shell module** (`retention_module.sh`) | All `rm -rf`, all DB writes, all safety checks | Single source of truth for safe deletion. Already has the primitives. |
-| **CLI wrapper** (`vmbackup.sh --prune`) | Scriptable / cron-able interface | `--prune --dry-run`, `--prune --vm myvm`, `--purge-marked` |
+#### Flags
+
+| Flag | Effect |
+|------|--------|
+| `--vm <name>` | Scope operation to a single VM. Required for all targets except `list` and `archives` (without period qualifier) |
+| `--dry-run` | Preview what would be removed without making changes |
+| `--yes` | Skip confirmation prompt (for scripting/cron) |
+| `--config-instance <name>` | Use a specific configuration instance (determines `BACKUP_PATH`) |
+
+#### Discovery: `--prune list`
+
+Space-focused discovery view. Shows every purgeable target with its size so the operator can construct a `--prune` command.
+
+```bash
+# All VMs — summary with per-VM totals
+sudo vmbackup --prune list
+
+# Single VM — detailed view with per-chain sizes and copy-paste commands
+sudo vmbackup --prune list --vm my-vm
+```
+
+**All-VMs view** shows per-VM totals (period count, archive count, total size, archive size). **Single-VM view** adds per-period breakdown with individual archive chains and their sizes, plus copy-paste `--prune` commands as `#` comments.
+
+Data sourced from filesystem only (`find`, `du`) — works even if the SQLite DB is missing.
+
+#### Operator Workflow
+
+```
+list → choose target → --dry-run → execute
+```
+
+1. **Discover** — `--prune list` to see sizes and copy-paste commands
+2. **Preview** — `--prune <target> --vm <name> --dry-run` to see what would be removed
+3. **Execute** — `--prune <target> --vm <name>` (confirmation prompt, or `--yes` to skip)
+
+#### Safety Guards
+
+| Guard | Behaviour |
+|-------|-----------|
+| **Keep-last protection** | `period:` target refuses to delete the last remaining period for a VM. Use `all` to explicitly remove everything. |
+| **Confirmation prompt** | Interactive Y/N prompt before any destructive operation. Bypass with `--yes`. |
+| **`_is_safe_to_remove()`** | Same path safety validation used by automated retention — prevents removal of paths outside `BACKUP_PATH`. |
+| **Dry-run logging** | Dry runs are logged (tagged `DRY RUN`) for audit purposes. |
+
+#### Database Audit Trail
+
+All prune operations record audit rows in the same tables used by automated retention:
+
+| Table | What's recorded |
+|-------|----------------|
+| `chain_events` | `chain_purged` event for each archived chain removed |
+| `period_events` | `period_deleted` event when a period is removed |
+| `retention_events` | Action, target path, freed bytes, triggered_by=`prune` |
+| `file_operations` | Filesystem-level record of each deletion |
+| `chain_health` | `chain_status='purged'`, `purged_at` timestamp (tombstone row persists) |
+
+#### Log File
+
+All prune operations log to `<BACKUP_PATH>/_state/logs/vmprune.log` — separate from the main backup session log. Each entry includes timestamp, VM name, target, and bytes freed.
+
+#### Examples
+
+```bash
+# Free space by removing all archives across all VMs (preserves active chains)
+sudo vmbackup --prune archives --yes
+
+# Remove a single archived chain (~8.7 GiB)
+sudo vmbackup --prune chain:chain-2026-01-14 --vm my-vm --yes
+
+# Remove an old period (active + archives)
+sudo vmbackup --prune period:202602 --vm web-server --yes
+
+# Nuclear option — remove all backup data for a decommissioned VM
+sudo vmbackup --prune all --vm old-vm --yes
+
+# Preview before acting
+sudo vmbackup --prune archives:202603 --vm my-vm --dry-run
+```
+
+---
+
+### Standalone Replication (`--replicate-only`)
+
+Re-run replication without performing a backup. No VMs are processed, no retention runs, no FSTRIM — just the replication phase against existing backup data.
+
+#### Use Cases
+
+| Scenario | Command |
+|----------|---------|
+| Replication failed partway through a normal session | `sudo vmbackup --replicate-only` |
+| Added a new NAS destination after the last backup | `sudo vmbackup --replicate-only local` |
+| Pushing existing backups to a new cloud target | `sudo vmbackup --replicate-only cloud` |
+| Manual sync after storage maintenance window | `sudo vmbackup --replicate-only both` |
+| Verify what would replicate without transferring | `sudo vmbackup --replicate-only --dry-run` |
+| Re-run replication for a specific config instance | `sudo vmbackup --replicate-only --config-instance prod` |
+
+#### CLI Reference
+
+```bash
+sudo vmbackup --replicate-only [local|cloud|both] [--dry-run] [--config-instance <name>]
+```
+
+| Scope | What runs | What's skipped |
+|-------|-----------|----------------|
+| `local` | Local replication (`rsync` to all configured destinations) | Cloud replication |
+| `cloud` | Cloud replication (`rclone` to all configured destinations) | Local replication |
+| `both` (default) | Both local and cloud | Nothing |
+
+If no scope selector is provided, `both` is assumed.
+
+#### Mutual Exclusivity
+
+`--replicate-only` cannot be combined with:
+
+| Flag | Reason |
+|------|--------|
+| `--prune` | Prune is a standalone cleanup mode |
+| `--vm` | Replicate-only operates on all backup data, not individual VMs |
+
+Attempting either combination exits with an error and non-zero return code.
+
+#### What Gets Skipped
+
+The following normal-session operations are bypassed entirely:
+
+- `check_dependencies()` — virtnbdbackup/virsh not needed
+- VM discovery (`virsh list`)
+- FSTRIM optimisation
+- Stale qemu-nbd cleanup
+- All backup and retention logic
+
+#### Configuration Interaction
+
+Replicate-only respects your existing replication configuration:
+
+| Config state | Behaviour |
+|--------------|-----------|
+| Local enabled, cloud enabled | Both run (or whichever scope was requested) |
+| Local enabled, cloud disabled | Cloud skipped silently if `both`; clean exit if `--replicate-only cloud` |
+| Neither enabled | Exit 0 with log message — not an error, respects config |
+| `REPLICATION_ORDER` | Honoured (`simultaneous`, `local_first`, `cloud_first`) |
+| Cancel flag set | Checked before each replication phase — graceful abort |
+
+#### Dispatch Flow
+
+```
+main()
+  ├── parse args (store _REPLICATE_ONLY_MODE)
+  ├── load config, init logging, init SQLite
+  ├── init replication modules (local and/or cloud)
+  │
+  ├── [_REPLICATE_ONLY_MODE is set]
+  │     └── _run_replicate_only()
+  │           ├── validate BACKUP_PATH exists
+  │           ├── check module availability vs requested scope
+  │           ├── check cancel flag
+  │           ├── run replication (respecting REPLICATION_ORDER)
+  │           ├── _log_replicate_only_summary()   ← no VM table
+  │           ├── sqlite_session_end()
+  │           ├── send email report
+  │           └── exit with replication result code
+  │
+  └── [normal backup flow continues]
+```
+
+#### Session Summary Format
+
+Replicate-only sessions print a simplified summary without the VM table:
+
+```
+╔═══════════════════════════════════════════════════╗
+║         REPLICATION-ONLY SESSION SUMMARY          ║
+╠═══════════════════════════════════════════════════╣
+║  Mode:    replicate-only (both)
+║  Host:    my-host
+║  Config:  default
+║  Duration: 3m 22s
+║
+║  Local Replication:  OK (2 destinations)
+║  Cloud Replication:  FAILED (1 destination)
+║
+║  Status:  FAILED
+╚═══════════════════════════════════════════════════╝
+```
+
+#### Database Behaviour
+
+A replicate-only session creates a normal `sessions` row with `session_type='replicate_only'`. Replication results are logged to `replication_runs` and `replication_vms` as usual.
+
+| Table | Rows created |
+|-------|-------------|
+| `sessions` | 1 row — `status` is `replication_only` (success) or `failed` |
+| `replication_runs` | 1 per destination that was attempted |
+| `replication_vms` | 1 per VM per destination (logged by rsync/rclone) |
+| `vm_backups` | 0 — no backups performed |
+
+#### Email Report
+
+If email is configured, a report is sent with:
+
+- **Subject:** `Replication Only — hostname — OK` or `Replication Only — hostname — FAILED`
+- **Body:** Replication sections only (local and/or cloud results), no VM details
+- **Footer:** "No backups were performed — this was a replication-only session"
+
+#### Examples
+
+```bash
+# Re-run all replication after a failed session
+sudo vmbackup --replicate-only
+
+# Push to local NAS only
+sudo vmbackup --replicate-only local
+
+# Push to cloud only
+sudo vmbackup --replicate-only cloud
+
+# Dry run — see what would happen without transferring
+sudo vmbackup --replicate-only --dry-run
+
+# Specific config instance
+sudo vmbackup --replicate-only local --config-instance prod
+```
 
 ---
 
@@ -2539,6 +2389,411 @@ flowchart TD
 | AUTO backup fails | Exit code | Convert to FULL, retry |
 | FULL backup fails | Exit code | Retry with delay |
 | Script interrupted | Signal handler | Next run recovers |
+
+---
+
+## Security & Permissions
+
+### Permission Model
+
+vmbackup uses **SGID (setgid)** on backup directories so that every new file and subdirectory automatically inherits the `backup` group. No post-hoc `chown` or `chgrp` is needed on individual files.
+
+| Layer | Mechanism | Effect |
+|-------|-----------|--------|
+| **vmbackup.sh** | `umask 027` | Files: `640` (`rw-r-----`), Dirs: `750` (`rwxr-x---`) |
+| **vmbackup.sh** | `ensure_backup_path_sgid()` | BACKUP_PATH gets `root:backup 2750` on first run |
+| **vmbackup.sh** | `set_backup_permissions()` | Applies `root:backup` + SGID to directories (recursive sweep) |
+| **systemd** | `UMask=0027` | Belt-and-suspenders with script umask |
+| **Makefile/dpkg** | `install -m 750/640` | Installed files are not world-accessible |
+| **postinst** | `chown -R root:backup /opt/vmbackup` | Group ownership set on install/upgrade |
+
+### How SGID Works
+
+When a directory has the SGID bit set (mode `2750`, shown as `drwxr-s---`):
+
+1. New **files** created inside inherit the directory's **group** (not the creating process's group)
+2. New **subdirectories** inherit both the group **and** the SGID bit — propagation is automatic
+3. Combined with `umask 027`, files are created as `root:backup 640` and dirs as `root:backup 2750`
+
+This means vmbackup only needs to set SGID once on `BACKUP_PATH` — all subsequent `mkdir`, `touch`, file redirects, and `virtnbdbackup` output automatically inherit `backup` group ownership.
+
+### First-Run Setup
+
+See [BACKUP_PATH Setup](#backup_path-setup) in the Installation section. In short: `mkdir -p` the directory and vmbackup handles the rest.
+
+On first run, `ensure_backup_path_sgid()` detects the directory lacks SGID or backup group ownership and automatically applies `root:backup 2750`. This runs before `init_logging()` so all subdirectories (`_state/`, `_state/logs/`, `_state/temp/`) are created under the correct group.
+
+### Access Groups
+
+See [User & Group Setup](#user--group-setup) in the Installation section for setup instructions.
+
+| Group | Purpose | Grant command |
+|-------|---------|---------------|
+| `backup` | Read access to all backups, logs, configs, and scripts | `sudo usermod -aG backup <username>` |
+| `libvirt` | Read-only virsh access (VM status, `virsh list`, etc.) | `sudo usermod -aG libvirt <username>` |
+
+**Example — grant full read access:**
+
+```bash
+sudo usermod -aG backup myuser
+sudo usermod -aG libvirt myuser
+# Log out and back in for group membership to take effect
+```
+
+### What Runs as Root
+
+vmbackup.sh runs as root via systemd (required for libvirt, virtnbdbackup, and TPM access). All child processes — including virtnbdbackup — inherit the `umask 027`. Because BACKUP_PATH and its subdirectories have SGID set, all new files are created as `root:backup 640` automatically.
+
+### Permission Enforcement Architecture
+
+Two functions handle permissions:
+
+**`ensure_backup_path_sgid()`** — runs once at the start of `main()`, before `init_logging()`:
+- Checks if `BACKUP_PATH` has `backup` group ownership and SGID bit
+- If not, applies `chown root:backup` and `chmod 2750`
+- Ensures all subsequent directory creation inherits the correct group
+- Logs to stderr since the logging system isn't initialised yet
+
+**`set_backup_permissions()`** — the recursive sweep and safety net:
+
+| Mode | Invocation | Behaviour |
+|------|-----------|-----------|
+| **Single-target** | `set_backup_permissions "/path"` | `chown root:backup` + `chmod g+s` on the named path |
+| **Recursive** | `set_backup_permissions "/path" --recursive` | Uses `find` to apply `chown root:backup` and `chmod g+s` to the entire tree |
+
+**Recursive mode** excludes `tpm-state/` directories (TPM private keys must stay `root:root 600`):
+
+```bash
+find "$target_path" \
+  -not -path '*/tpm-state/*' -not -path '*/tpm-state' \
+  -exec chown root:backup {} +
+find "$target_path" -type d \
+  -not -path '*/tpm-state/*' -not -path '*/tpm-state' \
+  -exec chmod g+s {} +
+```
+
+The function is a **no-op** if the `backup` group does not exist on the system (checked via `getent group backup`). All operations suppress errors (`2>/dev/null || true`) so NFS or filesystem permission failures do not abort the backup.
+
+**File modes are never changed by `set_backup_permissions()`** — modes are controlled exclusively by:
+- `umask 027` (set at script top, inherited by all child processes including virtnbdbackup)
+- Explicit `chmod` calls for security-sensitive files (e.g., `chmod 600` for BitLocker keys, `chmod 640` for TPM metadata)
+- `chmod g-s` on `tpm-state/` directories to strip SGID (TPM keys must not inherit backup group)
+
+### Permission Enforcement Points
+
+SGID handles group inheritance automatically. `set_backup_permissions()` is only called in 5 places as bootstrap and safety nets:
+
+| Source File | Function | Target | Mode | Purpose |
+|-------------|----------|--------|------|---------|
+| `vmbackup.sh` | `main()` → `ensure_backup_path_sgid()` | `BACKUP_PATH` | Single | First-run bootstrap |
+| `vmbackup.sh` | `init_logging()` | `STATE_DIR`, log dir, `TEMP_DIR` | Single | Bootstrap before recursive sweep |
+| `vmbackup.sh` | `check_backup_destination()` | `BACKUP_PATH` (full tree) | Recursive | Session-start sweep — catches anything created outside vmbackup |
+| `vmbackup.sh` | `perform_backup()` | Per-VM backup dir | Recursive | Safety net after virtnbdbackup (external tool) |
+| `modules/tpm_backup_module.sh` | TPM backup functions | `tpm-state/` dirs | `chmod g-s` | Strip SGID so TPM keys stay `root:root` |
+
+No modules or library files call `set_backup_permissions()`. All file/directory ownership in modules is handled by SGID inheritance from the parent directory.
+
+### File Permissions Summary
+
+| Path | Owner:Group | Mode | Contents |
+|------|-------------|------|----------|
+| `/opt/vmbackup/` | `root:backup` | `750` | Install tree |
+| `/opt/vmbackup/vmbackup.sh` | `root:backup` | `750` | Main script |
+| `/opt/vmbackup/modules/*.sh` | `root:backup` | `640` | Business logic modules |
+| `/opt/vmbackup/lib/*.sh` | `root:backup` | `640` | Shared libraries |
+| `/opt/vmbackup/transports/*.sh` | `root:backup` | `750` | Transport drivers |
+| `/opt/vmbackup/config/default/*.conf` | `root:backup` | `640` | Instance config (conffiles) |
+| `/var/log/vmbackup/` | `root:backup` | `750` | Log directory |
+| `/run/vmbackup/` | `root:backup` | `750` | Lock files |
+| `$BACKUP_PATH/` | `root:backup` | `2750` | Backup data root (SGID) |
+| `$BACKUP_PATH/<vm>/` | `root:backup` | `2750` | Per-VM backup dirs (SGID inherited) |
+| `$BACKUP_PATH/<vm>/config/` | `root:backup` | `2750` | VM libvirt XML snapshots |
+| `$BACKUP_PATH/<vm>/chain-manifest.json` | `root:backup` | `640` | Backup chain metadata |
+| `$BACKUP_PATH/<vm>/.chain-*/` | `root:backup` | `2750` | Archived chain dirs |
+| `$BACKUP_PATH/<vm>/tpm-state/` | `root:root` | `750` | TPM state root (SGID stripped) |
+| `$BACKUP_PATH/<vm>/tpm-state/tpm2/` | `root:root` | `600` | TPM private keys |
+| `$BACKUP_PATH/<vm>/tpm-state/BACKUP_METADATA.txt` | `root:root` | `640` | TPM backup metadata |
+| `$BACKUP_PATH/<vm>/tpm-state/bitlocker-recovery-keys.txt` | `root:root` | `600` | BitLocker recovery keys |
+| `$BACKUP_PATH/__HOST_CONFIG__/` | `root:backup` | `2750` | Host config archive dir |
+| `$BACKUP_PATH/__HOST_CONFIG__/*.tar.gz` | `root:backup` | `600` | libvirt secrets (mode-restricted) |
+| `$BACKUP_PATH/_state/` | `root:backup` | `2750` | State directory root |
+| `$BACKUP_PATH/_state/backups/` | `root:backup` | `2750` | Backup state files |
+| `$BACKUP_PATH/_state/locks/` | `root:backup` | `2750` | Per-VM lock files |
+| `$BACKUP_PATH/_state/email/` | `root:backup` | `2750` | Email debug output |
+
+### TPM & BitLocker Key Security
+
+TPM state files and BitLocker recovery keys contain sensitive cryptographic material and receive special handling that **overrides** the SGID permission model:
+
+- **TPM state directories** (`tpm-state/`): After creation, SGID is explicitly stripped with `chmod g-s` so the directory does not propagate `backup` group ownership. Contents remain `root:root`.
+- **TPM private keys** (`tpm-state/tpm2/`): Backed up via `sudo cp` from swtpm directories (`tss:tss` owned). After copy, files remain `root:root 600` — the `set_backup_permissions --recursive` call on the parent VM dir explicitly **excludes** `tpm-state/` via `find -not -path` filters.
+- **TPM metadata** (`tpm-state/BACKUP_METADATA.txt`): Written with explicit `chmod 640` — group-readable because it contains only informational text (swtpm version, backup timestamp, recovery instructions), not key material.
+- **BitLocker recovery keys**: Written with explicit `chmod 600` and `chown root:root` — these remain root-only even within the backup group-readable tree.
+
+The net result is that a user in the `backup` group can browse the backup tree, read VM configs and logs, but **cannot** read TPM private keys, BitLocker recovery keys, or libvirt secret material.
+
+### Multi-Instance BACKUP_PATH
+
+Each config instance defines its own `BACKUP_PATH`. The `.deb` package does **not** create `BACKUP_PATH` — the user creates it with `mkdir -p` and vmbackup applies SGID automatically on first run via `ensure_backup_path_sgid()`.
+
+### Config File Protection (conffiles)
+
+The following files are declared as `conffiles` in the `.deb` package. dpkg will **not** overwrite them on upgrade if they have been modified:
+
+- `/opt/vmbackup/config/default/vmbackup.conf`
+- `/opt/vmbackup/config/default/vm_overrides.conf`
+- `/opt/vmbackup/config/default/email.conf`
+- `/opt/vmbackup/config/default/exclude_patterns.conf`
+- `/opt/vmbackup/config/default/fstrim_exclude.conf`
+- `/opt/vmbackup/config/default/replication_cloud.conf`
+- `/opt/vmbackup/config/default/replication_local.conf`
+- `/etc/apparmor.d/local/abstractions/libvirt-qemu`
+
+User-created config instances (e.g., `config/prod/`) are not managed by dpkg and are never touched during upgrade.
+
+### NFS Backup Destinations
+
+When `BACKUP_PATH` is on an NFS mount, be aware of `root_squash` (the NFS default):
+
+| NFS Export Option | Effect on vmbackup |
+|---|---|
+| `root_squash` (default) | All `chgrp backup` calls silently fail — files owned by `nobody:nogroup` |
+| `no_root_squash` | `chgrp backup` works normally — correct `root:backup` ownership |
+
+**If your backup destination is NFS, you must export it with `no_root_squash`** for the security model to function. Example NFS server export:
+
+```
+/mnt/backups  10.0.0.0/24(rw,sync,no_subtree_check,no_root_squash)
+```
+
+Without `no_root_squash`, vmbackup will still run successfully but all files will be owned by `nobody:nogroup` and the `backup` group access model provides no benefit.
+
+For local replication destinations on NFS, the same applies. See `replication_local.conf` for per-destination notes.
+
+### Security-Sensitive Paths
+
+The following paths within `BACKUP_PATH` are intentionally excluded from the `backup` group ownership model and remain `root:root`:
+
+| Path | Mode | Contents | Reason |
+|---|---|---|---|
+| `__HOST_CONFIG__/*.tar.gz` | 600 | libvirt/QEMU config including `/var/lib/libvirt/secrets/` | Contains secret material |
+| `*/tpm-state/tpm2/*` | 600 | TPM private key material (`tpm2-00.permall`) | Encryption keys |
+| `*/tpm-state/BACKUP_METADATA.txt` | 640 | TPM backup metadata and recovery instructions | Non-sensitive (group-readable) |
+
+---
+
+## Architecture
+
+```mermaid
+flowchart TD
+    subgraph main["vmbackup.sh Main"]
+        A["Configuration<br/>Instance Load"] --> B["Dependencies<br/>Check"]
+        B --> C["Session Init<br/>Lock Cleanup"]
+
+        C --> vm_loop
+
+        subgraph vm_loop["Per-VM Loop"]
+            D["Policy Check<br/>(Hook)"] --> E["State Validate<br/>(Cache)"]
+            E --> F["Backup Type<br/>Decision"]
+            F --> G["Execute<br/>Backup"]
+            G --> H["Post-Backup<br/>Hook"]
+        end
+
+        vm_loop --> I["Retention<br/>Cleanup"]
+        I --> J["Replication<br/>(Optional)"]
+        J --> K["Session<br/>Summary"]
+        K --> L["SQLite Logging<br/>Module"]
+        K --> M["Email Report<br/>Module"]
+    end
+```
+
+### Directory Structure
+
+Installed layout from the `.deb` package:
+
+```
+/opt/vmbackup/
+├── vmbackup.sh                      # Main entry point
+│
+├── modules/                         # Business logic modules
+│   ├── vmbackup_integration.sh      # Module loader, lifecycle hooks
+│   ├── rotation_module.sh           # Rotation policies
+│   ├── logging_module.sh            # SQLite lifecycle logging
+│   ├── chain_manifest_module.sh     # JSON manifest for restore points
+│   ├── retention_module.sh          # Per-VM retention enforcement
+│   ├── email_report_module.sh       # Email notifications
+│   ├── replication_local_module.sh  # Multi-destination local replication
+│   ├── replication_cloud_module.sh  # Cloud replication via rclone
+│   ├── fstrim_optimization_module.sh # Pre-backup FSTRIM
+│   └── tpm_backup_module.sh         # TPM state backup
+│
+├── lib/                             # Infrastructure utilities
+│   ├── sqlite_module.sh             # SQLite database layer
+│   ├── chain_validation.sh          # Backup chain integrity checks
+│   ├── transfer_utils.sh            # Replication file-transfer helpers
+│   ├── logging.sh                   # Shared logging functions
+│   └── vm_lock.sh                   # Per-VM lock management
+│
+├── transports/                      # Local replication drivers
+│   ├── transport_local.sh
+│   ├── transport_ssh.sh
+│   └── transport_smb.sh
+│
+├── cloud_transports/                # Cloud replication drivers
+│   ├── cloud_transport_sharepoint.sh
+│   └── sharepoint_auth.sh
+│
+└── config/                          # Configuration instances
+    ├── default/                     # Production defaults
+    └── template/                    # Documented templates
+
+/lib/systemd/system/
+├── vmbackup.service                 # Backup service (oneshot)
+└── vmbackup.timer                   # Daily timer (01:00)
+
+/etc/apparmor.d/local/abstractions/
+└── libvirt-qemu                     # virtnbdbackup socket access rule
+```
+
+### File Reference
+
+#### Core Scripts
+
+| File | Purpose |
+|------|---------|
+| `vmbackup.sh` | Main backup orchestrator - VM discovery, backup execution, session management |
+
+#### Business Logic Modules (modules/)
+
+| File | Purpose |
+|------|---------|
+| `modules/vmbackup_integration.sh` | Loads modules, provides pre/post backup hooks, period boundary detection |
+| `modules/rotation_module.sh` | Rotation policies (daily/weekly/monthly/accumulate), period ID generation |
+| `modules/retention_module.sh` | Per-VM retention enforcement, orphan cleanup, age-based deletion |
+| `modules/chain_manifest_module.sh` | JSON manifest for restore points, chain tracking |
+| `modules/logging_module.sh` | SQLite lifecycle logging (log_chain_lifecycle, log_period_lifecycle, log_file_operation, log_retention_action, log_config_event) |
+| `modules/email_report_module.sh` | Email notifications with backup summary and log attachment |
+| `modules/replication_local_module.sh` | Multi-destination local replication (local/SSH/SMB) |
+| `modules/replication_cloud_module.sh` | Cloud replication via rclone (SharePoint, Backblaze) |
+| `modules/fstrim_optimization_module.sh` | Pre-backup FSTRIM to reduce backup size |
+| `modules/tpm_backup_module.sh` | TPM state backup for BitLocker/Secure Boot VMs + BitLocker key extraction |
+
+#### Infrastructure Utilities (lib/)
+
+| File | Purpose |
+|------|---------|
+| `lib/sqlite_module.sh` | SQLite database layer - sessions, VM backups, chain health tracking |
+| `lib/chain_validation.sh` | Validates backup chain integrity before restore |
+| `lib/transfer_utils.sh` | Common file transfer utilities for replication |
+| `lib/logging.sh` | Shared logging functions (log_info, log_warn, log_error) |
+| `lib/vm_lock.sh` | Per-VM lock management (prevents concurrent backups) |
+
+#### Transport Drivers (transports/)
+
+See [Transport Drivers](#transport-drivers-transportssh) in the Replication Architecture section for the full contract and implementation guide.
+
+| File | Purpose | Status |
+|------|---------|--------|
+| `transports/transport_local.sh` | Local filesystem rsync replication | **Production** |
+| `transports/transport_ssh.sh` | SSH/rsync remote replication | **Stub** — scaffold for future implementation |
+| `transports/transport_smb.sh` | SMB/CIFS mount + rsync replication | **Stub** — scaffold for future implementation |
+
+#### Cloud Transport Drivers (cloud_transports/)
+
+| File | Purpose | Status |
+|------|---------|--------|
+| `cloud_transports/cloud_transport_sharepoint.sh` | SharePoint Online via rclone | **Production** |
+| `cloud_transports/sharepoint_auth.sh` | SharePoint rclone auth helper (CLI flags, instance discovery) | **Production** |
+
+#### Configuration (config/)
+
+| Directory | Purpose |
+|-----------|---------|
+| `config/default/` | Production configuration files (used by default) |
+| `config/template/` | Fully documented template configs for new deployments |
+
+Each config directory contains:
+- `vmbackup.conf` - Main backup settings
+- `vm_overrides.conf` - Per-VM rotation policy overrides
+- `exclude_patterns.conf` - VM exclusion patterns
+- `fstrim_exclude.conf` - VM patterns to exclude from pre-backup FSTRIM
+- `email.conf` - Email notification settings
+- `replication_local.conf` - Local replication destinations
+- `replication_cloud.conf` - Cloud replication settings
+
+### External Modules
+
+All modules reside in the `modules/` subdirectory.
+
+| Module | File | Purpose |
+|--------|------|---------|
+| Integration | `modules/vmbackup_integration.sh` | Module loader, pre/post backup hooks, archival |
+| Rotation | `modules/rotation_module.sh` | Rotation policies, period boundaries |
+| Retention | `modules/retention_module.sh` | Per-VM retention enforcement |
+| Chain Manifest | `modules/chain_manifest_module.sh` | JSON manifest for restore points |
+| Logging | `modules/logging_module.sh` | SQLite lifecycle logging |
+| Email Report | `modules/email_report_module.sh` | Email notifications with log attachment |
+| Local Replication | `modules/replication_local_module.sh` | Local/mounted filesystem replication via rsync |
+| Cloud Replication | `modules/replication_cloud_module.sh` | Cloud replication via rclone (ships with SharePoint driver) |
+| FSTRIM | `modules/fstrim_optimization_module.sh` | Pre-backup TRIM optimization |
+| TPM Backup | `modules/tpm_backup_module.sh` | Backup TPM state for BitLocker/Secure Boot |
+
+### Data Flow
+
+```mermaid
+flowchart TD
+    A["VM Discovery"] --> B["Pre-Backup Hook"]
+
+    subgraph B_detail["Pre-Backup Hook"]
+        B1["Policy Check<br/>(vm_overrides.conf)"]
+        B2["Period Boundary Detection<br/>(rotation_module.sh)"]
+        B3["Archival Decision"]
+    end
+
+    B --> C["State Validation"]
+
+    subgraph C_detail["State Validation"]
+        C1["Phase 1: Directory existence"]
+        C2["Phase 2: Checkpoint health"]
+        C3["Phase 3: Chain continuity"]
+        C4["Phase 4: Manifest consistency"]
+        C5["Phase 5: Disk alignment"]
+    end
+
+    C --> D["Backup Type Decision"]
+
+    subgraph D_detail["Backup Type Decision"]
+        D1["full — new chain"]
+        D2["auto — virtnbdbackup decides"]
+        D3["copy — offline incremental"]
+    end
+
+    D --> E["FSTRIM Optimization<br/>(if running + agent)"]
+    E --> F["Execute Backup"]
+
+    subgraph F_detail["Execute Backup"]
+        F1["virtnbdbackup<br/>(primary)"]
+        F2["TPM backup<br/>(if applicable)"]
+    end
+
+    F --> G["Post-Backup Hook"]
+
+    subgraph G_detail["Post-Backup Hook"]
+        G1["Manifest update"]
+        G2["SQLite logging<br/>(sqlite_module.sh)"]
+        G3["Retention cleanup"]
+    end
+
+    G --> H["Replication<br/>(optional)"]
+
+    subgraph H_detail["Replication"]
+        H1["Local — rsync to NAS"]
+        H2["Cloud — rclone to<br/>SharePoint / B2"]
+    end
+
+    H --> I["Session Summary"]
+    I --> J["Email report<br/>(if enabled)"]
+```
 
 ---
 
@@ -3706,6 +3961,26 @@ BACKUP_RC_EXCLUDED=2  # Excluded by policy (not counted as success)
 ╚══════════════════════════════════════════════════════════════════════════════════════════════════════════╝
 ```
 
+### Replicate-Only Summary
+
+When running in `--replicate-only` mode, the session summary uses a simplified format with no VM table:
+
+```
+╔═══════════════════════════════════════════════════╗
+║         REPLICATION-ONLY SESSION SUMMARY          ║
+╠═══════════════════════════════════════════════════╣
+║  Mode:    replicate-only (both)
+║  Host:    my-host
+║  Config:  default
+║  Duration: 3m 22s
+║
+║  Local Replication:  OK (2 destinations)
+║  Cloud Replication:  FAILED (1 destination)
+║
+║  Status:  FAILED
+╚═══════════════════════════════════════════════════╝
+```
+
 ---
 
 ## Email Reporting System
@@ -3768,6 +4043,16 @@ Duration:        Xm Ys
 | `EMAIL_RECIPIENT` | Destination email address |
 | `EMAIL_SENDER` | From address |
 | `EMAIL_HOSTNAME` | Host identifier in reports |
+
+### Replicate-Only Email Format
+
+When running in `--replicate-only` mode, the email report uses a different subject and simplified body:
+
+**Subject Line:**
+- Success: `Replication Only — hostname — OK`
+- Failure: `Replication Only — hostname — FAILED`
+
+**Body:** Contains only the replication results sections (local and/or cloud). No VM backup details. A footer line reads "No backups were performed — this was a replication-only session."
 
 ---
 
@@ -3861,7 +4146,7 @@ Each replication operation creates a timestamped log:
 | Pattern | Location | Purpose |
 |---------|----------|---------|
 | `<endpoint>_<date>_<time>.log` | `_state/replication_logs/cloud/` | Cloud endpoint replication logs |
-| `<transport>_<date>_<time>.log` | `_state/replication_logs/local/` | Local transport logs (local, ssh, smb) |
+| `<transport>_<date>_<time>.log` | `_state/replication_logs/local/` | Local transport logs |
 
 **Examples:**
 - `cloudprovider_20260212_020134.log` — Cloud upload log
@@ -3930,8 +4215,10 @@ Log files are automatically cleaned up after being captured in state backups:
 
 Replication runs after backup completes, copying backups to secondary storage. Two replication systems operate independently:
 
-- **Local Replication**: Local/SSH/SMB to NAS or remote servers via rsync
-- **Cloud Replication**: SharePoint/Backblaze via rclone
+- **Local Replication**: rsync to any locally accessible path (local disk, NFS, virtiofs, pre-mounted CIFS, or any mounted filesystem)
+- **Cloud Replication**: rclone to cloud storage (ships with SharePoint; extensible to any rclone-supported backend)
+
+Both systems use a pluggable transport architecture. New endpoints can be added by implementing the corresponding transport contract — see [Transport Function Contract](#transport-function-contract) for local transports and [Cloud Transport Metrics Contract](#cloud-transport-metrics-contract) for cloud transports.
 
 ### Replication Order (vmbackup.conf)
 
@@ -3964,9 +4251,11 @@ Syncs backups to secondary local/NAS storage via rsync.
 | `REPLICATION_ON_FAILURE` | continue/abort | Error handling |
 | `REPLICATION_SPACE_CHECK` | skip/warn/disabled | Pre-replication space check |
 | `REPLICATION_MIN_FREE_PERCENT` | 0-100 | Minimum free space threshold |
-| `DEST_N_TRANSPORT` | local/ssh/smb | Protocol for destination N |
+| `DEST_N_TRANSPORT` | local (others pluggable) | Transport driver for destination N. Currently ships with `local` (rsync to any mounted path). Additional transports can be added — see [Implementing a New Transport](#implementing-a-new-transport). |
 | `DEST_N_SYNC_MODE` | mirror/accumulate | Delete behavior |
 | `DEST_N_VERIFY` | none/size/checksum | Post-sync verification |
+
+**Space check behaviour:** For `mirror` mode, the space check calculates the effective delta (source size minus existing destination data) rather than the total source size, since mirror only transfers changes. For `accumulate` mode, the full source size is used.
 
 **Key Functions:**
 
@@ -4019,13 +4308,13 @@ Uploads backups to cloud storage via rclone.
 
 Pluggable drivers for local replication. The replication module loads the appropriate driver based on `DEST_N_TRANSPORT` and calls a standard set of functions. See [Implementing a New Transport](#implementing-a-new-transport) below for the full contract.
 
-> **Warning:** Only `transport_local.sh` is production-tested. The SSH and SMB transports are **stubs** — they log an error and return `exit 1`. Do not configure `DEST_N_TRANSPORT="ssh"` or `"smb"` and expect replication to work. These transports need to be implemented before use.
+> **Current status:** Only `transport_local.sh` is production-ready. The SSH and SMB transport files are scaffolds with the correct function signatures and metrics contract but no implementation — they return `exit 1` if loaded. They exist as starting points for anyone who needs those transports. The local transport covers any destination that appears as a mounted filesystem, which in practice includes NFS, virtiofs, and pre-mounted CIFS/SMB shares.
 
 | Driver | Status | Purpose |
 |--------|--------|---------|
-| `transport_local.sh` | **Production** | Local/mounted filesystems (local disk, NFS, virtiofs, pre-mounted CIFS) |
-| `transport_ssh.sh` | **Stub** — not implemented | Remote SSH/rsync |
-| `transport_smb.sh` | **Stub** — not implemented | SMB/CIFS shares |
+| `transport_local.sh` | **Production** | Any mounted filesystem (local disk, NFS, virtiofs, pre-mounted CIFS) |
+| `transport_ssh.sh` | **Scaffold** | Remote SSH/rsync (not yet implemented) |
+| `transport_smb.sh` | **Scaffold** | SMB/CIFS shares (not yet implemented) |
 
 ### Cloud Transport Drivers (cloud_transports/*.sh)
 
@@ -4174,6 +4463,9 @@ transport_init()  →  transport_sync()  →  transport_verify()  →  transport
 | `validate_operational_settings()` | Validate config settings, apply defaults | none | Logs warnings for missing settings |
 | `_log_vm_backup_summary()` | Log per-VM result to console | 10 params including policy | Formatted log output |
 | `_log_session_summary()` | Log final session totals | counts for 4 categories | Formatted session summary |
+| `_run_replicate_only()` | Standalone replication mode entry point | scope, session_start_time | Exit code 0/1 |
+| `_log_replicate_only_summary()` | Log replicate-only session summary | scope, duration, results | Formatted summary (no VM table) |
+| `_sqlite_end_replicate_only()` | End SQLite session for replicate-only | session_start, status | DB session row updated |
 | `_invalidate_replication_state_files()` | Remove stale replication state files at session start | none | Prevents stale data in summaries |
 
 **Return Codes:**
@@ -4202,20 +4494,39 @@ BACKUP_RC_EXCLUDED=2  # VM excluded by policy (not counted as success)
 
 | Function | Purpose | Inputs | Outputs |
 |----------|---------|--------|---------|
-| `apply_fstrim_optimization()` | Public API - safe wrapper | vm_name | Return 0 (always safe) |
-| `execute_fstrim_in_guest()` | Execute guest-fstrim via QEMU agent | vm_name | Return 0 (logs result) |
+| `execute_fstrim_in_guest()` | Execute guest-fstrim via QEMU agent | vm_name, os_type | Sets `FSTRIM_LAST_*` globals |
+| `_fstrim_is_vm_excluded()` | Check if VM matches exclusion patterns | vm_name | Return 0 (excluded) / 1 (not excluded) |
+| `_fstrim_parse_results()` | Parse per-path JSON results into log lines | raw_output, os_type | Writes to log, sets globals |
 
-**OS Detection (pre-fstrim):**
-- Uses `guest-get-osinfo` to detect Windows guests before running fstrim
-- Windows: Uses `FSTRIM_WINDOWS_TIMEOUT` (default 600s) — retrim completes synchronously
-- Linux: Uses `FSTRIM_TIMEOUT` (default 300s) — response contains `"trimmed"` byte count
+The caller (`backup_vm()`) is responsible for detecting the guest OS via `detect_guest_os()` and passing the result as `os_type` ("windows", "linux", or "unknown").
+
+**Output variables:** After `execute_fstrim_in_guest()` returns, the following globals are set for the caller (used by SQLite logging):
+
+| Variable | Description |
+|----------|-------------|
+| `FSTRIM_LAST_DURATION` | Wall-clock seconds for the TRIM operation |
+| `FSTRIM_LAST_BYTES_TRIMMED` | Total bytes trimmed across all filesystems (Linux only; 0 for Windows) |
+| `FSTRIM_LAST_STATUS` | `"success"`, `"partial"`, `"failed"`, `"skipped"`, or `"excluded"` |
+| `FSTRIM_LAST_OUTPUT` | Raw JSON response from the guest agent |
+
+**OS-specific behaviour:**
+- **Linux:** Sends `{"execute":"guest-fstrim","arguments":{"minimum":N}}` where N is `FSTRIM_MINIMUM`. Response includes per-path `"trimmed"` byte counts. The module logs human-readable sizes (GB/MB/KB) for each filesystem path.
+- **Windows:** Sends `{"execute":"guest-fstrim"}` (no `minimum` — Windows agent ignores it). The agent internally calls `defrag.exe /L` on each volume. Response confirms per-path success but does not report bytes trimmed.
+
+**OS-specific timeout:**
+- Windows: Uses `FSTRIM_WINDOWS_TIMEOUT` (default 600s)
+- Linux / unknown: Uses `FSTRIM_TIMEOUT` (default 300s)
+
+**Exclusion:** VMs matching patterns in `fstrim_exclude.conf` are skipped without error. One glob pattern per line; `#` comments and blank lines are ignored.
+
+**Pre-flight check:** Before executing FSTRIM, `check_discard_granularity()` (in vmbackup.sh) parses `virsh dumpxml` for Windows VMs to detect VirtIO disks missing the `discard_granularity` override. A warning with the exact XML fix is logged for each affected disk.
 
 **virsh Timeout Handling:**
-- All `virsh qemu-agent-command` calls use explicit `--timeout` to override the 5-second default
-- `guest-info` and `guest-get-osinfo` probes: 10s timeout
+- `virsh qemu-agent-command` uses explicit `--timeout` to override the 5-second default
 - `guest-fstrim`: OS-appropriate timeout (`FSTRIM_TIMEOUT` or `FSTRIM_WINDOWS_TIMEOUT`)
 
 > **See also:** [Known Issue: VirtIO discard_granularity](#virtio-discard_granularity--windows-trim-performance) — Windows VMs with VirtIO disks require a QEMU XML fix for fast TRIM.
+> **See also:** [Known Issue: QEMU Agent Hang on FSTRIM Interruption](#qemu-agent-hang-on-fstrim-interruption) — interrupting a running FSTRIM can hang the guest agent.
 
 #### tpm_backup_module.sh
 
@@ -4238,6 +4549,7 @@ BACKUP_RC_EXCLUDED=2  # VM excluded by policy (not counted as success)
 |----------|---------|
 | `get_vm_status()` | Return running/shut off/paused |
 | `check_qemu_agent()` | Verify agent responsiveness |
+| `detect_guest_os()` | Detect guest OS via `guest-get-osinfo` (returns "windows"/"linux"/"unknown") |
 | `has_offline_vm_changed()` | Detect disk mtime changes |
 | `pause_vm()` / `resume_vm()` | VM pause/resume |
 
@@ -4274,7 +4586,7 @@ BACKUP_RC_EXCLUDED=2  # VM excluded by policy (not counted as success)
 
 **Affects:** ALL Windows VMs using VirtIO disks (virtio-blk or virtio-scsi). Not setup-specific — this is a universal QEMU upstream default.
 
-**Symptom:** `guest-fstrim` takes 8–15 minutes on a Windows VM with a VirtIO disk, vs 1–2 seconds on Linux or SATA. The fstrim module logs a timeout warning or the backup stall exceeds `FSTRIM_WINDOWS_TIMEOUT`.
+**Symptom:** `guest-fstrim` takes 3–15 minutes on a Windows VM with VirtIO disks, vs 1–3 seconds on Linux or SATA. The fstrim module logs a timeout warning or the backup stall exceeds `FSTRIM_WINDOWS_TIMEOUT`.
 
 **Root Cause:** QEMU's `discard_granularity` property for all block device types defaults to `4294967295` (0xFFFFFFFF) — a sentinel value meaning "unset". When virtio-blk reports this to the guest, it resolves to the logical block size (typically 512 bytes). Windows then issues millions of individual 512-byte TRIM operations, each traversing the virtio ring and punching a separate hole in the qcow2 file. This is catastrophically slow.
 
@@ -4301,7 +4613,34 @@ $ qemu-system-x86_64 -device virtio-blk-pci,help | grep discard_granularity
 
 **Fix — libvirt XML (qemu:override):**
 
-Add the `qemu:` XML namespace and override block to the domain XML. The `alias` must match the disk's device alias (visible in `virsh dumpxml`):
+Add the `qemu:` XML namespace and override block to the domain XML. The `alias` must match each disk's device alias (visible in `virsh dumpxml`).
+
+**Important: Every VirtIO disk with `discard='unmap'` needs its own override entry.** Missing even one disk causes slow TRIM for that volume. The pre-flight check in `check_discard_granularity()` will warn you about any missing overrides at backup time.
+
+**Step 1 — Find your VirtIO disk aliases:**
+
+```bash
+# List all VirtIO disk aliases with discard enabled
+virsh dumpxml <vm-name> | awk '
+  /<disk / { in_disk=1; d=0; v=0; a="" }
+  in_disk && /discard=.unmap/ { d=1 }
+  in_disk && /bus=.virtio/ { v=1 }
+  in_disk && /alias name=/ { s=$0; sub(/.*alias name=./, "", s); sub(/[^a-zA-Z0-9_-].*/, "", s); a=s }
+  /<\/disk>/ { if (d && v && a != "") print a; in_disk=0 }
+'
+```
+
+Example output for a Windows VM with two VirtIO disks and one SATA disk:
+
+```
+virtio-disk0    ← vda (OS disk)
+virtio-disk1    ← vdb (data disk)
+                   sata0-0-0 is not listed (SATA — not affected)
+```
+
+**Step 2 — Add the override block to the domain XML:**
+
+Single-disk example (one VirtIO disk):
 
 ```xml
 <domain type="kvm" xmlns:qemu="http://libvirt.org/schemas/domain/qemu/1.0">
@@ -4316,9 +4655,37 @@ Add the `qemu:` XML namespace and override block to the domain XML. The `alias` 
 </domain>
 ```
 
-The `xmlns:qemu` namespace declaration must be on the `<domain>` tag. The value `33554432` is 32 MiB in bytes — matching Microsoft Hyper-V's default. The device alias (e.g. `virtio-disk0`, `scsi0-0-0-0`) can be found in `virsh dumpxml <vm>`.
+Multi-disk example (two VirtIO disks — vda and vdb):
 
-For VMs with multiple VirtIO disks, add a `<qemu:device>` block for each disk alias.
+```xml
+<domain type="kvm" xmlns:qemu="http://libvirt.org/schemas/domain/qemu/1.0">
+  <!-- ... existing domain XML ... -->
+  <qemu:override>
+    <qemu:device alias="virtio-disk0">
+      <qemu:frontend>
+        <qemu:property name="discard_granularity" type="unsigned" value="33554432"/>
+      </qemu:frontend>
+    </qemu:device>
+    <qemu:device alias="virtio-disk1">
+      <qemu:frontend>
+        <qemu:property name="discard_granularity" type="unsigned" value="33554432"/>
+      </qemu:frontend>
+    </qemu:device>
+  </qemu:override>
+</domain>
+```
+
+> **Pattern:** One `<qemu:device alias="...">` block per VirtIO disk. The alias names increment automatically (`virtio-disk0`, `virtio-disk1`, etc.). SATA disks (`sata0-0-0`) do not need this fix.
+
+The `xmlns:qemu` namespace declaration must be on the `<domain>` tag. The value `33554432` is 32 MiB in bytes — matching Microsoft Hyper-V's default. After editing, apply with `virsh define` and power-cycle the VM (reboot alone is not sufficient — the QEMU process must restart).
+
+**Step 3 — Verify the fix:**
+
+```bash
+# Quick TRIM timing test (VM must be running with guest agent)
+virsh qemu-agent-command <vm-name> --timeout 60 '{"execute":"guest-fstrim"}'
+# Should complete in 1-3 seconds instead of minutes
+```
 
 **Fix — QEMU command line (non-libvirt):**
 ```bash
@@ -4327,7 +4694,9 @@ For VMs with multiple VirtIO disks, add a `<qemu:device>` block for each disk al
 -device scsi-hd,...,discard_granularity=32M
 ```
 
-**vmbackup mitigation:** The fstrim module detects Windows guests via `guest-get-osinfo` and applies `FSTRIM_WINDOWS_TIMEOUT=600s` (configurable) as a safety net. This allows unfixed VMs to complete trim within the timeout rather than being killed at 300s. However, applying the XML fix above is strongly recommended — it reduces trim from minutes to ~1 second.
+**vmbackup pre-flight detection:** The `check_discard_granularity()` function runs automatically before FSTRIM for Windows VMs. It parses `virsh dumpxml`, identifies all VirtIO disks with `discard='unmap'`, cross-references the `<qemu:override>` section, and logs a warning with the exact XML fix for any disk missing the override. This runs once per VM per session.
+
+**vmbackup timeout safety net:** The fstrim module detects Windows guests via `guest-get-osinfo` and applies `FSTRIM_WINDOWS_TIMEOUT=600s` (configurable) as a fallback. This allows unfixed VMs to complete trim within the timeout rather than being killed at 300s. However, applying the XML fix above is strongly recommended — it reduces trim from minutes to seconds.
 
 **References:**
 - [Red Hat Bugzilla 2020998](https://bugzilla.redhat.com/show_bug.cgi?id=2020998) — "Windows 10 TRIM/Discard causes all data to be rewritten" (CLOSED ERRATA)
@@ -4337,6 +4706,33 @@ For VMs with multiple VirtIO disks, add a `<qemu:device>` block for each disk al
 - QEMU source: `hw/block/virtio-blk.c` → `virtio_blk_update_config()` — sentinel fallback to `blk_size`
 
 > **Note:** The virtio-win driver fix (RHBA-2023:2451) addresses the "Slab size is too small" error but does NOT fix the performance issue. Even with updated drivers, the QEMU `discard_granularity` override is required for fast TRIM.
+
+### QEMU Agent Hang on FSTRIM Interruption
+
+**Affects:** All guests (Windows and Linux) running the QEMU guest agent. Observed more frequently on Windows due to longer TRIM times on unfixed VMs.
+
+**Symptom:** After interrupting a running `guest-fstrim` command (Ctrl+C during manual testing, or SIGTERM/SIGINT during a backup run), all subsequent `virsh qemu-agent-command` calls to that VM fail with:
+
+```
+error: Guest agent is not responding: QEMU guest agent is not connected
+```
+
+The VM itself continues to run normally — only the guest agent communication channel is broken.
+
+**Root Cause:** The QEMU guest agent processes `guest-fstrim` synchronously. When the host-side `virsh` command is killed, the agent's internal state machine does not clean up properly. The virtio-serial channel enters a wedged state where the agent process is still running inside the guest but cannot accept new commands.
+
+**Recovery:**
+- **Immediate:** Power-cycle the VM (`virsh destroy` + `virsh start`). A simple `virsh reboot` is NOT sufficient — the QEMU process and virtio-serial channel must be fully torn down and recreated.
+- **Inside the guest (if accessible):** Restart the QEMU guest agent service:
+  - Linux: `systemctl restart qemu-guest-agent`
+  - Windows: Restart the "QEMU Guest Agent" service in `services.msc`, or: `net stop QEMU-GA && net start QEMU-GA`
+
+**Prevention:**
+- Do NOT manually Ctrl+C a `guest-fstrim` command while it is running
+- Apply the `discard_granularity` fix (see above) to ensure TRIM completes in seconds rather than minutes, reducing the window where interruption is likely
+- vmbackup's interrupt handler avoids killing in-progress FSTRIM — the `_BACKUP_IN_PROGRESS` flag gates interrupt handling to prevent false chain-break markers
+
+> **Note:** This is a known QEMU guest agent limitation, not a vmbackup bug. There is no upstream fix as of QEMU 10.0. The agent protocol does not support cancellation of in-progress commands.
 
 ### Configuration Options for Recovery
 

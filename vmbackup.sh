@@ -74,7 +74,7 @@ set -o pipefail
 umask 027
 
 # Version - used by Debian packaging and --version flag
-VMBACKUP_VERSION="0.5.1"
+VMBACKUP_VERSION="0.5.2"
 
 # Dry-run mode: show what would happen without executing destructive operations
 DRY_RUN=false
@@ -85,6 +85,15 @@ DRY_RUN=false
 
 # Config instance (default, test, etc.)
 CONFIG_INSTANCE="default"
+
+# Prune mode flags
+_PRUNE_MODE=false
+_PRUNE_TARGET=""
+_PRUNE_VM=""
+_PRUNE_CONFIRM_SKIP=false
+
+# Replicate-only mode (empty = normal backup, local|cloud|both = replicate-only)
+_REPLICATE_ONLY_MODE=""
 
 # Parse arguments early to get --config-instance before config load
 for arg in "$@"; do
@@ -109,6 +118,33 @@ while [[ $# -gt 0 ]]; do
             _CANCEL_REPLICATION_REQUESTED=true
             shift
             ;;
+        --replicate-only)
+            _REPLICATE_ONLY_MODE="both"
+            if [[ -n "${2:-}" && "${2:0:1}" != "-" ]]; then
+                case "$2" in
+                    local|cloud|both) _REPLICATE_ONLY_MODE="$2"; shift ;;
+                    *) echo "Error: --replicate-only accepts: local, cloud, both (got '$2')" >&2; exit 1 ;;
+                esac
+            fi
+            shift
+            ;;
+        --prune)
+            _PRUNE_MODE=true
+            [[ -n "${2:-}" && "${2:0:1}" != "-" ]] && { _PRUNE_TARGET="$2"; shift; }
+            shift
+            ;;
+        --vm)
+            if [[ -n "${2:-}" && "${2:0:1}" != "-" ]]; then
+                _PRUNE_VM="$2"
+                shift 2
+            else
+                shift
+            fi
+            ;;
+        --yes|-y)
+            _PRUNE_CONFIRM_SKIP=true
+            shift
+            ;;
         --help|-h)
             cat << 'HELP_EOF'
 Usage: vmbackup.sh [OPTIONS]
@@ -122,12 +158,32 @@ OPTIONS:
                             replication phase. Backups continue unaffected.
                             Creates flag file in STATE_DIR; replication checks
                             this file and terminates gracefully.
+
+PRUNE OPTIONS (standalone cleanup — no backup session):
+    --prune TARGET          Remove backup data. See PRUNE TARGETS below.
+    --vm NAME               Target a specific VM (required for most targets)
+    --yes, -y               Skip confirmation prompt (for scripted use)
+
+PRUNE TARGETS:
+    list                 Show backup inventory with sizes and prune commands
+    archives             Remove all .archives/ dirs (all VMs, or --vm for one)
+    archives:<period>    Remove .archives/ in a specific period (requires --vm)
+    chain:<name>         Remove one archived chain (requires --vm)
+    period:<period_id>   Remove entire period directory (requires --vm)
+    all                  Remove everything for a VM (requires --vm)
+
+REPLICATE-ONLY (run replication without backups):
+    --replicate-only [SCOPE]  Run replication only, skip backup/retention/FSTRIM.
+                              SCOPE: local, cloud, both (default: both)
+                              Cannot be combined with --prune or --vm.
+
+GENERAL:
     --version               Show version and exit
     --help                  Show this help message
 
 CONFIG INSTANCES:
-    default   Production config (config/default/)
-    test      Test config - excludes production VMs (config/test/)
+    default    Production config (config/default/)
+    <name>     Custom instance — copy config/template/ to config/<name>/
 
 Each instance has its own:
     - vmbackup.conf        Main settings (BACKUP_PATH, retention, etc.)
@@ -135,10 +191,26 @@ Each instance has its own:
     - exclude_patterns.conf Glob patterns to exclude
 
 EXAMPLES:
-    sudo ./vmbackup.sh                          # Production (all VMs)
-    sudo ./vmbackup.sh --config-instance test   # Test VMs only
+    sudo ./vmbackup.sh                          # Production (default instance)
+    sudo ./vmbackup.sh --config-instance test   # Custom instance
     sudo ./vmbackup.sh --config-instance test --dry-run  # Preview without changes
     sudo ./vmbackup.sh --cancel-replication     # Cancel running replication
+
+PRUNE EXAMPLES:
+    sudo ./vmbackup.sh --prune list                              # Show all VMs
+    sudo ./vmbackup.sh --prune list --vm dev-win11               # Show one VM
+    sudo ./vmbackup.sh --prune archives --dry-run                # Preview archive removal
+    sudo ./vmbackup.sh --prune archives --vm dev-win11           # Remove VM archives
+    sudo ./vmbackup.sh --prune chain:chain-2026-03-09 --vm dev-manjaro
+    sudo ./vmbackup.sh --prune period:202603 --vm dev-win11
+    sudo ./vmbackup.sh --prune all --vm dev-win11 --yes          # No confirmation
+
+REPLICATE-ONLY EXAMPLES:
+    sudo ./vmbackup.sh --replicate-only                           # Both local + cloud
+    sudo ./vmbackup.sh --replicate-only local                     # Local destinations only
+    sudo ./vmbackup.sh --replicate-only cloud                     # Cloud destinations only
+    sudo ./vmbackup.sh --replicate-only --config-instance test    # Test instance
+    sudo ./vmbackup.sh --replicate-only --dry-run                 # Preview only
 HELP_EOF
             exit 0
             ;;
@@ -151,6 +223,27 @@ HELP_EOF
             ;;
     esac
 done
+
+# Mutual exclusivity guards
+if [[ "${_PRUNE_MODE}" == "true" && -n "${_REPLICATE_ONLY_MODE}" ]]; then
+    echo "Error: --prune and --replicate-only cannot be used together" >&2
+    exit 1
+fi
+if [[ -n "${_REPLICATE_ONLY_MODE}" && -n "${_PRUNE_VM}" ]]; then
+    echo "Error: --vm cannot be used with --replicate-only (replication operates on the entire backup path)" >&2
+    exit 1
+fi
+if [[ -n "${_PRUNE_VM}" && "${_PRUNE_MODE}" != "true" && -z "${_REPLICATE_ONLY_MODE}" ]]; then
+    echo "Warning: --vm has no effect without --prune (ignored)" >&2
+fi
+
+# ── Root privilege check ─────────────────────────────────────────────────────
+# vmbackup needs root for virsh, QEMU agent, backup paths, lock files, and DB.
+# --help and --version exit above before reaching this point.
+if [[ $EUID -ne 0 ]]; then
+    echo "Error: vmbackup must be run as root (e.g. sudo $0)" >&2
+    exit 1
+fi
 
 export CONFIG_INSTANCE
 
@@ -294,7 +387,7 @@ CHECKPOINT_MAX_RETRIES_AUTO=1         # Max AUTO retries before FULL
 #################################################################################
 
 # Retry configuration
-MAX_RETRIES=2
+MAX_RETRIES=3
 RETRY_DELAY=30  # seconds
 
 # State directory (locks, logs, recovery flags)
@@ -323,6 +416,55 @@ if [[ "${_CANCEL_REPLICATION_REQUESTED:-false}" == "true" ]]; then
     echo "Flag file created: $CANCEL_REPLICATION_FLAG"
     echo "Active replication jobs will terminate gracefully within ~30 seconds."
     exit 0
+fi
+
+#################################################################################
+# PRUNE MODE VALIDATION
+#
+# When --prune is passed, validate flags and redirect logging to vmprune.log.
+# Prune is NOT a backup session — it uses separate logging.
+#################################################################################
+if [[ "${_PRUNE_MODE:-false}" == "true" ]]; then
+    # Validate: --prune requires a target
+    if [[ -z "$_PRUNE_TARGET" ]]; then
+        echo "Error: --prune requires a target (e.g. --prune list, --prune archives, --prune all)"
+        echo "Run vmbackup.sh --help for usage."
+        exit 1
+    fi
+    
+    # Validate: --prune incompatible with --cancel-replication
+    if [[ "${_CANCEL_REPLICATION_REQUESTED:-false}" == "true" ]]; then
+        echo "Error: --prune cannot be combined with --cancel-replication"
+        exit 1
+    fi
+    
+    # Validate target syntax
+    case "$_PRUNE_TARGET" in
+        list|archives|all)
+            ;;
+        archives:*|chain:*|period:*)
+            ;;
+        *)
+            echo "Error: Unknown prune target: $_PRUNE_TARGET"
+            echo "Valid targets: list, archives, archives:<period>, chain:<name>, period:<id>, all"
+            echo "Run vmbackup.sh --help for usage."
+            exit 1
+            ;;
+    esac
+    
+    # Validate: --vm required for certain targets
+    case "$_PRUNE_TARGET" in
+        all|period:*|archives:*|chain:*)
+            if [[ -z "$_PRUNE_VM" ]]; then
+                echo "Error: --vm is required for --prune $_PRUNE_TARGET"
+                echo "Example: sudo ./vmbackup.sh --prune $_PRUNE_TARGET --vm <vm-name>"
+                exit 1
+            fi
+            ;;
+    esac
+    
+    # Redirect log file for prune operations
+    LOG_FILE="${LOG_DIR}/vmprune.log"
 fi
 
 #################################################################################
@@ -496,12 +638,21 @@ validate_operational_settings() {
   # FSTRIM Settings
   #-----------------------------------------------------------------------------
   if [[ -z "${ENABLE_FSTRIM+x}" ]]; then
-    ENABLE_FSTRIM="false"
+    ENABLE_FSTRIM="true"
     log_warn "vmbackup.sh" "validate_operational_settings" "MISSING: ENABLE_FSTRIM not set in config/$instance/vmbackup.conf"
-    log_warn "vmbackup.sh" "validate_operational_settings" "USING DEFAULT: ENABLE_FSTRIM=false (fstrim disabled for safety)"
+    log_warn "vmbackup.sh" "validate_operational_settings" "USING DEFAULT: ENABLE_FSTRIM=true (fstrim enabled — set to false to disable)"
     ((missing_count++))
   else
     log_debug "vmbackup.sh" "validate_operational_settings" "ENABLE_FSTRIM=$ENABLE_FSTRIM (from config)"
+  fi
+  
+  if [[ -z "${FSTRIM_MINIMUM+x}" ]]; then
+    FSTRIM_MINIMUM=1048576
+    log_warn "vmbackup.sh" "validate_operational_settings" "MISSING: FSTRIM_MINIMUM not set in config/$instance/vmbackup.conf"
+    log_warn "vmbackup.sh" "validate_operational_settings" "USING DEFAULT: FSTRIM_MINIMUM=1048576 (1 MB — Linux only, Windows ignores this)"
+    ((missing_count++))
+  else
+    log_debug "vmbackup.sh" "validate_operational_settings" "FSTRIM_MINIMUM=$FSTRIM_MINIMUM (from config)"
   fi
   
   if [[ -z "${FSTRIM_TIMEOUT+x}" ]]; then
@@ -522,13 +673,20 @@ validate_operational_settings() {
     log_debug "vmbackup.sh" "validate_operational_settings" "FSTRIM_WINDOWS_TIMEOUT=$FSTRIM_WINDOWS_TIMEOUT (from config)"
   fi
   
+  if [[ -z "${FSTRIM_EXCLUDE_FILE+x}" ]]; then
+    FSTRIM_EXCLUDE_FILE="fstrim_exclude.conf"
+    log_debug "vmbackup.sh" "validate_operational_settings" "FSTRIM_EXCLUDE_FILE not set, using default: fstrim_exclude.conf"
+  else
+    log_debug "vmbackup.sh" "validate_operational_settings" "FSTRIM_EXCLUDE_FILE=$FSTRIM_EXCLUDE_FILE (from config)"
+  fi
+  
   #-----------------------------------------------------------------------------
   # Offline VM Optimization Settings
   #-----------------------------------------------------------------------------
   if [[ -z "${SKIP_OFFLINE_UNCHANGED_BACKUPS+x}" ]]; then
-    SKIP_OFFLINE_UNCHANGED_BACKUPS="false"
+    SKIP_OFFLINE_UNCHANGED_BACKUPS="true"
     log_warn "vmbackup.sh" "validate_operational_settings" "MISSING: SKIP_OFFLINE_UNCHANGED_BACKUPS not set in config/$instance/vmbackup.conf"
-    log_warn "vmbackup.sh" "validate_operational_settings" "USING DEFAULT: SKIP_OFFLINE_UNCHANGED_BACKUPS=false (always backup offline VMs)"
+    log_warn "vmbackup.sh" "validate_operational_settings" "USING DEFAULT: SKIP_OFFLINE_UNCHANGED_BACKUPS=true (skip unchanged offline VMs)"
     ((missing_count++))
   else
     log_debug "vmbackup.sh" "validate_operational_settings" "SKIP_OFFLINE_UNCHANGED_BACKUPS=$SKIP_OFFLINE_UNCHANGED_BACKUPS (from config)"
@@ -547,9 +705,9 @@ validate_operational_settings() {
   # Checkpoint Recovery Settings
   #-----------------------------------------------------------------------------
   if [[ -z "${ENABLE_AUTO_RECOVERY_ON_CHECKPOINT_CORRUPTION+x}" ]]; then
-    ENABLE_AUTO_RECOVERY_ON_CHECKPOINT_CORRUPTION="warn"
+    ENABLE_AUTO_RECOVERY_ON_CHECKPOINT_CORRUPTION="yes"
     log_warn "vmbackup.sh" "validate_operational_settings" "MISSING: ENABLE_AUTO_RECOVERY_ON_CHECKPOINT_CORRUPTION not set in config/$instance/vmbackup.conf"
-    log_warn "vmbackup.sh" "validate_operational_settings" "USING DEFAULT: ENABLE_AUTO_RECOVERY_ON_CHECKPOINT_CORRUPTION=warn (will fail on corruption, manual fix required)"
+    log_warn "vmbackup.sh" "validate_operational_settings" "USING DEFAULT: ENABLE_AUTO_RECOVERY_ON_CHECKPOINT_CORRUPTION=yes (self-healing enabled)"
     ((missing_count++))
   else
     log_debug "vmbackup.sh" "validate_operational_settings" "ENABLE_AUTO_RECOVERY_ON_CHECKPOINT_CORRUPTION=$ENABLE_AUTO_RECOVERY_ON_CHECKPOINT_CORRUPTION (from config)"
@@ -561,8 +719,8 @@ validate_operational_settings() {
       ;;
     *)
       log_warn "vmbackup.sh" "validate_operational_settings" "INVALID: ENABLE_AUTO_RECOVERY_ON_CHECKPOINT_CORRUPTION='$ENABLE_AUTO_RECOVERY_ON_CHECKPOINT_CORRUPTION' (must be yes/warn/no)"
-      log_warn "vmbackup.sh" "validate_operational_settings" "USING DEFAULT: ENABLE_AUTO_RECOVERY_ON_CHECKPOINT_CORRUPTION=warn"
-      ENABLE_AUTO_RECOVERY_ON_CHECKPOINT_CORRUPTION="warn"
+      log_warn "vmbackup.sh" "validate_operational_settings" "USING DEFAULT: ENABLE_AUTO_RECOVERY_ON_CHECKPOINT_CORRUPTION=yes"
+      ENABLE_AUTO_RECOVERY_ON_CHECKPOINT_CORRUPTION="yes"
       ;;
   esac
   
@@ -945,6 +1103,24 @@ check_qemu_agent() {
   return $rc
 }
 
+# Detect guest OS via QEMU agent. Outputs: "windows", "linux", or "unknown".
+# Requires agent to be responsive (caller should check first).
+detect_guest_os() {
+  local vm_name=${1:?}
+  local osinfo
+  osinfo=$(virsh qemu-agent-command --timeout 10 "$vm_name" \
+    '{"execute":"guest-get-osinfo"}' 2>/dev/null) || {
+    echo "unknown"
+    return 1
+  }
+  if echo "$osinfo" | grep -qi '"id".*"mswindows"'; then
+    echo "windows"
+  else
+    echo "linux"
+  fi
+  return 0
+}
+
 #################################################################################
 # PER-VM BACKUP SUMMARY LOGGING
 #################################################################################
@@ -1060,6 +1236,10 @@ _log_vm_backup_summary() {
     
     # Update chain_health for successful/failed backups (not excluded)
     # Skip if integration module already handled this via post_backup_hook
+    # NOTE: This fallback path only fires when the integration module is NOT loaded.
+    # For accumulate-policy VMs the basename of backup_dir is the VM name (flat path),
+    # NOT the correct period_id ("accumulate"). If the integration module is ever made
+    # optional, this derivation must be replaced with a get_period_id() call.
     if [[ "$status" != "EXCLUDED" ]] && [[ -n "${backup_dir:-}" ]] && ! declare -f post_backup_hook >/dev/null 2>&1; then
       local period_id
       period_id=$(basename "$backup_dir" 2>/dev/null || echo "unknown")
@@ -3172,10 +3352,26 @@ perform_backup() {
     if wait $backup_pid 2>/dev/null; then
       _BACKUP_IN_PROGRESS="false"
       local backup_end_time=$(date '+%Y-%m-%d %H:%M:%S')
-      log_info "vmbackup.sh" "perform_backup" "$backup_type backup successful for VM: $vm_name at $backup_end_time"
       
       # Kill monitor if still running
       kill $monitor_pid 2>/dev/null || true
+      
+      # virtnbdbackup sometimes exits 0 despite logging ERROR lines (e.g.,
+      # "target directory already contains full or copy backup", bitmap
+      # conflicts, extent read failures). Scan the captured log for any
+      # ERROR line and treat it as a backup failure.
+      if [[ -f "$backup_log" ]] && grep -qi "ERROR" "$backup_log" 2>/dev/null; then
+          local error_lines
+          error_lines=$(grep -i "ERROR" "$backup_log" 2>/dev/null | tail -3 | tr '\n' ' ' | cut -c1-200)
+          log_error "vmbackup.sh" "perform_backup" \
+              "virtnbdbackup exited 0 but logged ERROR(s) for VM $vm_name: $error_lines"
+          set_backup_error "VIRTNBD_FALSE_SUCCESS" \
+              "virtnbdbackup exited 0 but logged errors" "$error_lines"
+          _BACKUP_IN_PROGRESS="false"
+          return 1
+      fi
+      
+      log_info "vmbackup.sh" "perform_backup" "$backup_type backup successful for VM: $vm_name at $backup_end_time"
       
       # Verify backup directory contents
       local file_count=$(find "$backup_dir" -maxdepth 1 -type f 2>/dev/null | wc -l)
@@ -3397,13 +3593,119 @@ verify_backup() {
 
 # Cache FSTRIM module availability after loading
 cache_fstrim_availability() {
-  if declare -f apply_fstrim_optimization >/dev/null 2>&1; then
+  if declare -f execute_fstrim_in_guest >/dev/null 2>&1; then
     FSTRIM_IMPL_AVAILABLE=1
     log_debug "vmbackup.sh" "cache_fstrim_availability" "FSTRIM module implementation available"
   else
     FSTRIM_IMPL_AVAILABLE=0
     log_debug "vmbackup.sh" "cache_fstrim_availability" "FSTRIM module implementation not available"
   fi
+}
+
+# Check VirtIO discard_granularity for Windows VMs.
+# Parses virsh dumpxml to find VirtIO disks with discard='unmap' that are
+# missing the qemu:override discard_granularity property. Emits a clear
+# warning with the exact XML fix needed for each missing disk.
+#
+# Args: $1=vm_name  $2=os_type
+# Returns: 0 always (advisory only — does not block backup)
+# Only runs once per VM per session (cached in associative array).
+declare -A _DISCARD_GRANULARITY_CHECKED 2>/dev/null || true
+
+check_discard_granularity() {
+  local vm_name=$1
+  local os_type=${2:-unknown}
+
+  # Only relevant for Windows VMs
+  [[ "$os_type" != "windows" ]] && return 0
+
+  # Only check once per VM per session
+  [[ -n "${_DISCARD_GRANULARITY_CHECKED[$vm_name]+x}" ]] && return 0
+  _DISCARD_GRANULARITY_CHECKED[$vm_name]=1
+
+  local xml_dump
+  xml_dump=$(virsh dumpxml "$vm_name" 2>/dev/null) || {
+    log_debug "vmbackup.sh" "check_discard_granularity" \
+      "Could not dump XML for $vm_name — skipping discard_granularity check"
+    return 0
+  }
+
+  # Find all VirtIO disk aliases with discard='unmap'
+  # Strategy: read disk blocks, track discard+virtio+alias across lines
+  # Uses POSIX-compatible awk (no gawk match() with capture groups)
+  local virtio_aliases
+  virtio_aliases=$(echo "$xml_dump" | awk '
+    /<disk / { in_disk=1; has_discard=0; is_virtio=0; alias="" }
+    in_disk && /discard=.unmap/ { has_discard=1 }
+    in_disk && /bus=.virtio/ { is_virtio=1 }
+    in_disk && /alias name=/ {
+      s=$0; sub(/.*alias name=./, "", s); sub(/[^a-zA-Z0-9_-].*/, "", s)
+      alias=s
+    }
+    /<\/disk>/ {
+      if (has_discard && is_virtio && alias != "") print alias
+      in_disk=0
+    }
+  ')
+
+  [[ -z "$virtio_aliases" ]] && return 0
+
+  # Find which aliases have the qemu:override discard_granularity set
+  local override_aliases
+  override_aliases=$(echo "$xml_dump" | awk '
+    /qemu:device alias=/ {
+      s=$0; sub(/.*alias=./, "", s); sub(/[^a-zA-Z0-9_-].*/, "", s)
+      current_alias=s
+    }
+    /discard_granularity/ && current_alias != "" {
+      print current_alias
+      current_alias=""
+    }
+  ')
+
+  # Compare: find VirtIO disks missing the override
+  local missing_aliases=()
+  local alias
+  while IFS= read -r alias; do
+    [[ -z "$alias" ]] && continue
+    if ! echo "$override_aliases" | grep -qxF "$alias"; then
+      missing_aliases+=("$alias")
+    fi
+  done <<< "$virtio_aliases"
+
+  if [[ ${#missing_aliases[@]} -gt 0 ]]; then
+    log_warn "vmbackup.sh" "check_discard_granularity" \
+      "WARNING: Windows VM '$vm_name' has VirtIO disks without discard_granularity"
+    log_warn "vmbackup.sh" "check_discard_granularity" \
+      "FSTRIM will be extremely slow (~3-15 minutes) on unfixed disks."
+    log_warn "vmbackup.sh" "check_discard_granularity" \
+      "With the fix applied, FSTRIM completes in ~1-3 seconds."
+
+    for alias in "${missing_aliases[@]}"; do
+      log_warn "vmbackup.sh" "check_discard_granularity" \
+        "MISSING discard_granularity on: $alias"
+      log_warn "vmbackup.sh" "check_discard_granularity" \
+        "  Fix: Add to VM XML inside <qemu:override>:"
+      log_warn "vmbackup.sh" "check_discard_granularity" \
+        "    <qemu:device alias='"'"'$alias'"'"'>"
+      log_warn "vmbackup.sh" "check_discard_granularity" \
+        "      <qemu:frontend>"
+      log_warn "vmbackup.sh" "check_discard_granularity" \
+        "        <qemu:property name='"'"'discard_granularity'"'"' type='"'"'unsigned'"'"' value='"'"'33554432'"'"'/>"
+      log_warn "vmbackup.sh" "check_discard_granularity" \
+        "      </qemu:frontend>"
+      log_warn "vmbackup.sh" "check_discard_granularity" \
+        "    </qemu:device>"
+    done
+
+    log_warn "vmbackup.sh" "check_discard_granularity" \
+      "See vmbackup.md: VirtIO discard_granularity & Windows TRIM Performance"
+  else
+    log_debug "vmbackup.sh" "check_discard_granularity" \
+      "All VirtIO disks for $vm_name have discard_granularity set"
+  fi
+
+  return 0
 }
 
 
@@ -3912,8 +4214,13 @@ archive_existing_checkpoint_chain() {
   
   # G6/G7: Log archive to SQLite chain_health + chain_events audit trail
   if declare -f sqlite_archive_chain >/dev/null 2>&1; then
-    # Extract period_id and chain_id from archive path
-    local archive_period_id=$(basename "$(dirname "$chain_archive")")
+    # Derive period_id via get_period_id when available (handles accumulate correctly).
+    # Fallback to basename of parent directory for non-integration deployments.
+    local archive_period_id
+    if declare -f get_vm_rotation_policy >/dev/null 2>&1 && declare -f get_period_id >/dev/null 2>&1; then
+      archive_period_id=$(get_period_id "$(get_vm_rotation_policy "$vm_name")" 2>/dev/null)
+    fi
+    archive_period_id="${archive_period_id:-$(basename "$(dirname "$chain_archive")")}"
     local archive_chain_id=$(basename "$chain_archive")
     local archive_size=$(du -sb "$chain_archive" 2>/dev/null | cut -f1 || echo 0)
     
@@ -4053,9 +4360,13 @@ backup_vm() {
   
   # Cache agent availability check (eliminates redundant virsh qemu-agent-command calls)
   local has_qemu_agent=false
+  local guest_os="unknown"
   if [[ "$vm_status" == "running" ]] && check_qemu_agent "$vm_name"; then
     has_qemu_agent=true
     QEMU_AGENT_AVAILABLE=1
+    # Detect OS once — used by FSTRIM timeout selection and future OS-specific logic
+    guest_os=$(detect_guest_os "$vm_name")
+    log_debug "vmbackup.sh" "backup_vm" "Guest OS detected: $guest_os"
   else
     QEMU_AGENT_AVAILABLE=0
   fi
@@ -4378,10 +4689,12 @@ backup_vm() {
   
   # Execute fstrim if enabled and agent available (use cached result)
   if [[ "$ENABLE_FSTRIM" == "true" ]] && [[ "$has_qemu_agent" == "true" ]]; then
+    # Pre-flight: check discard_granularity on Windows VirtIO disks (advisory warning)
+    check_discard_granularity "$vm_name" "$guest_os"
     if [[ "$DRY_RUN" == true ]]; then
       log_info "vmbackup.sh" "backup_vm" "[DRY-RUN] Would execute FSTRIM on VM: $vm_name"
     else
-      [[ ${FSTRIM_IMPL_AVAILABLE:-0} -eq 1 ]] && execute_fstrim_in_guest "$vm_name"
+      [[ ${FSTRIM_IMPL_AVAILABLE:-0} -eq 1 ]] && execute_fstrim_in_guest "$vm_name" "$guest_os"
     fi
   fi
   
@@ -4883,7 +5196,7 @@ handle_sigterm() {
   _log_interrupted_chain "SIGTERM"
   
   # Attempt to send email report before exit
-  local session_end_time=$(date '+%Y-%m-%d %H:%M:%S')
+  local session_end_time=$(date '+%Y-%m-%d %H:%M:%S %Z')
   if [[ "$DRY_RUN" == true ]]; then
     log_info "vmbackup.sh" "handle_sigterm" "[DRY-RUN] Skipping email report"
   elif [[ -f "${SCRIPT_DIR}/modules/email_report_module.sh" ]]; then
@@ -4902,6 +5215,775 @@ handle_sigterm() {
   fi
   
   exit 143
+}
+
+#################################################################################
+# PRUNE MODE — Standalone Backup Cleanup
+#
+# Targeted on-demand cleanup of backup data — archives, periods, or entire VMs.
+# Runs outside of a backup session (no session_id, no email report).
+# Logs to ${BACKUP_PATH}_state/logs/vmprune.log
+#################################################################################
+
+# Human-readable size formatting (pure bash, no bc dependency)
+_format_size() {
+    local bytes="${1:-0}"
+    if (( bytes >= 1073741824 )); then
+        local whole=$(( bytes / 1073741824 ))
+        local frac=$(( (bytes % 1073741824) * 10 / 1073741824 ))
+        printf "%d.%d GiB" "$whole" "$frac"
+    elif (( bytes >= 1048576 )); then
+        local whole=$(( bytes / 1048576 ))
+        local frac=$(( (bytes % 1048576) * 10 / 1048576 ))
+        printf "%d.%d MiB" "$whole" "$frac"
+    elif (( bytes >= 1024 )); then
+        local whole=$(( bytes / 1024 ))
+        local frac=$(( (bytes % 1024) * 10 / 1024 ))
+        printf "%d.%d KiB" "$whole" "$frac"
+    else
+        printf "%d B" "$bytes"
+    fi
+}
+
+# Discovery listing — filesystem scan, size reporting, prune command hints
+# Args: $1 - vm_filter (optional, specific VM name)
+# Uses: BACKUP_PATH
+_prune_list() {
+    local vm_filter="${1:-}"
+    local total_bytes=0
+    local total_archive_bytes=0
+    local vm_count=0
+    local show_chain_commands=false
+    
+    # Show individual chain commands only for single-VM mode
+    [[ -n "$vm_filter" ]] && show_chain_commands=true
+    
+    echo ""
+    echo "vmbackup prune — backup inventory"
+    echo ""
+    
+    # Discover VMs from disk
+    local vm_dir
+    for vm_dir in "$BACKUP_PATH"*/; do
+        [[ -d "$vm_dir" ]] || continue
+        local vm_name
+        vm_name=$(basename "$vm_dir")
+        
+        # Skip state/system directories
+        [[ "$vm_name" == _* || "$vm_name" == .* ]] && continue
+        
+        # Filter if --vm specified
+        [[ -n "$vm_filter" && "$vm_name" != "$vm_filter" ]] && continue
+        
+        local vm_bytes
+        vm_bytes=$(du -sb "$vm_dir" 2>/dev/null | cut -f1 || echo 0)
+        local vm_size
+        vm_size=$(_format_size "$vm_bytes")
+        total_bytes=$(( total_bytes + vm_bytes ))
+        (( vm_count++ ))
+        
+        printf "%-30s %10s    %s\n" "$vm_name" "$vm_size" "# --prune all --vm ${vm_name}"
+        
+        # Discover periods
+        local period_dir
+        for period_dir in "$vm_dir"*/; do
+            [[ -d "$period_dir" ]] || continue
+            local period_id
+            period_id=$(basename "$period_dir")
+            
+            # Skip non-period dirs
+            [[ "$period_id" == _* || "$period_id" == .* ]] && continue
+            
+            local period_bytes
+            period_bytes=$(du -sb "$period_dir" 2>/dev/null | cut -f1 || echo 0)
+            local period_size
+            period_size=$(_format_size "$period_bytes")
+            
+            printf "  %-28s %10s    %s\n" "$period_id" "$period_size" "# --prune period:${period_id} --vm ${vm_name}"
+            
+            # Active chain stats (everything except .archives)
+            local active_bytes=0
+            local data_file_count=0
+            data_file_count=$(find "$period_dir" -maxdepth 1 -name "*.data" -type f 2>/dev/null | wc -l)
+            # Active chain = period total minus archives
+            local archives_dir="${period_dir}.archives"
+            local archives_total_bytes=0
+            if [[ -d "$archives_dir" ]]; then
+                archives_total_bytes=$(du -sb "$archives_dir" 2>/dev/null | cut -f1 || echo 0)
+            fi
+            active_bytes=$(( period_bytes - archives_total_bytes ))
+            local active_size
+            active_size=$(_format_size "$active_bytes")
+            
+            printf "    %-26s %10s    (%d data files)\n" "active chain" "$active_size" "$data_file_count"
+            
+            # Archives
+            if [[ -d "$archives_dir" ]]; then
+                local chain_count=0
+                local chain_dir
+                for chain_dir in "$archives_dir"/chain-*; do
+                    [[ -d "$chain_dir" ]] && (( chain_count++ ))
+                done
+                
+                if [[ $chain_count -gt 0 ]]; then
+                    local archives_size
+                    archives_size=$(_format_size "$archives_total_bytes")
+                    total_archive_bytes=$(( total_archive_bytes + archives_total_bytes ))
+                    
+                    local chain_word="chains"
+                    [[ $chain_count -eq 1 ]] && chain_word="chain"
+                    printf "    %-26s %10s    %-14s %s\n" "archives" "$archives_size" \
+                        "(${chain_count} ${chain_word})" "# --prune archives:${period_id} --vm ${vm_name}"
+                    
+                    # Individual chains
+                    for chain_dir in "$archives_dir"/chain-*; do
+                        [[ -d "$chain_dir" ]] || continue
+                        local chain_name
+                        chain_name=$(basename "$chain_dir")
+                        local chain_bytes
+                        chain_bytes=$(du -sb "$chain_dir" 2>/dev/null | cut -f1 || echo 0)
+                        local chain_size
+                        chain_size=$(_format_size "$chain_bytes")
+                        
+                        if [[ "$show_chain_commands" == "true" ]]; then
+                            printf "      %-24s %10s    %s\n" "$chain_name" "$chain_size" \
+                                "# --prune chain:${chain_name} --vm ${vm_name}"
+                        else
+                            printf "      %-24s %10s\n" "$chain_name" "$chain_size"
+                        fi
+                    done
+                else
+                    printf "    %-26s %10s\n" "archives" "—"
+                fi
+            else
+                printf "    %-26s %10s\n" "archives" "—"
+            fi
+            
+            echo ""
+        done
+    done
+    
+    if [[ $vm_count -eq 0 ]]; then
+        if [[ -n "$vm_filter" ]]; then
+            echo "No backup data found for VM: $vm_filter"
+            echo "Check --prune list (without --vm) to see all VMs."
+        else
+            echo "No backup data found in: $BACKUP_PATH"
+        fi
+        return 0
+    fi
+    
+    # Footer
+    local total_size
+    total_size=$(_format_size "$total_bytes")
+    local archives_size
+    archives_size=$(_format_size "$total_archive_bytes")
+    
+    if [[ -z "$vm_filter" ]]; then
+        local total_line
+        total_line=$(printf "Total: %d VMs, %s (archives: %s)" "$vm_count" "$total_size" "$archives_size")
+        if [[ $total_archive_bytes -gt 0 ]]; then
+            local pad=$(( 44 - ${#total_line} ))
+            (( pad < 4 )) && pad=4
+            printf "%s%*s%s\n" "$total_line" "$pad" "" "# --prune archives"
+        else
+            printf "%s\n" "$total_line"
+        fi
+    else
+        printf "Total: %s (archives: %s)\n" "$total_size" "$archives_size"
+    fi
+    echo ""
+}
+
+#################################################################################
+# REPLICATE-ONLY MODE
+#################################################################################
+
+# Log a replication-only session summary (no VM table, replication results only)
+_log_replicate_only_summary() {
+  local mode="$1"
+
+  log_info "vmbackup.sh" "main" ""
+  log_info "vmbackup.sh" "main" "╔══════════════════════════════════════════════════════════════════════════════════════════════════════════╗"
+  log_info "vmbackup.sh" "main" "║                              REPLICATION-ONLY SESSION SUMMARY                                          ║"
+  log_info "vmbackup.sh" "main" "╠══════════════════════════════════════════════════════════════════════════════════════════════════════════╣"
+  log_info "vmbackup.sh" "main" "║  Mode: $mode  (no backups, retention, or FSTRIM)"
+  log_info "vmbackup.sh" "main" "╠══════════════════════════════════════════════════════════════════════════════════════════════════════════╣"
+
+  # Local replication summary
+  if [[ "$mode" == "local" || "$mode" == "both" ]]; then
+    if [[ "${LOCAL_REPLICATION_MODULE_AVAILABLE:-0}" -eq 1 ]] && declare -f get_replication_summary >/dev/null 2>&1; then
+      local local_repl_summary
+      local_repl_summary=$(get_replication_summary 2>/dev/null)
+      if [[ -n "$local_repl_summary" ]]; then
+        log_info "vmbackup.sh" "main" "║  LOCAL REPLICATION"
+        while IFS= read -r line; do
+          [[ -n "$line" ]] && log_info "vmbackup.sh" "main" "║    $line"
+        done <<< "$local_repl_summary"
+      fi
+    else
+      log_info "vmbackup.sh" "main" "║  LOCAL REPLICATION: Not configured"
+    fi
+    log_info "vmbackup.sh" "main" "║"
+  fi
+
+  # Cloud replication summary
+  if [[ "$mode" == "cloud" || "$mode" == "both" ]]; then
+    if [[ "${CLOUD_REPLICATION_MODULE_AVAILABLE:-0}" -eq 1 ]] && declare -f get_cloud_replication_summary >/dev/null 2>&1; then
+      local cloud_repl_summary
+      cloud_repl_summary=$(get_cloud_replication_summary 2>/dev/null)
+      if [[ -n "$cloud_repl_summary" ]]; then
+        log_info "vmbackup.sh" "main" "║  CLOUD REPLICATION"
+        while IFS= read -r line; do
+          [[ -n "$line" ]] && log_info "vmbackup.sh" "main" "║    $line"
+        done <<< "$cloud_repl_summary"
+      fi
+    else
+      log_info "vmbackup.sh" "main" "║  CLOUD REPLICATION: Not configured"
+    fi
+  fi
+
+  log_info "vmbackup.sh" "main" "╚══════════════════════════════════════════════════════════════════════════════════════════════════════════╝"
+  log_info "vmbackup.sh" "main" ""
+}
+
+# Run replication without performing backups
+# Arguments:
+#   $1 - mode: "local", "cloud", or "both"
+#   $2 - session_start_time (for email report)
+# Returns: 0 if all requested replication succeeded (or nothing to do), 1 if any failed
+_run_replicate_only() {
+  local mode="$1"
+  local session_start_time="$2"
+
+  log_info "vmbackup.sh" "main" "===== REPLICATE-ONLY MODE START (scope=$mode) ====="
+
+  # Verify BACKUP_PATH exists (replication reads from it)
+  if [[ ! -d "$BACKUP_PATH" ]]; then
+    log_error "vmbackup.sh" "main" "BACKUP_PATH does not exist: $BACKUP_PATH"
+    log_error "vmbackup.sh" "main" "Nothing to replicate — run a backup first"
+    _sqlite_end_replicate_only "failed"
+    return 1
+  fi
+
+  # Determine what modules are available for the requested scope
+  local local_repl_needed=0
+  local cloud_repl_needed=0
+
+  if [[ "$mode" == "local" || "$mode" == "both" ]]; then
+    if [[ "${LOCAL_REPLICATION_MODULE_AVAILABLE:-0}" -eq 1 ]]; then
+      local_repl_needed=1
+    else
+      log_warn "vmbackup.sh" "main" "Local replication requested but not configured/available — skipping"
+    fi
+  fi
+
+  if [[ "$mode" == "cloud" || "$mode" == "both" ]]; then
+    if [[ "${CLOUD_REPLICATION_MODULE_AVAILABLE:-0}" -eq 1 ]]; then
+      cloud_repl_needed=1
+    else
+      log_warn "vmbackup.sh" "main" "Cloud replication requested but not configured/available — skipping"
+    fi
+  fi
+
+  # Nothing to do — exit cleanly
+  if [[ $local_repl_needed -eq 0 && $cloud_repl_needed -eq 0 ]]; then
+    log_info "vmbackup.sh" "main" "No replication modules available for scope=$mode — nothing to do"
+    _log_replicate_only_summary "$mode"
+    _sqlite_end_replicate_only "replication_only"
+    log_info "vmbackup.sh" "main" "===== REPLICATE-ONLY MODE END (exit=0) ====="
+    return 0
+  fi
+
+  # DRY-RUN: report what would run, skip execution
+  if [[ "$DRY_RUN" == true ]]; then
+    log_info "vmbackup.sh" "main" "[DRY-RUN] Would run replication (scope=$mode, local=$local_repl_needed, cloud=$cloud_repl_needed)"
+    _log_replicate_only_summary "$mode"
+    _sqlite_end_replicate_only "replication_only"
+    log_info "vmbackup.sh" "main" "===== REPLICATE-ONLY MODE END (dry-run, exit=0) ====="
+    return 0
+  fi
+
+  # Check cancellation flag before starting
+  if is_replication_cancelled; then
+    log_warn "vmbackup.sh" "main" "Replication cancellation flag detected — skipping replication"
+    clear_replication_cancel_flag
+    _log_replicate_only_summary "$mode"
+    _sqlite_end_replicate_only "replication_only"
+    log_info "vmbackup.sh" "main" "===== REPLICATE-ONLY MODE END (cancelled, exit=0) ====="
+    return 0
+  fi
+
+  # Execute replication — honour REPLICATION_ORDER setting
+  local replication_mode="${REPLICATION_ORDER:-simultaneous}"
+  local local_repl_pid=""
+  local cloud_repl_pid=""
+  local local_repl_result=0
+  local cloud_repl_result=0
+  local local_repl_config="${SCRIPT_DIR}/config/${CONFIG_INSTANCE:-default}/replication_local.conf"
+
+  log_info "vmbackup.sh" "main" "Replication order: $replication_mode"
+
+  if [[ "$replication_mode" == "simultaneous" ]]; then
+    # Start local in background
+    if [[ $local_repl_needed -eq 1 ]]; then
+      log_info "vmbackup.sh" "main" "Starting local replication (background)"
+      (
+        if run_local_replication_batch "$BACKUP_PATH"; then exit 0; else exit 1; fi
+      ) &
+      local_repl_pid=$!
+    fi
+    # Start cloud in background
+    if [[ $cloud_repl_needed -eq 1 ]]; then
+      log_info "vmbackup.sh" "main" "Starting cloud replication (background)"
+      (
+        if invoke_cloud_replication "$BACKUP_PATH"; then exit 0; else exit 1; fi
+      ) &
+      cloud_repl_pid=$!
+    fi
+    # Wait for both
+    if [[ -n "$local_repl_pid" ]]; then
+      wait $local_repl_pid; local_repl_result=$?
+      log_info "vmbackup.sh" "main" "Local replication finished (rc=$local_repl_result)"
+    fi
+    if [[ -n "$cloud_repl_pid" ]]; then
+      wait $cloud_repl_pid; cloud_repl_result=$?
+      log_info "vmbackup.sh" "main" "Cloud replication finished (rc=$cloud_repl_result)"
+    fi
+
+  elif [[ "$replication_mode" == "local_first" ]]; then
+    if [[ $local_repl_needed -eq 1 ]]; then
+      log_info "vmbackup.sh" "main" "Starting local replication"
+      [[ -f "$local_repl_config" ]] && source "$local_repl_config"
+      run_local_replication_batch "$BACKUP_PATH" && local_repl_result=0 || local_repl_result=1
+      log_info "vmbackup.sh" "main" "Local replication finished (rc=$local_repl_result)"
+    fi
+    if [[ $cloud_repl_needed -eq 1 ]]; then
+      log_info "vmbackup.sh" "main" "Starting cloud replication"
+      invoke_cloud_replication "$BACKUP_PATH" && cloud_repl_result=0 || cloud_repl_result=1
+      log_info "vmbackup.sh" "main" "Cloud replication finished (rc=$cloud_repl_result)"
+    fi
+
+  elif [[ "$replication_mode" == "cloud_first" ]]; then
+    if [[ $cloud_repl_needed -eq 1 ]]; then
+      log_info "vmbackup.sh" "main" "Starting cloud replication"
+      invoke_cloud_replication "$BACKUP_PATH" && cloud_repl_result=0 || cloud_repl_result=1
+      log_info "vmbackup.sh" "main" "Cloud replication finished (rc=$cloud_repl_result)"
+    fi
+    if [[ $local_repl_needed -eq 1 ]]; then
+      log_info "vmbackup.sh" "main" "Starting local replication"
+      [[ -f "$local_repl_config" ]] && source "$local_repl_config"
+      run_local_replication_batch "$BACKUP_PATH" && local_repl_result=0 || local_repl_result=1
+      log_info "vmbackup.sh" "main" "Local replication finished (rc=$local_repl_result)"
+    fi
+
+  else
+    log_warn "vmbackup.sh" "main" "Unknown REPLICATION_ORDER: $replication_mode — running simultaneous"
+    if [[ $local_repl_needed -eq 1 ]]; then
+      ( run_local_replication_batch "$BACKUP_PATH" && exit 0 || exit 1 ) &
+      local_repl_pid=$!
+    fi
+    if [[ $cloud_repl_needed -eq 1 ]]; then
+      ( invoke_cloud_replication "$BACKUP_PATH" && exit 0 || exit 1 ) &
+      cloud_repl_pid=$!
+    fi
+    [[ -n "$local_repl_pid" ]] && { wait $local_repl_pid; local_repl_result=$?; }
+    [[ -n "$cloud_repl_pid" ]] && { wait $cloud_repl_pid; cloud_repl_result=$?; }
+  fi
+
+  # Clean up cancel flag if set during replication
+  is_replication_cancelled && clear_replication_cancel_flag
+
+  # Determine final status
+  local any_failed=0
+  (( local_repl_result != 0 )) && any_failed=1
+  (( cloud_repl_result != 0 )) && any_failed=1
+
+  local final_status="replication_only"
+  (( any_failed )) && final_status="failed"
+
+  # Session summary
+  _log_replicate_only_summary "$mode"
+
+  log_info "vmbackup.sh" "main" "FINAL: local_rc=$local_repl_result cloud_rc=$cloud_repl_result status=$final_status"
+  log_info "vmbackup.sh" "main" "Backup location: $BACKUP_PATH"
+  log_info "vmbackup.sh" "main" "Full log: $LOG_FILE"
+
+  # End SQLite session
+  _sqlite_end_replicate_only "$final_status"
+
+  # Send email report
+  local session_end_time=$(date '+%Y-%m-%d %H:%M:%S %Z')
+  if [[ -f "${SCRIPT_DIR}/modules/email_report_module.sh" ]]; then
+    source "${SCRIPT_DIR}/modules/email_report_module.sh"
+    if load_email_config; then
+      log_info "vmbackup.sh" "main" "Sending email report to $EMAIL_RECIPIENT"
+      send_backup_report "$session_start_time" "$session_end_time" "$final_status" || true
+    else
+      log_debug "vmbackup.sh" "main" "Email disabled or not configured"
+    fi
+  fi
+
+  log_info "vmbackup.sh" "main" "===== REPLICATE-ONLY MODE END (exit=$any_failed) ====="
+  return $any_failed
+}
+
+# Helper: end SQLite session for replicate-only mode
+_sqlite_end_replicate_only() {
+  local status="$1"
+  if sqlite_is_available 2>/dev/null && [[ "$DRY_RUN" != true ]]; then
+    sqlite_session_end "0" "0" "0" "0" "0" "0" "$status"
+    log_debug "vmbackup.sh" "main" "SQLite session ended: status=$status"
+  fi
+}
+
+#################################################################################
+# PRUNE MODE
+#################################################################################
+
+# Main prune dispatch — target parsing, validation, confirmation, execution
+# Uses globals: _PRUNE_TARGET, _PRUNE_VM, _PRUNE_CONFIRM_SKIP, DRY_RUN, BACKUP_PATH
+run_prune_mode() {
+    local target="$_PRUNE_TARGET"
+    local vm_name="$_PRUNE_VM"
+    local dry_run="$DRY_RUN"
+    
+    log_info "vmbackup.sh" "run_prune_mode" "===== PRUNE MODE START ====="
+    
+    # Validate target is specified
+    if [[ -z "$target" ]]; then
+        echo "Error: --prune requires a target (list, archives, chain:NAME, period:ID, all)"
+        echo "Run: sudo ./vmbackup.sh --help"
+        log_error "vmbackup.sh" "run_prune_mode" "No prune target specified"
+        return 1
+    fi
+    
+    # Validate target type is recognized
+    local target_type_check="${target%%:*}"
+    case "$target_type_check" in
+        list|archives|chain|period|all) ;;
+        *)
+            echo "Error: Unknown prune target: $target"
+            echo "Valid targets: list, archives, chain:NAME, period:ID, all"
+            log_error "vmbackup.sh" "run_prune_mode" "Unknown prune target: $target"
+            return 1
+            ;;
+    esac
+    
+    # Validate --vm is provided for targets that require it
+    if [[ -z "$vm_name" ]]; then
+        case "$target_type_check" in
+            period|chain|all)
+                echo "Error: --prune $target_type_check requires --vm NAME"
+                echo "Run: sudo ./vmbackup.sh --prune list"
+                log_error "vmbackup.sh" "run_prune_mode" "--prune $target_type_check requires --vm"
+                return 1
+                ;;
+            archives)
+                local _param_check="${target#*:}"
+                [[ "$target_type_check" == "$_param_check" ]] && _param_check=""
+                if [[ -n "$_param_check" ]]; then
+                    echo "Error: --prune archives:<period> requires --vm NAME"
+                    echo "Run: sudo ./vmbackup.sh --prune list"
+                    log_error "vmbackup.sh" "run_prune_mode" "--prune archives:<period> requires --vm"
+                    return 1
+                fi
+                ;;
+        esac
+    fi
+    
+    log_info "vmbackup.sh" "run_prune_mode" "Target: $target VM: ${vm_name:-all} Dry-run: $dry_run"
+    
+    # Handle 'list' target (no destructive action)
+    if [[ "$target" == "list" ]]; then
+        _prune_list "$vm_name"
+        return 0
+    fi
+    
+    # Validate VM exists on disk (if specified)
+    if [[ -n "$vm_name" ]]; then
+        local safe_name
+        safe_name=$(sanitize_vm_name "$vm_name")
+        local vm_dir="${BACKUP_PATH}${safe_name}"
+        if [[ ! -d "$vm_dir" ]]; then
+            echo "Error: VM not found: $vm_name"
+            echo "No backup directory at: $vm_dir"
+            echo "Run: sudo ./vmbackup.sh --prune list"
+            log_error "vmbackup.sh" "run_prune_mode" "VM not found: $vm_name (path=$vm_dir)"
+            return 1
+        fi
+    fi
+    
+    # Parse target-specific parameters
+    local target_type="${target%%:*}"
+    local target_param="${target#*:}"
+    [[ "$target_type" == "$target_param" ]] && target_param=""
+    
+    # Validate specific targets exist on disk
+    case "$target_type" in
+        period)
+            local safe_name=$(sanitize_vm_name "$vm_name")
+            local period_dir="${BACKUP_PATH}${safe_name}/${target_param}"
+            if [[ ! -d "$period_dir" ]]; then
+                echo "Error: Period not found: $vm_name/$target_param"
+                echo "Run: sudo ./vmbackup.sh --prune list --vm $vm_name"
+                log_error "vmbackup.sh" "run_prune_mode" "Period not found: $period_dir"
+                return 1
+            fi
+            ;;
+        chain)
+            # Chain target needs to find the chain in any period's .archives
+            local safe_name=$(sanitize_vm_name "$vm_name")
+            local found_chain=""
+            local found_period=""
+            local period_dir
+            for period_dir in "${BACKUP_PATH}${safe_name}"/*/; do
+                [[ -d "$period_dir" ]] || continue
+                if [[ -d "${period_dir}.archives/${target_param}" ]]; then
+                    found_chain="${period_dir}.archives/${target_param}"
+                    found_period=$(basename "$period_dir")
+                    break
+                fi
+            done
+            if [[ -z "$found_chain" ]]; then
+                echo "Error: Archive chain not found: $target_param (VM: $vm_name)"
+                echo "Run: sudo ./vmbackup.sh --prune list --vm $vm_name"
+                log_error "vmbackup.sh" "run_prune_mode" "Chain not found: $target_param for VM $vm_name"
+                return 1
+            fi
+            ;;
+        archives)
+            if [[ -n "$target_param" ]]; then
+                # archives:<period> — verify period exists
+                local safe_name=$(sanitize_vm_name "$vm_name")
+                local period_dir="${BACKUP_PATH}${safe_name}/${target_param}"
+                if [[ ! -d "$period_dir" ]]; then
+                    echo "Error: Period not found: $vm_name/$target_param"
+                    echo "Run: sudo ./vmbackup.sh --prune list --vm $vm_name"
+                    log_error "vmbackup.sh" "run_prune_mode" "Period not found: $period_dir"
+                    return 1
+                fi
+            fi
+            ;;
+    esac
+    
+    # Calculate preview — what will be affected
+    local preview_bytes=0
+    local preview_desc=""
+    
+    case "$target_type" in
+        archives)
+            if [[ -n "$target_param" ]]; then
+                # archives:<period> — one period's archives
+                local safe_name=$(sanitize_vm_name "$vm_name")
+                local archives_dir="${BACKUP_PATH}${safe_name}/${target_param}/.archives"
+                if [[ -d "$archives_dir" ]]; then
+                    preview_bytes=$(du -sb "$archives_dir" 2>/dev/null | cut -f1 || echo 0)
+                fi
+                preview_desc="archives in $vm_name/$target_param"
+            elif [[ -n "$vm_name" ]]; then
+                # archives for one VM (all periods)
+                local safe_name=$(sanitize_vm_name "$vm_name")
+                local period_dir
+                for period_dir in "${BACKUP_PATH}${safe_name}"/*/; do
+                    [[ -d "${period_dir}.archives" ]] || continue
+                    local ab
+                    ab=$(du -sb "${period_dir}.archives" 2>/dev/null | cut -f1 || echo 0)
+                    preview_bytes=$(( preview_bytes + ab ))
+                done
+                preview_desc="all archives for $vm_name"
+            else
+                # archives for all VMs
+                local vd
+                for vd in "$BACKUP_PATH"*/; do
+                    [[ -d "$vd" ]] || continue
+                    local vn=$(basename "$vd")
+                    [[ "$vn" == _* || "$vn" == .* ]] && continue
+                    local pd
+                    for pd in "$vd"*/; do
+                        [[ -d "${pd}.archives" ]] || continue
+                        local ab
+                        ab=$(du -sb "${pd}.archives" 2>/dev/null | cut -f1 || echo 0)
+                        preview_bytes=$(( preview_bytes + ab ))
+                    done
+                done
+                preview_desc="all archives for all VMs"
+            fi
+            ;;
+        chain)
+            preview_bytes=$(du -sb "$found_chain" 2>/dev/null | cut -f1 || echo 0)
+            preview_desc="chain $target_param in $vm_name/$found_period"
+            ;;
+        period)
+            local safe_name=$(sanitize_vm_name "$vm_name")
+            preview_bytes=$(du -sb "${BACKUP_PATH}${safe_name}/${target_param}" 2>/dev/null | cut -f1 || echo 0)
+            preview_desc="period $target_param for $vm_name"
+            ;;
+        all)
+            local safe_name=$(sanitize_vm_name "$vm_name")
+            preview_bytes=$(du -sb "${BACKUP_PATH}${safe_name}" 2>/dev/null | cut -f1 || echo 0)
+            preview_desc="ALL data for $vm_name"
+            ;;
+    esac
+    
+    local preview_size
+    preview_size=$(_format_size "$preview_bytes")
+    
+    # Show preview / dry-run output
+    echo ""
+    echo "vmbackup prune — ${preview_desc}"
+    echo "  Space to free: ${preview_size}"
+    
+    if [[ "$dry_run" == "true" ]]; then
+        echo "  [DRY RUN] No data will be deleted."
+        log_info "vmbackup.sh" "run_prune_mode" "[DRY RUN] Would free ${preview_size} (${preview_bytes} bytes) — ${preview_desc}"
+        echo ""
+        return 0
+    fi
+    
+    # Confirmation prompt (unless --yes)
+    if [[ "$_PRUNE_CONFIRM_SKIP" != "true" ]]; then
+        echo ""
+        printf "  Continue? [y/N] "
+        local confirm
+        read -r confirm
+        case "$confirm" in
+            [yY]|[yY][eE][sS])
+                ;;
+            *)
+                echo "  Cancelled."
+                log_info "vmbackup.sh" "run_prune_mode" "User declined confirmation"
+                return 0
+                ;;
+        esac
+    fi
+    
+    echo ""
+    
+    # Execute deletion
+    local success_count=0
+    local fail_count=0
+    local total_freed=0
+    
+    case "$target_type" in
+        archives)
+            if [[ -n "$target_param" ]]; then
+                # archives:<period> — one period
+                local result
+                result=$(_remove_archives_in_period "$vm_name" "$target_param" "$dry_run" "prune")
+                if [[ $? -eq 0 ]]; then
+                    total_freed=$(( total_freed + ${result:-0} ))
+                    (( success_count++ ))
+                else
+                    total_freed=$(( total_freed + ${result:-0} ))
+                    (( fail_count++ ))
+                fi
+            elif [[ -n "$vm_name" ]]; then
+                # archives for one VM (all periods)
+                local safe_name=$(sanitize_vm_name "$vm_name")
+                local period_dir
+                for period_dir in "${BACKUP_PATH}${safe_name}"/*/; do
+                    [[ -d "$period_dir" ]] || continue
+                    local pid=$(basename "$period_dir")
+                    [[ "$pid" == _* || "$pid" == .* ]] && continue
+                    [[ -d "${period_dir}.archives" ]] || continue
+                    local result
+                    result=$(_remove_archives_in_period "$vm_name" "$pid" "$dry_run" "prune")
+                    if [[ $? -eq 0 ]]; then
+                        total_freed=$(( total_freed + ${result:-0} ))
+                        (( success_count++ ))
+                    else
+                        total_freed=$(( total_freed + ${result:-0} ))
+                        (( fail_count++ ))
+                    fi
+                done
+            else
+                # archives for all VMs
+                local vd
+                for vd in "$BACKUP_PATH"*/; do
+                    [[ -d "$vd" ]] || continue
+                    local vn=$(basename "$vd")
+                    [[ "$vn" == _* || "$vn" == .* ]] && continue
+                    local period_dir
+                    for period_dir in "$vd"*/; do
+                        [[ -d "$period_dir" ]] || continue
+                        local pid=$(basename "$period_dir")
+                        [[ "$pid" == _* || "$pid" == .* ]] && continue
+                        [[ -d "${period_dir}.archives" ]] || continue
+                        local result
+                        result=$(_remove_archives_in_period "$vn" "$pid" "$dry_run" "prune")
+                        if [[ $? -eq 0 ]]; then
+                            total_freed=$(( total_freed + ${result:-0} ))
+                            (( success_count++ ))
+                        else
+                            total_freed=$(( total_freed + ${result:-0} ))
+                            (( fail_count++ ))
+                        fi
+                    done
+                done
+            fi
+            ;;
+        chain)
+            local result
+            result=$(_remove_archive_chain "$vm_name" "$found_period" "$target_param" "$dry_run" "prune")
+            if [[ $? -eq 0 ]]; then
+                total_freed=$(( total_freed + ${result:-0} ))
+                (( success_count++ ))
+            else
+                (( fail_count++ ))
+            fi
+            # Rebuild manifest after chain removal
+            if declare -f rebuild_chain_manifest >/dev/null 2>&1; then
+                rebuild_chain_manifest "$vm_name"
+            fi
+            ;;
+        period)
+            _remove_period "$vm_name" "$target_param" "$dry_run" "false" "prune"
+            local rc=$?
+            if [[ $rc -eq 0 ]]; then
+                # Verify deletion actually happened (protection/keep-last may skip)
+                local safe_name=$(sanitize_vm_name "$vm_name")
+                if [[ ! -d "${BACKUP_PATH}${safe_name}/${target_param}" ]]; then
+                    total_freed=$preview_bytes
+                fi
+                (( success_count++ ))
+            else
+                (( fail_count++ ))
+            fi
+            # Rebuild manifest after period removal
+            if declare -f rebuild_chain_manifest >/dev/null 2>&1; then
+                rebuild_chain_manifest "$vm_name"
+            fi
+            ;;
+        all)
+            local result
+            result=$(_remove_vm_all "$vm_name" "$dry_run" "prune")
+            if [[ $? -eq 0 ]]; then
+                total_freed=$(( total_freed + ${result:-0} ))
+                (( success_count++ ))
+            else
+                total_freed=$(( total_freed + ${result:-0} ))
+                (( fail_count++ ))
+            fi
+            ;;
+    esac
+    
+    # Summary
+    local freed_size
+    freed_size=$(_format_size "$total_freed")
+    
+    echo "vmbackup prune — complete"
+    echo "  Freed: ${freed_size}"
+    if [[ $fail_count -gt 0 ]]; then
+        echo "  Errors: ${fail_count} (check ${LOG_FILE})"
+        log_error "vmbackup.sh" "run_prune_mode" \
+            "Prune completed with errors: freed=${total_freed} bytes, failures=${fail_count}"
+        return 1
+    else
+        log_info "vmbackup.sh" "run_prune_mode" \
+            "Prune completed: freed=${freed_size} (${total_freed} bytes)"
+        return 0
+    fi
 }
 
 # Set up signal handlers
@@ -4930,19 +6012,27 @@ main() {
   
   log_info "vmbackup.sh" "main" "Configuration: COMPRESS_LEVEL=$VIRTNBD_COMPRESS_LEVEL, HEALTH_CHECK=$CHECKPOINT_HEALTH_CHECK"
   
-  # Track session start time for email report
-  local session_start_time=$(date '+%Y-%m-%d %H:%M:%S')
+  # Track session start time for email report (include %Z for unambiguous
+  # epoch conversion in email_report_module — avoids DST fall-back mismatch)
+  local session_start_time=$(date '+%Y-%m-%d %H:%M:%S %Z')
   
-  # Dependency check (MUST be first, before any tool usage)
-  log_info "vmbackup.sh" "main" "Checking dependencies"
-  if ! check_dependencies; then
-    log_error "vmbackup.sh" "main" "Dependency check failed - aborting session"
-    exit 1
+  # Dependency check — skip in replicate-only mode (virsh/virtnbdbackup not needed)
+  if [[ -n "${_REPLICATE_ONLY_MODE:-}" ]]; then
+    log_info "vmbackup.sh" "main" "Replicate-only mode: skipping dependency check (backup tools not required)"
+  else
+    log_info "vmbackup.sh" "main" "Checking dependencies"
+    if ! check_dependencies; then
+      log_error "vmbackup.sh" "main" "Dependency check failed - aborting session"
+      exit 1
+    fi
   fi
   
   # CRITICAL: Clean up any stale qemu-nbd processes from previous interrupted runs
   # These hold write locks on qcow2 files and prevent VMs from starting
-  if [[ "$DRY_RUN" == true ]]; then
+  # Skip in replicate-only mode — no backup processes to clean up
+  if [[ -n "${_REPLICATE_ONLY_MODE:-}" ]]; then
+    log_debug "vmbackup.sh" "main" "Replicate-only mode: skipping stale qemu-nbd cleanup"
+  elif [[ "$DRY_RUN" == true ]]; then
     local stale_qemu_nbd=$(pgrep -f "qemu-nbd.*virtnbdbackup" 2>/dev/null)
     if [[ -n "$stale_qemu_nbd" ]]; then
       log_info "vmbackup.sh" "main" "[DRY-RUN] Would clean up stale qemu-nbd processes (found $(echo "$stale_qemu_nbd" | wc -l))"
@@ -4971,7 +6061,7 @@ main() {
   else
     log_debug "vmbackup.sh" "main" "No stale qemu-nbd processes found"
   fi
-  fi  # end DRY_RUN else block
+  fi  # end DRY_RUN/replicate-only else block
   
   # OPT #4: Lazy load TPM backup module only when first VM is processed
   # This defers module initialization until we know if any VMs have TPM
@@ -5014,6 +6104,23 @@ main() {
     exit 1
   fi
 
+  # PRUNE MODE: dispatch now that config, SQLite, and integration modules are loaded
+  # Prune skips replication modules, FSTRIM, pre-flight checks, and session tracking
+  if [[ "${_PRUNE_MODE:-false}" == "true" ]]; then
+    log_info "vmbackup.sh" "main" "Entering prune mode (skipping backup pipeline)"
+    run_prune_mode
+    local rc=$?
+    log_info "vmbackup.sh" "main" "===== PRUNE MODE END (exit=$rc) ====="
+    # End SQLite session so the row doesn't become an orphan
+    if declare -f sqlite_session_end >/dev/null 2>&1; then
+      local prune_status="success"
+      [[ $rc -ne 0 ]] && prune_status="failed"
+      # Args: vms_total vms_success vms_failed vms_skipped vms_excluded bytes_total final_status
+      sqlite_session_end "0" "0" "0" "0" "0" "0" "$prune_status"
+    fi
+    exit $rc
+  fi
+
   # Load local replication module at startup (provides offsite backup via local/SSH/SMB)
   # Module self-configures based on config/<instance>/replication_local.conf
   if init_local_replication_module; then
@@ -5034,6 +6141,13 @@ main() {
   # Each module re-creates its state file when it actually runs.
   # This prevents disabled/skipped modules from showing data from a prior run.
   _invalidate_replication_state_files
+
+  # REPLICATE-ONLY dispatch — runs replication only, then exits
+  # Placed after replication module init + state invalidation, before FSTRIM/pre-flight/VM-listing
+  if [[ -n "${_REPLICATE_ONLY_MODE:-}" ]]; then
+    _run_replicate_only "$_REPLICATE_ONLY_MODE" "$session_start_time"
+    exit $?
+  fi
   
   # Load FSTRIM module if enabled (can be loaded once at startup for caching)
   if [[ "$ENABLE_FSTRIM" == "true" ]]; then
@@ -5121,6 +6235,10 @@ main() {
     # Sequential backup processing with proper return code handling
     backup_vm "$vm_name"
     local rc=$?
+    # Clear the RETURN trap set inside backup_vm() to prevent it leaking.
+    # The trap fires correctly when backup_vm returns (releasing the VM lock),
+    # but without clearing it, the last VM's remove_lock fires again when main() returns.
+    trap - RETURN
     
     case $rc in
       0)  # Success or skipped (offline/unchanged)
@@ -5391,7 +6509,7 @@ main() {
   } >> "$LOG_FILE"
   
   # Send email report
-  local session_end_time=$(date '+%Y-%m-%d %H:%M:%S')
+  local session_end_time=$(date '+%Y-%m-%d %H:%M:%S %Z')
   local overall_status="success"
   if (( fail_count > 0 && backed_up_count == 0 )); then
     overall_status="failed"

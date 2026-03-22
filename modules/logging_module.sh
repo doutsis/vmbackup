@@ -159,6 +159,7 @@ log_period_lifecycle() {
 #       $7  - triggered_by (function name)
 #       $8  - success (true|false)
 #       $9  - error_message (optional)
+#       $10 - file_size_override (optional, integer bytes — use when source is already deleted)
 log_file_operation() {
     [[ "${DRY_RUN:-false}" == true ]] && return 0
     local operation="$1"
@@ -170,12 +171,16 @@ log_file_operation() {
     local triggered_by="${7:-}"
     local success="${8:-true}"
     local error_message="${9:-}"
+    local file_size_override="${10:-}"
     
     local file_size_bytes=0
     local verification_data=""
     
-    # Get file info if file exists
-    if [[ -f "$source_path" ]]; then
+    # Use override size when provided (source may already be deleted)
+    if [[ -n "$file_size_override" && "$file_size_override" -gt 0 ]] 2>/dev/null; then
+        file_size_bytes="$file_size_override"
+        verification_data="size_from_caller"
+    elif [[ -f "$source_path" ]]; then
         file_size_bytes=$(stat -c %s "$source_path" 2>/dev/null || echo 0)
         
         if [[ "$FILE_OPS_CHECKSUMS" == "true" ]]; then
@@ -219,6 +224,7 @@ log_file_operation() {
 #       $11 - preserve_reason (for keep/skip)
 #       $12 - triggered_by
 #       $13 - success (true|false)
+#       $14 - action_source (optional: prune|retention|orphan_retention)
 log_retention_action() {
     [[ "${DRY_RUN:-false}" == true ]] && return 0
     local action="$1"
@@ -234,8 +240,9 @@ log_retention_action() {
     local preserve_reason="${11:-}"
     local triggered_by="${12:-}"
     local success="${13:-true}"
+    local action_source="${14:-}"
     
-    log_debug "logging_module.sh" "log_retention_action" "$action: $vm_name target=$target_path type=$target_type policy=$rotation_policy success=$success"
+    log_debug "logging_module.sh" "log_retention_action" "$action: $vm_name target=$target_path type=$target_type policy=$rotation_policy source=$action_source success=$success"
     
     # Write to SQLite database (primary destination since v1.5)
     if type sqlite_log_retention_event &>/dev/null; then
@@ -243,7 +250,8 @@ log_retention_action() {
             "$action" "$vm_name" "$target_type" "$target_path" \
             "$target_period" "$rotation_policy" "$retention_limit" \
             "$current_count" "$age_days" "$freed_bytes" \
-            "$preserve_reason" "$triggered_by" "$success"
+            "$preserve_reason" "$triggered_by" "$success" \
+            "$action_source"
     fi
 }
 

@@ -192,8 +192,11 @@ get_period_id() {
             date -d "$timestamp" +%Y%m
             ;;
         accumulate)
-            # No period for accumulate - empty string
-            echo ""
+            # Stable period_id for accumulate — used as DB key in chain_health
+            # (UNIQUE(vm_name, period_id)) and in restore-point IDs.
+            # Filesystem paths are NOT affected — get_vm_backup_dir() short-circuits
+            # before calling get_period_id() for accumulate.
+            echo "accumulate"
             ;;
         never)
             echo ""
