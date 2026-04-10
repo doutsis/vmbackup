@@ -168,7 +168,7 @@ install:
 	@echo ""
 	@echo "  Command:       vmbackup --version"
 	@echo "  Timer:         sudo systemctl start vmbackup.timer"
-	@echo "  Manual run:    sudo vmbackup"
+	@echo "  Manual run:    sudo vmbackup --run"
 	@echo "  Config:        $(INSTALL_DIR)/config/default/"
 	@echo ""
 

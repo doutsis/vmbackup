@@ -309,11 +309,11 @@ post_backup_hook() {
     # Run retention cleanup (skip on failure to avoid cascading issues)
     if [[ "$backup_status" == "success" ]] && declare -f run_retention_for_vm >/dev/null 2>&1; then
         # Tier 1: Active policy retention (count-based, current policy format)
-        run_retention_for_vm "$vm_name" "false"
+        run_retention_for_vm "$vm_name"
         
         # Tier 2: Orphaned policy retention (age-based, previous policy formats)
         if declare -f run_orphan_retention_for_vm >/dev/null 2>&1; then
-            run_orphan_retention_for_vm "$vm_name" "false"
+            run_orphan_retention_for_vm "$vm_name"
         fi
     fi
     

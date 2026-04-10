@@ -6,14 +6,14 @@ Requires=libvirtd.service
 
 [Service]
 Type=oneshot
-ExecStart=/opt/vmbackup/vmbackup.sh
+ExecStart=/opt/vmbackup/vmbackup.sh --run
 # Uses the 'default' config instance at /opt/vmbackup/config/default/
 # To use a different config instance:
 #   sudo systemctl edit vmbackup.service
 # Then add:
 #   [Service]
 #   ExecStart=
-#   ExecStart=/opt/vmbackup/vmbackup.sh --config-instance myinstance
+#   ExecStart=/opt/vmbackup/vmbackup.sh --run --config-instance myinstance
 TimeoutStartSec=43200
 Nice=10
 IOSchedulingClass=best-effort

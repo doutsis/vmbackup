@@ -404,12 +404,18 @@ build_email_body() {
     
     # Replicate-only session — build simplified body without VM details
     local _session_status=""
+    local _session_type=""
     if declare -f sqlite_query_session_summary >/dev/null 2>&1; then
         local _summary_row
         _summary_row=$(sqlite_query_session_summary 2>/dev/null)
-        [[ -n "$_summary_row" ]] && _session_status="${_summary_row##*|}"
+        if [[ -n "$_summary_row" ]]; then
+            # Row format: total|success|failed|skipped|excluded|bytes|status|session_type
+            _session_type="${_summary_row##*|}"
+            local _sr_rest="${_summary_row%|*}"
+            _session_status="${_sr_rest##*|}"
+        fi
     fi
-    if [[ "$_session_status" == "replication_only" || ( "$_session_status" == "failed" && "${_summary_row%%|*}" == "0" ) ]]; then
+    if [[ "$_session_type" == "replicate_only" ]]; then
         # Build replication sections (reuse standard logic)
         local local_replication_section="" cloud_replication_section=""
         if [[ "$db_available" -eq 0 ]] && declare -f sqlite_query_session_vm_backups >/dev/null 2>&1; then
@@ -751,14 +757,14 @@ build_subject() {
         local summary_row
         summary_row=$(sqlite_query_session_summary 2>/dev/null)
         if [[ -n "$summary_row" ]]; then
-            IFS='|' read -r _total _success _failed _skipped _excluded _bytes _status <<< "$summary_row"
+            IFS='|' read -r _total _success _failed _skipped _excluded _bytes _status _stype <<< "$summary_row"
             # Replicate-only session — distinct subject line
-            if [[ "$_status" == "replication_only" ]]; then
-                echo "Replication Only — $(hostname -s) — OK"
-                return
-            elif [[ "$_status" == "failed" && "$_total" == "0" ]]; then
-                # Replicate-only that failed
-                echo "Replication Only — $(hostname -s) — FAILED"
+            if [[ "$_stype" == "replicate_only" ]]; then
+                if [[ "$_status" == "failed" ]]; then
+                    echo "Replication Only — $(hostname -s) — FAILED"
+                else
+                    echo "Replication Only — $(hostname -s) — OK"
+                fi
                 return
             fi
             success_count=${_success:-0}

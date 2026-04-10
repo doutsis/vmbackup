@@ -71,7 +71,7 @@ case "$1" in
         echo "  Install path:  /opt/vmbackup/"
         echo "  Command:       vmbackup --version"
         echo "  Timer:         systemctl start vmbackup.timer   (daily at 1:00 AM)"
-        echo "  Manual run:    systemctl start vmbackup.service"
+        echo "  Manual run:    sudo vmbackup --run"
         echo "  Logs:          journalctl -u vmbackup.service"
         echo ""
         echo "  Config:        /opt/vmbackup/config/default/    (protected on upgrade)"
@@ -83,7 +83,7 @@ case "$1" in
         echo ""
         echo "  To create a new config instance:"
         echo "    cp -r /opt/vmbackup/config/template /opt/vmbackup/config/prod"
-        echo "    systemctl edit vmbackup.service  # set --config-instance prod"
+        echo "    systemctl edit vmbackup.service  # set --run --config-instance prod"
         echo ""
         ;;
 esac

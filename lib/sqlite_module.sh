@@ -52,8 +52,8 @@
 
 # Module identification
 readonly SQLITE_MODULE_NAME="sqlite_module"
-readonly SQLITE_MODULE_VERSION="1.9"
-readonly SQLITE_SCHEMA_VERSION="1.9"
+readonly SQLITE_MODULE_VERSION="2.0"
+readonly SQLITE_SCHEMA_VERSION="2.0"
 
 # Ensure module is only loaded once
 if [[ "${_SQLITE_MODULE_LOADED:-}" == "1" ]]; then
@@ -514,6 +514,28 @@ MIGRATE_1_5_EOF
         log_info "$SQLITE_MODULE_NAME" "_sqlite_migrate_schema" \
             "Schema migrated to v1.9 (dropped bytes_transferred from replication_vms)"
     fi
+
+    # Migration: 1.9 -> 2.0 (add session_type to sessions)
+    if [[ "$current_version" < "2.0" ]]; then
+        log_info "$SQLITE_MODULE_NAME" "_sqlite_migrate_schema" \
+            "Migrating schema from v$current_version to v2.0 (session_type column)"
+
+        local _sess_cols_20
+        _sess_cols_20=$(sqlite3 "$SQLITE_DB_PATH" "SELECT name FROM pragma_table_info('sessions');" 2>/dev/null)
+
+        echo "$_sess_cols_20" | grep -qx 'session_type' || \
+            sqlite3 "$SQLITE_DB_PATH" "ALTER TABLE sessions ADD COLUMN session_type TEXT;" 2>/dev/null
+
+        sqlite3 "$SQLITE_DB_PATH" "UPDATE schema_info SET value = '2.0' WHERE key = 'version';" 2>/dev/null
+        if [[ $? -ne 0 ]]; then
+            log_error "$SQLITE_MODULE_NAME" "_sqlite_migrate_schema" \
+                "Schema migration v$current_version→v2.0 FAILED"
+            return 1
+        fi
+
+        log_info "$SQLITE_MODULE_NAME" "_sqlite_migrate_schema" \
+            "Schema migrated to v2.0 (added session_type to sessions)"
+    fi
 }
 
 # Create database schema (tables and indexes)
@@ -527,7 +549,7 @@ CREATE TABLE IF NOT EXISTS schema_info (
     key   TEXT PRIMARY KEY,
     value TEXT
 );
-INSERT OR REPLACE INTO schema_info (key, value) VALUES ('version', '1.9');
+INSERT OR REPLACE INTO schema_info (key, value) VALUES ('version', '2.0');
 INSERT OR REPLACE INTO schema_info (key, value) VALUES ('created', datetime('now'));
 
 /* A backup session (one vmbackup.sh invocation) */
@@ -544,7 +566,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     vms_excluded    INTEGER DEFAULT 0,
     bytes_total     INTEGER DEFAULT 0,
     status          TEXT DEFAULT 'running',
-    log_file        TEXT
+    log_file        TEXT,
+    session_type    TEXT
 );
 
 /* Individual VM backup within a session */
@@ -788,6 +811,7 @@ SCHEMA_EOF
 sqlite_session_start() {
     local instance="${1:-default}"
     local log_file="${2:-}"
+    local session_type="${3:-standard}"
     
     if [[ "$SQLITE_MODULE_AVAILABLE" -ne 1 ]]; then
         return 1
@@ -797,8 +821,8 @@ sqlite_session_start() {
     # Store time in UTC for consistent duration calculations
     local start_time=$(date -u '+%Y-%m-%d %H:%M:%S')
     
-    local sql="INSERT INTO sessions (id, instance, start_time, log_file, status) 
-               VALUES ($session_id, '${instance//\'/\'\'}', '$start_time', '${log_file//\'/\'\'}', 'running');"
+    local sql="INSERT INTO sessions (id, instance, start_time, log_file, status, session_type) 
+               VALUES ($session_id, '${instance//\'/\'\'}', '$start_time', '${log_file//\'/\'\'}', 'running', '${session_type//\'/\'\'}');"
     
     if ! sqlite3 "$SQLITE_DB_PATH" "$sql" 2>/dev/null; then
         log_error "$SQLITE_MODULE_NAME" "sqlite_session_start" \
@@ -1332,7 +1356,8 @@ sqlite_query_session_summary() {
 SELECT COALESCE(vms_total,0), COALESCE(vms_success,0),
        COALESCE(vms_failed,0), COALESCE(vms_skipped,0),
        COALESCE(vms_excluded,0), COALESCE(bytes_total,0),
-       COALESCE(status,'unknown')
+       COALESCE(status,'unknown'),
+       COALESCE(session_type,'standard')
 FROM sessions
 WHERE id = $session_id;
 SQL_EOF

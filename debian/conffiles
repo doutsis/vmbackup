@@ -2,6 +2,7 @@
 /opt/vmbackup/config/default/vm_overrides.conf
 /opt/vmbackup/config/default/email.conf
 /opt/vmbackup/config/default/exclude_patterns.conf
+/opt/vmbackup/config/default/fstrim_exclude.conf
 /opt/vmbackup/config/default/replication_cloud.conf
 /opt/vmbackup/config/default/replication_local.conf
 /etc/apparmor.d/local/abstractions/libvirt-qemu

@@ -4,15 +4,36 @@ All notable changes to [vmbackup](https://github.com/doutsis/vmbackup) will be d
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions follow [Semantic Versioning](https://semver.org/).
 
-## [0.5.3] - Unreleased
+## [0.5.3] - 2026-04-10
 
 ### Added
 
+- **`--run` flag required to start backups** — Running `vmbackup.sh` with no arguments now prints a short usage summary instead of starting a backup. Use `--run` to start a backup session: `sudo vmbackup --run`. All mode operations are now explicit: `--run`, `--prune`, `--replicate-only`, `--cancel-replication`.
+- **Unknown flag detection** — Unrecognized flags now produce an error and exit instead of being silently ignored.
+- **`--cancel-replication` conflict guards** — `--cancel-replication` now rejects combinations with `--prune`, `--replicate-only`, `--vm`, and `--dry-run`.
 - **Root privilege check** — Running vmbackup without root now prints a clear error (`vmbackup must be run as root`) and exits 1 instead of failing with cryptic permission errors. `--help` and `--version` still work without root.
+- **`--vm` targeted backup mode** — Back up specific VMs without running a full session. Accepts a single VM (`--vm web`) or comma-separated list (`--vm web,db,mail`). Composable with `--dry-run` and `--config-instance`.
+- **Global session lock** — vmbackup now creates `$STATE_DIR/vmbackup.pid` at startup and checks for an existing running session. Prevents concurrent vmbackup invocations. Cleaned up on normal exit, SIGINT, SIGTERM, and SIGTSTP. Stale PID files from crashed processes are detected via PID liveness check and removed automatically.
+- **`session_type` column in SQLite sessions table** — Tracks the type of each backup session (`standard`, `targeted`, `replicate_only`, `prune`). Schema migrated from v1.9 to v2.0.
 
 ### Changed
 
+- **`--vm` requires explicit mode** — `--vm` is now a modifier, not a standalone command. Use `--run --vm web` for targeted backups or `--prune list --vm web` for pruning. Standalone `--vm` exits with an error.
+- **`--help` output restructured** — Sections reordered: GENERAL first, then BACKUP, PRUNE, REPLICATE-ONLY, SIGNAL, CONFIG INSTANCES, EXAMPLES. Added destructive warning to `--prune all` example. Added documentation link.
+- **Systemd service updated** — `ExecStart` now includes `--run` flag.
 - **`SKIP_OFFLINE_UNCHANGED_BACKUPS` default changed to `true`** — Offline VMs whose disks haven't changed since the last backup are now skipped by default. Previously defaulted to `false` (always backup). Existing installations with the setting explicitly configured are unaffected.
+- **`--vm` no longer prune-only** — `--vm` previously only worked with `--prune`. Now also works in backup mode. Internal variable renamed from `_PRUNE_VM` to `_TARGET_VM`.
+- **`--replicate-only` sessions now write `status='success'`** — Previously wrote `status='replication_only'`. Session type is now tracked via the new `session_type` column instead of overloading the status field.
+- **Documentation rewritten** — `vmbackup.md` condensed from ~4,500 to ~2,900 lines. Added CLI reference section. Removed function reference and schema reference (use `grep` and `.schema` instead). Replaced diagrams with prose. Condensed configuration, replication, BitLocker, and cleanup sections. Fixed broken cross-references.
+- **`fstrim_exclude.conf` comments improved** — Rewritten with categorised exclusion reasons and practical examples.
+
+### Removed
+
+- **Host Configuration Backup** — Removed `backup_host_config()` function and `Host Configuration Backup` documentation section. This feature backed up libvirt/QEMU/network configuration to `$BACKUP_PATH/__HOST_CONFIG__/`.
+
+### Fixed
+
+- **`RETENTION_ORPHAN_DRY_RUN` config setting ignored** — `post_backup_hook()` in `vmbackup_integration.sh` passed a hardcoded `"false"` as the dry_run argument to `run_orphan_retention_for_vm()` and `run_retention_for_vm()`. This always overrode the `RETENTION_ORPHAN_DRY_RUN` config variable, so setting it to `true` had no effect — orphans were still deleted. Fixed: removed the hardcoded argument so both functions fall through to their config variable defaults.
 
 ## [0.5.2] - 2026-03-22
 

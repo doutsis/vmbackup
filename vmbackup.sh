@@ -74,7 +74,7 @@ set -o pipefail
 umask 027
 
 # Version - used by Debian packaging and --version flag
-VMBACKUP_VERSION="0.5.2"
+VMBACKUP_VERSION="0.5.3"
 
 # Dry-run mode: show what would happen without executing destructive operations
 DRY_RUN=false
@@ -89,11 +89,14 @@ CONFIG_INSTANCE="default"
 # Prune mode flags
 _PRUNE_MODE=false
 _PRUNE_TARGET=""
-_PRUNE_VM=""
+_TARGET_VM=""
 _PRUNE_CONFIRM_SKIP=false
 
 # Replicate-only mode (empty = normal backup, local|cloud|both = replicate-only)
 _REPLICATE_ONLY_MODE=""
+
+# Backup mode (requires explicit --run)
+_BACKUP_MODE=false
 
 # Parse arguments early to get --config-instance before config load
 for arg in "$@"; do
@@ -135,91 +138,96 @@ while [[ $# -gt 0 ]]; do
             ;;
         --vm)
             if [[ -n "${2:-}" && "${2:0:1}" != "-" ]]; then
-                _PRUNE_VM="$2"
+                _TARGET_VM="$2"
                 shift 2
             else
-                shift
+                echo "Error: --vm requires a VM name" >&2
+                exit 1
             fi
             ;;
         --yes|-y)
             _PRUNE_CONFIRM_SKIP=true
             shift
             ;;
+        --run)
+            _BACKUP_MODE=true
+            shift
+            ;;
         --help|-h)
-            cat << 'HELP_EOF'
-Usage: vmbackup.sh [OPTIONS]
+            cat << HELP_EOF
+vmbackup ${VMBACKUP_VERSION} — KVM/QEMU virtual machine backup utility
+Vibe coded by James Doutsis | https://www.github.com/doutsis/
 
-OPTIONS:
+Usage: vmbackup.sh <MODE> [OPTIONS]
+
+  sudo vmbackup.sh --run                     Start full backup (all VMs)
+  sudo vmbackup.sh --run --vm web,db         Backup specific VMs
+  sudo vmbackup.sh --prune list              Show backup inventory
+  sudo vmbackup.sh --replicate-only          Run replication only
+  sudo vmbackup.sh --help                    Full help and examples
+
+GENERAL:
+    --help, -h              Show this help message
+    --version               Show version and exit
+
+BACKUP:
+    --run                   Start a backup session (required)
+    --vm NAME               Target specific VM(s), comma-separated: --vm web,db
+                            Replication is skipped in targeted backup mode.
+    --dry-run               Preview without executing changes (read-only mode)
     --config-instance NAME  Use config from config/NAME/ (default: "default")
-                            Examples: --config-instance test
-    --dry-run               Show what would happen without executing backups,
-                            retention, replication, or FSTRIM. Read-only mode.
-    --cancel-replication    Signal a running vmbackup session to cancel its
-                            replication phase. Backups continue unaffected.
+
+PRUNE (standalone cleanup — no backup session):
+    --prune TARGET          Remove backup data. Targets:
+        list                  Show backup inventory with sizes
+        archives              Remove .archives/ dirs (all VMs, or --vm for one)
+        archives:<period>     Remove .archives/ in a specific period (requires --vm)
+        chain:<name>          Remove one archived chain (requires --vm)
+        period:<period_id>    Remove entire period directory (requires --vm)
+        all                   Remove everything for a VM (requires --vm)
+    --vm NAME               Scope prune to a single VM (required for most targets)
+    --yes, -y               Skip confirmation prompt (for scripted use)
+
+REPLICATE-ONLY (run replication without backups):
+    --replicate-only [SCOPE]  SCOPE: local, cloud, both (default: both)
+
+SIGNAL:
+    --cancel-replication    Signal running session to cancel replication phase.
                             Creates flag file in STATE_DIR; replication checks
                             this file and terminates gracefully.
 
-PRUNE OPTIONS (standalone cleanup — no backup session):
-    --prune TARGET          Remove backup data. See PRUNE TARGETS below.
-    --vm NAME               Target a specific VM (required for most targets)
-    --yes, -y               Skip confirmation prompt (for scripted use)
-
-PRUNE TARGETS:
-    list                 Show backup inventory with sizes and prune commands
-    archives             Remove all .archives/ dirs (all VMs, or --vm for one)
-    archives:<period>    Remove .archives/ in a specific period (requires --vm)
-    chain:<name>         Remove one archived chain (requires --vm)
-    period:<period_id>   Remove entire period directory (requires --vm)
-    all                  Remove everything for a VM (requires --vm)
-
-REPLICATE-ONLY (run replication without backups):
-    --replicate-only [SCOPE]  Run replication only, skip backup/retention/FSTRIM.
-                              SCOPE: local, cloud, both (default: both)
-                              Cannot be combined with --prune or --vm.
-
-GENERAL:
-    --version               Show version and exit
-    --help                  Show this help message
-
 CONFIG INSTANCES:
-    default    Production config (config/default/)
-    <name>     Custom instance — copy config/template/ to config/<name>/
-
-Each instance has its own:
-    - vmbackup.conf        Main settings (BACKUP_PATH, retention, etc.)
-    - vm_overrides.conf    Per-VM policy overrides (never = skip)
-    - exclude_patterns.conf Glob patterns to exclude
+    Each instance (config/<name>/) contains vmbackup.conf, vm_overrides.conf,
+    and exclude_patterns.conf. Copy config/template/ to create a new instance.
 
 EXAMPLES:
-    sudo ./vmbackup.sh                          # Production (default instance)
-    sudo ./vmbackup.sh --config-instance test   # Custom instance
-    sudo ./vmbackup.sh --config-instance test --dry-run  # Preview without changes
-    sudo ./vmbackup.sh --cancel-replication     # Cancel running replication
+    sudo vmbackup.sh --run                                    # Full backup
+    sudo vmbackup.sh --run --vm web                           # Single VM
+    sudo vmbackup.sh --run --vm web,db,mail                   # Multiple VMs
+    sudo vmbackup.sh --run --dry-run                          # Preview full backup
+    sudo vmbackup.sh --run --config-instance test --dry-run   # Test config preview
+    sudo vmbackup.sh --prune list                             # Backup inventory
+    sudo vmbackup.sh --prune list --vm myvm                   # Single VM inventory
+    sudo vmbackup.sh --prune archives --vm myvm               # Remove VM archives
+    sudo vmbackup.sh --prune archives --dry-run               # Preview archive removal
+    sudo vmbackup.sh --prune all --vm myvm --yes              # ⚠ DESTRUCTIVE: removes all backups for myvm
+    sudo vmbackup.sh --replicate-only                         # Both local + cloud
+    sudo vmbackup.sh --replicate-only local --dry-run         # Preview local only
+    sudo vmbackup.sh --cancel-replication                     # Cancel replication
 
-PRUNE EXAMPLES:
-    sudo ./vmbackup.sh --prune list                              # Show all VMs
-    sudo ./vmbackup.sh --prune list --vm dev-win11               # Show one VM
-    sudo ./vmbackup.sh --prune archives --dry-run                # Preview archive removal
-    sudo ./vmbackup.sh --prune archives --vm dev-win11           # Remove VM archives
-    sudo ./vmbackup.sh --prune chain:chain-2026-03-09 --vm dev-manjaro
-    sudo ./vmbackup.sh --prune period:202603 --vm dev-win11
-    sudo ./vmbackup.sh --prune all --vm dev-win11 --yes          # No confirmation
-
-REPLICATE-ONLY EXAMPLES:
-    sudo ./vmbackup.sh --replicate-only                           # Both local + cloud
-    sudo ./vmbackup.sh --replicate-only local                     # Local destinations only
-    sudo ./vmbackup.sh --replicate-only cloud                     # Cloud destinations only
-    sudo ./vmbackup.sh --replicate-only --config-instance test    # Test instance
-    sudo ./vmbackup.sh --replicate-only --dry-run                 # Preview only
+    See full documentation: https://github.com/doutsis/vmbackup
 HELP_EOF
             exit 0
             ;;
         --version)
             echo "vmbackup ${VMBACKUP_VERSION}"
+            echo "Vibe coded by James Doutsis | https://www.github.com/doutsis/"
             exit 0
             ;;
         *)
-            shift
+            echo "Error: Unknown option: $1" >&2
+            echo "Run vmbackup.sh --help for usage." >&2
+            exit 1
             ;;
     esac
 done
@@ -229,12 +237,73 @@ if [[ "${_PRUNE_MODE}" == "true" && -n "${_REPLICATE_ONLY_MODE}" ]]; then
     echo "Error: --prune and --replicate-only cannot be used together" >&2
     exit 1
 fi
-if [[ -n "${_REPLICATE_ONLY_MODE}" && -n "${_PRUNE_VM}" ]]; then
+if [[ -n "${_REPLICATE_ONLY_MODE}" && -n "${_TARGET_VM}" ]]; then
     echo "Error: --vm cannot be used with --replicate-only (replication operates on the entire backup path)" >&2
     exit 1
 fi
-if [[ -n "${_PRUNE_VM}" && "${_PRUNE_MODE}" != "true" && -z "${_REPLICATE_ONLY_MODE}" ]]; then
-    echo "Warning: --vm has no effect without --prune (ignored)" >&2
+if [[ "${_PRUNE_MODE}" == "true" && "${_TARGET_VM}" == *","* ]]; then
+    echo "Error: --prune requires a single VM name (comma-separated list not supported)" >&2
+    exit 1
+fi
+if [[ "${_CANCEL_REPLICATION_REQUESTED:-false}" == "true" ]]; then
+    if [[ "${_PRUNE_MODE}" == "true" ]]; then
+        echo "Error: --cancel-replication cannot be combined with --prune" >&2
+        exit 1
+    fi
+    if [[ -n "${_REPLICATE_ONLY_MODE}" ]]; then
+        echo "Error: --cancel-replication cannot be combined with --replicate-only" >&2
+        exit 1
+    fi
+    if [[ -n "${_TARGET_VM}" ]]; then
+        echo "Error: --cancel-replication cannot be combined with --vm" >&2
+        exit 1
+    fi
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        echo "Error: --cancel-replication cannot be combined with --dry-run" >&2
+        exit 1
+    fi
+fi
+if [[ "${_BACKUP_MODE}" == "true" && "${_PRUNE_MODE}" == "true" ]]; then
+    echo "Error: --run and --prune cannot be used together" >&2
+    exit 1
+fi
+if [[ "${_BACKUP_MODE}" == "true" && -n "${_REPLICATE_ONLY_MODE}" ]]; then
+    echo "Error: --run and --replicate-only cannot be used together" >&2
+    exit 1
+fi
+if [[ "${_BACKUP_MODE}" == "true" && "${_CANCEL_REPLICATION_REQUESTED:-false}" == "true" ]]; then
+    echo "Error: --run and --cancel-replication cannot be used together" >&2
+    exit 1
+fi
+if [[ -n "${_TARGET_VM}" && "${_BACKUP_MODE}" == "false" && "${_PRUNE_MODE}" == "false" ]]; then
+    echo "Error: --vm requires --run (for backup) or --prune (for cleanup)" >&2
+    echo "Example: sudo vmbackup.sh --run --vm ${_TARGET_VM}" >&2
+    exit 1
+fi
+
+# If no mode flag given, show usage and exit
+if [[ "${_BACKUP_MODE}" == "false" \
+   && "${_PRUNE_MODE}" == "false" \
+   && -z "${_REPLICATE_ONLY_MODE}" \
+   && "${_CANCEL_REPLICATION_REQUESTED:-false}" != "true" ]]; then
+    cat << USAGE_EOF
+vmbackup ${VMBACKUP_VERSION} — KVM/QEMU virtual machine backup utility
+Vibe coded by James Doutsis | https://www.github.com/doutsis/
+
+Usage:
+  sudo vmbackup.sh --run                           Start full backup (all VMs)
+  sudo vmbackup.sh --run --vm web,db               Backup specific VMs
+  sudo vmbackup.sh --prune list                    Show backup inventory
+  sudo vmbackup.sh --replicate-only                Run replication only
+  sudo vmbackup.sh --cancel-replication            Cancel running replication
+
+Options:
+  --dry-run              Preview without making changes
+  --config-instance NAME Use alternate config (default: "default")
+  --help                 Full help and examples
+  --version              Show version
+USAGE_EOF
+    exit 0
 fi
 
 # ── Root privilege check ─────────────────────────────────────────────────────
@@ -455,7 +524,7 @@ if [[ "${_PRUNE_MODE:-false}" == "true" ]]; then
     # Validate: --vm required for certain targets
     case "$_PRUNE_TARGET" in
         all|period:*|archives:*|chain:*)
-            if [[ -z "$_PRUNE_VM" ]]; then
+            if [[ -z "$_TARGET_VM" ]]; then
                 echo "Error: --vm is required for --prune $_PRUNE_TARGET"
                 echo "Example: sudo ./vmbackup.sh --prune $_PRUNE_TARGET --vm <vm-name>"
                 exit 1
@@ -517,6 +586,7 @@ init_logging() {
     echo "================================================================================"
     echo "VM Backup Session Started: $(date '+%Y-%m-%d %H:%M:%S')"
     echo "vmbackup v${VMBACKUP_VERSION}"
+    echo "Vibe coded by James Doutsis | https://www.github.com/doutsis/"
     echo "================================================================================"
   } >> "$LOG_FILE"
 }
@@ -1715,102 +1785,6 @@ backup_vm_config() {
     return 0
   fi
 }
-
-# Backup host-level libvirt, QEMU, and network configuration
-# Strategy: Tar and compress /etc/libvirt, QEMU, and network bridge configs
-# Keep: First backup of each month + any subsequent backups if config changed
-# Location: $BACKUP_PATH/__HOST_CONFIG__/YYYYMM/ (centralized, not per-VM)
-#
-# Network paths captured (both may exist — only the active manager matters):
-#   /etc/network/              — ifupdown (interfaces, interfaces.d/)
-#   /etc/NetworkManager/system-connections/ — NetworkManager connection profiles
-backup_host_config() {
-  local current_month=$(get_current_month)
-  local host_config_dir="$BACKUP_PATH/__HOST_CONFIG__/$current_month"
-  local backup_date=$(date '+%Y%m%d_%H%M%S')
-  
-  mkdir -p "$host_config_dir"
-  
-  # Generate host config filename
-  local config_archive="$host_config_dir/libvirt_qemu_config_${backup_date}.tar.gz"
-  
-  # Create temporary tar for comparison
-  local temp_tar="/tmp/libvirt_config_temp_$$.tar.gz"
-  
-  # Tar libvirt, QEMU, and network configs (requires root access, use sudo if needed)
-  # Missing directories are silently ignored by tar (stderr suppressed)
-  local -a tar_paths=(
-    /etc/libvirt
-    /var/lib/libvirt/qemu/
-    /var/lib/libvirt/network/
-    /var/lib/libvirt/storage/
-    /var/lib/libvirt/secrets/
-    /var/lib/libvirt/dnsmasq/
-    /etc/network/
-    /etc/NetworkManager/system-connections/
-  )
-  
-  # Check if we have read permission to /etc/libvirt
-  if [[ -r /etc/libvirt/qemu.conf ]]; then
-    # We have permission, tar directly (ignore errors for missing directories)
-    log_debug "vmbackup.sh" "backup_host_config" "Using direct tar (have read permission to /etc/libvirt)"
-    tar czf "$temp_tar" "${tar_paths[@]}" 2>/dev/null
-    if [[ ! -s "$temp_tar" ]]; then
-      rm -f "$temp_tar"
-      log_error "vmbackup.sh" "backup_host_config" "Failed to create host configuration archive"
-      return 1
-    fi
-  else
-    # Don't have read permission, try with sudo
-    log_debug "vmbackup.sh" "backup_host_config" "Using sudo tar (no read permission to /etc/libvirt)"
-    sudo tar czf "$temp_tar" "${tar_paths[@]}" 2>/dev/null
-    if [[ ! -s "$temp_tar" ]]; then
-      rm -f "$temp_tar"
-      log_error "vmbackup.sh" "backup_host_config" "Failed to create host configuration archive (need root/sudo for /etc/libvirt access)"
-      return 1
-    fi
-    # Ensure we own the temp file
-    sudo chown $(id -u):$(id -g) "$temp_tar" 2>/dev/null || true
-  fi
-  
-  # Check if this is the first of the month
-  local first_of_month_file="$host_config_dir/libvirt_qemu_config_${current_month}_FIRST.tar.gz"
-  
-  if [[ ! -f "$first_of_month_file" ]]; then
-    # First backup of month - keep it and mark as first
-    mv "$temp_tar" "$first_of_month_file"
-    chmod 600 "$first_of_month_file"
-    # mv preserves original ownership from /tmp/ — fix to match SGID parent
-    chown root:backup "$first_of_month_file" 2>/dev/null || true
-    log_info "vmbackup.sh" "backup_host_config" "Host config backup: FIRST of month"
-    if declare -f log_file_operation >/dev/null 2>&1; then
-      log_file_operation "create" "__HOST__" "$first_of_month_file" "" \
-        "host_config" "First-of-month host config archive" "backup_host_config" "true"
-    fi
-    return 0
-  fi
-  
-  # Compare with first-of-month backup
-  if ! cmp -s "$first_of_month_file" "$temp_tar"; then
-    # Config changed - keep this backup too
-    mv "$temp_tar" "$config_archive"
-    chmod 600 "$config_archive"
-    # mv preserves original ownership from /tmp/ — fix to match SGID parent
-    chown root:backup "$config_archive" 2>/dev/null || true
-    log_info "vmbackup.sh" "backup_host_config" "Host config backup: CHANGED, retained"
-    if declare -f log_file_operation >/dev/null 2>&1; then
-      log_file_operation "create" "__HOST__" "$config_archive" "" \
-        "host_config" "Host config changed - retained" "backup_host_config" "true"
-    fi
-    return 0
-  else
-    # Config unchanged - delete the temporary backup
-    rm -f "$temp_tar"
-    log_info "vmbackup.sh" "backup_host_config" "Host config backup: unchanged, not retained"
-    return 0
-  fi
-}
-
 #################################################################################
 # HEALTH CHECK FUNCTIONS
 #################################################################################
@@ -3353,7 +3327,8 @@ perform_backup() {
       _BACKUP_IN_PROGRESS="false"
       local backup_end_time=$(date '+%Y-%m-%d %H:%M:%S')
       
-      # Kill monitor if still running
+      # Kill monitor and its children (e.g. sleep) if still running
+      pkill -P $monitor_pid 2>/dev/null || true
       kill $monitor_pid 2>/dev/null || true
       
       # virtnbdbackup sometimes exits 0 despite logging ERROR lines (e.g.,
@@ -3400,7 +3375,8 @@ perform_backup() {
       log_error "vmbackup.sh" "perform_backup" "$backup_type backup failed for VM: $vm_name (exit code: $exit_code) at $backup_end_time"
       log_error "vmbackup.sh" "perform_backup" "Backup directory state: $(ls -lh "$backup_dir" 2>/dev/null | head -10 || echo 'Directory not accessible')"
       
-      # Kill monitor if still running (must happen on failure path too)
+      # Kill monitor and its children (must happen on failure path too)
+      pkill -P $monitor_pid 2>/dev/null || true
       kill $monitor_pid 2>/dev/null || true
       wait $monitor_pid 2>/dev/null || true
       
@@ -5161,6 +5137,16 @@ cleanup_on_exit() {
     fi
   fi
   
+  # Remove global session PID file (only our own)
+  if [[ -f "$STATE_DIR/vmbackup.pid" ]]; then
+    local pid_content
+    pid_content=$(cat "$STATE_DIR/vmbackup.pid" 2>/dev/null)
+    if [[ "$pid_content" == "$$" ]]; then
+      rm -f "$STATE_DIR/vmbackup.pid"
+      log_debug "vmbackup.sh" "cleanup_on_exit" "Removed session PID file"
+    fi
+  fi
+  
   log_info "vmbackup.sh" "cleanup_on_exit" "Temporary file cleanup complete"
   
   return $exit_code
@@ -5490,7 +5476,7 @@ _run_replicate_only() {
   if [[ $local_repl_needed -eq 0 && $cloud_repl_needed -eq 0 ]]; then
     log_info "vmbackup.sh" "main" "No replication modules available for scope=$mode — nothing to do"
     _log_replicate_only_summary "$mode"
-    _sqlite_end_replicate_only "replication_only"
+    _sqlite_end_replicate_only "success"
     log_info "vmbackup.sh" "main" "===== REPLICATE-ONLY MODE END (exit=0) ====="
     return 0
   fi
@@ -5499,7 +5485,7 @@ _run_replicate_only() {
   if [[ "$DRY_RUN" == true ]]; then
     log_info "vmbackup.sh" "main" "[DRY-RUN] Would run replication (scope=$mode, local=$local_repl_needed, cloud=$cloud_repl_needed)"
     _log_replicate_only_summary "$mode"
-    _sqlite_end_replicate_only "replication_only"
+    _sqlite_end_replicate_only "success"
     log_info "vmbackup.sh" "main" "===== REPLICATE-ONLY MODE END (dry-run, exit=0) ====="
     return 0
   fi
@@ -5509,7 +5495,7 @@ _run_replicate_only() {
     log_warn "vmbackup.sh" "main" "Replication cancellation flag detected — skipping replication"
     clear_replication_cancel_flag
     _log_replicate_only_summary "$mode"
-    _sqlite_end_replicate_only "replication_only"
+    _sqlite_end_replicate_only "success"
     log_info "vmbackup.sh" "main" "===== REPLICATE-ONLY MODE END (cancelled, exit=0) ====="
     return 0
   fi
@@ -5599,7 +5585,7 @@ _run_replicate_only() {
   (( local_repl_result != 0 )) && any_failed=1
   (( cloud_repl_result != 0 )) && any_failed=1
 
-  local final_status="replication_only"
+  local final_status="success"
   (( any_failed )) && final_status="failed"
 
   # Session summary
@@ -5642,10 +5628,10 @@ _sqlite_end_replicate_only() {
 #################################################################################
 
 # Main prune dispatch — target parsing, validation, confirmation, execution
-# Uses globals: _PRUNE_TARGET, _PRUNE_VM, _PRUNE_CONFIRM_SKIP, DRY_RUN, BACKUP_PATH
+# Uses globals: _PRUNE_TARGET, _TARGET_VM, _PRUNE_CONFIRM_SKIP, DRY_RUN, BACKUP_PATH
 run_prune_mode() {
     local target="$_PRUNE_TARGET"
-    local vm_name="$_PRUNE_VM"
+    local vm_name="$_TARGET_VM"
     local dry_run="$DRY_RUN"
     
     log_info "vmbackup.sh" "run_prune_mode" "===== PRUNE MODE START ====="
@@ -6012,6 +5998,27 @@ main() {
   
   log_info "vmbackup.sh" "main" "Configuration: COMPRESS_LEVEL=$VIRTNBD_COMPRESS_LEVEL, HEALTH_CHECK=$CHECKPOINT_HEALTH_CHECK"
   
+  # Global session lock — prevent concurrent vmbackup invocations
+  local session_pidfile="$STATE_DIR/vmbackup.pid"
+  if [[ -f "$session_pidfile" ]]; then
+    local existing_pid
+    existing_pid=$(cat "$session_pidfile" 2>/dev/null)
+    if [[ -n "$existing_pid" ]] && kill -0 "$existing_pid" 2>/dev/null; then
+      local proc_cmd
+      proc_cmd=$(cat "/proc/$existing_pid/cmdline" 2>/dev/null | tr '\0' ' ')
+      if [[ "$proc_cmd" == *"vmbackup"* ]]; then
+        log_error "vmbackup.sh" "main" "Another vmbackup session is already running (PID $existing_pid) — aborting"
+        echo "Error: Another vmbackup session is already running (PID $existing_pid)" >&2
+        exit 1
+      fi
+    fi
+    # PID not running or not vmbackup — stale file
+    rm -f "$session_pidfile"
+    log_debug "vmbackup.sh" "main" "Removed stale session PID file (PID $existing_pid no longer running)"
+  fi
+  echo "$$" > "$session_pidfile"
+  log_debug "vmbackup.sh" "main" "Session PID file created: $session_pidfile (PID $$)"
+  
   # Track session start time for email report (include %Z for unambiguous
   # epoch conversion in email_report_module — avoids DST fall-back mismatch)
   local session_start_time=$(date '+%Y-%m-%d %H:%M:%S %Z')
@@ -6070,11 +6077,16 @@ main() {
   # Load SQLite logging module (provides structured database logging)
   if load_sqlite_logging_module; then
     log_info "vmbackup.sh" "main" "SQLite logging module loaded successfully"
+    # Determine session type for SQLite tracking
+    local _session_type="standard"
+    [[ -n "$_TARGET_VM" && "$_PRUNE_MODE" != "true" ]] && _session_type="targeted"
+    [[ -n "$_REPLICATE_ONLY_MODE" ]] && _session_type="replicate_only"
+    [[ "$_PRUNE_MODE" == "true" ]] && _session_type="prune"
     # Start SQLite session tracking (skip in dry-run to avoid polluting DB)
     if [[ "$DRY_RUN" == true ]]; then
       log_info "vmbackup.sh" "main" "[DRY-RUN] SQLite session tracking disabled - no DB writes"
-    elif sqlite_session_start "${CONFIG_INSTANCE:-default}" "$LOG_FILE"; then
-      log_debug "vmbackup.sh" "main" "SQLite session started: $(sqlite_get_session_id)"
+    elif sqlite_session_start "${CONFIG_INSTANCE:-default}" "$LOG_FILE" "$_session_type"; then
+      log_debug "vmbackup.sh" "main" "SQLite session started: $(sqlite_get_session_id) type=$_session_type"
     fi
   else
     log_debug "vmbackup.sh" "main" "SQLite logging module unavailable - database logging disabled"
@@ -6204,6 +6216,22 @@ main() {
     log_info "vmbackup.sh" "main" "Found ${#vm_list[@]} VMs to process: ${vm_list[*]}"
   fi
   
+  # Targeted backup: filter VM list to requested VM(s)
+  if [[ -n "$_TARGET_VM" && "$_PRUNE_MODE" != "true" ]]; then
+    local _target_vm_list=()
+    IFS=',' read -ra _target_vm_list <<< "$_TARGET_VM"
+    # Validate each VM exists in libvirt
+    for _tvm in "${_target_vm_list[@]}"; do
+      if ! virsh dominfo "$_tvm" &>/dev/null; then
+        log_error "vmbackup.sh" "main" "Targeted backup: VM not found in libvirt: $_tvm"
+        echo "Error: VM not found: $_tvm" >&2
+        exit 1
+      fi
+    done
+    vm_list=("${_target_vm_list[@]}")
+    log_info "vmbackup.sh" "main" "Targeted backup: processing ${#vm_list[@]} VM(s): ${vm_list[*]}"
+  fi
+  
   # Backup each VM (sequential processing)
   # Track separate counts for accurate reporting:
   #   backed_up  = VMs that were actually backed up (success)
@@ -6270,17 +6298,6 @@ main() {
   
   log_info "vmbackup.sh" "main" "Backup phase complete: $backed_up_count backed up, $excluded_count excluded, $skipped_count skipped, $fail_count failed"
   
-  # Backup host-level configuration (libvirt/QEMU)
-  if [[ "$DRY_RUN" == true ]]; then
-    log_info "vmbackup.sh" "main" "[DRY-RUN] Would backup host-level libvirt/QEMU configuration - skipping"
-  else
-    log_info "vmbackup.sh" "main" "Backing up host-level libvirt/QEMU configuration"
-    if ! backup_host_config; then
-      log_warn "vmbackup.sh" "main" "Failed to backup host configuration, but VM backups completed"
-      # Don't fail the entire session if host config backup fails - VMs are primary
-    fi
-  fi
-  
   #=============================================================================
   # REPLICATION PHASE (Local + Cloud)
   # Controlled by REPLICATION_ORDER in vmbackup.conf:
@@ -6310,6 +6327,13 @@ main() {
   fi
   if [[ "${CLOUD_REPLICATION_MODULE_AVAILABLE:-0}" -eq 1 ]]; then
     cloud_repl_needed=1
+  fi
+  
+  # TARGETED BACKUP: Skip replication (operator runs --replicate-only separately if needed)
+  if [[ -n "$_TARGET_VM" ]]; then
+    log_info "vmbackup.sh" "main" "Targeted backup mode: skipping replication (use --replicate-only separately)"
+    local_repl_needed=0
+    cloud_repl_needed=0
   fi
   
   # DRY-RUN: Skip entire replication phase (AFTER determination so we can report what would run)

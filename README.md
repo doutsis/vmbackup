@@ -20,8 +20,8 @@ vmbackup is that wrapper. It orchestrates virtnbdbackup across your entire fleet
 **Debian / Ubuntu:**
 
 ```bash
-wget https://github.com/doutsis/vmbackup/releases/download/v0.5.2/vmbackup_0.5.2_all.deb
-sudo dpkg -i vmbackup_0.5.2_all.deb
+wget https://github.com/doutsis/vmbackup/releases/download/v0.5.3/vmbackup_0.5.3_all.deb
+sudo dpkg -i vmbackup_0.5.3_all.deb
 ```
 
 **Any distro (Arch, Fedora, openSUSE, etc.):**
@@ -35,7 +35,7 @@ sudo make install
 Then edit `/opt/vmbackup/config/default/vmbackup.conf` to set your backup path and preferences:
 
 ```bash
-sudo vmbackup                            # run a backup now
+sudo vmbackup --run                        # run a backup now
 sudo systemctl start vmbackup.timer      # enable the daily schedule
 ```
 
@@ -44,6 +44,7 @@ For the full step-by-step walkthrough — backup path setup, per-VM overrides, e
 ## Features
 
 - **Every VM, automatically** — discovers and backs up all VMs on the host. No manifest to maintain — new VMs are picked up on the next run
+- **Targeted backup** — back up one or more specific VMs on demand with `--vm`, without waiting for the full scheduled run
 - **Full + incremental, zero decisions** — first backup is a full; every backup after that is an incremental. Period boundaries (daily, weekly, monthly) trigger a fresh full automatically
 - **Self-healing** — failed incrementals convert to fulls, broken chains are archived and restarted, interrupted runs clean up after themselves. Scheduled backups should never need manual intervention
 - **Multi-destination replication** — rsync to any mounted filesystem, rclone to cloud. Failed replication can be re-run independently without repeating a backup
@@ -79,8 +80,8 @@ Also requires `bash >= 5.0`, `libvirt-daemon-system`, `qemu-utils`, `sqlite3` an
 Download the latest `.deb` from [Releases](https://github.com/doutsis/vmbackup/releases):
 
 ```bash
-wget https://github.com/doutsis/vmbackup/releases/download/v0.5.2/vmbackup_0.5.2_all.deb
-sudo dpkg -i vmbackup_0.5.2_all.deb
+wget https://github.com/doutsis/vmbackup/releases/download/v0.5.3/vmbackup_0.5.3_all.deb
+sudo dpkg -i vmbackup_0.5.3_all.deb
 ```
 
 ### From Source (any distro)
@@ -132,7 +133,7 @@ The `default/` instance is used when vmbackup runs without `--config-instance`. 
 
 ```bash
 cp -r /opt/vmbackup/config/template /opt/vmbackup/config/prod
-vmbackup --config-instance prod
+vmbackup --run --config-instance prod
 ```
 
 This lets you run separate configurations (e.g. dev, staging, prod) from the same installation.
@@ -155,16 +156,22 @@ Once configured, vmbackup runs unattended via the systemd timer. For manual runs
 
 ```bash
 # Run a backup using the default config (config/default/)
-sudo vmbackup
+sudo vmbackup --run
 
 # Run using a named config instance (config/prod/)
-sudo vmbackup --config-instance prod
+sudo vmbackup --run --config-instance prod
 
 # Preview what a backup would do without writing anything
-sudo vmbackup --dry-run
+sudo vmbackup --run --dry-run
 
 # Cancel replication on a running session (backups continue)
 sudo vmbackup --cancel-replication
+
+# Back up a specific VM (replication skipped)
+sudo vmbackup --run --vm web
+
+# Back up multiple VMs
+sudo vmbackup --run --vm web,db,mail
 
 # Re-run replication without repeating the backup
 sudo vmbackup --replicate-only
@@ -205,10 +212,6 @@ The default rotation policy is set in `vmbackup.conf` and applies to all VMs. In
 ### Manual cleanup
 
 Automated retention runs after each backup, but sometimes you need to reclaim space on demand — remove archived chains, clean up old periods or wipe a decommissioned VM entirely. `--prune` handles this without running a backup session. All operations support `--dry-run` to preview, `--yes` to skip confirmation, and a keep-last guard that prevents removing the last period. See [vmbackup.md](vmbackup.md#on-demand-cleanup---prune) for the full target reference.
-
-## Host Configuration Backup
-
-Each backup session captures the libvirt configuration, network definitions and dependent service config needed to rebuild the virtualisation environment — not just the VMs. Host config is deduplicated and only stored when it has changed.
 
 ## TPM & BitLocker Support
 
@@ -300,21 +303,25 @@ The current test fleet covers the configurations that matter:
 
 The test runs through these phases:
 
-1. **Record identities** — UUID, MAC addresses, TPM presence, disk layout for every VM
-2. **Plant checkfiles** — write a marker file inside each guest via the QEMU agent (Linux and Windows)
-3. **Backup** — full backup cycle with FSTRIM, checkpoint validation and incremental chains
-4. **Verify** — confirm backup integrity with `vmrestore --verify`
-5. **Prune** — auto-detect and prune stale archives and periods from live backup data
-6. **Clone** — restore representative VMs as clones, verify new UUID + preserved data + disk paths, then destroy clones
-7. **Point-in-time restore** — restore to an earlier restore point (not latest), verify the VM boots and data matches the expected state
-8. **Destroy everything** — delete all original VMs including definitions, disks and NVRAM
-9. **DR restore** — restore all VMs from backup to a clean path
-10. **Post-restore verification** — for every restored VM, confirm:
+1. **Pre-flight checks** — tool availability, all VMs running, storage space, backup period detection
+2. **Record identities** — UUID, MAC addresses, TPM presence, disk layout for every VM
+3. **Plant checkfiles** — write uniquely identifiable marker files inside each guest via the QEMU agent (Linux and Windows). Three checkfiles (A, B, C) are planted at different points to enable point-in-time content verification
+4. **Build backup chains** — four vmbackup rounds that create two complete backup chains per VM (active + archived), with checkfiles planted between rounds so each restore point captures different content
+5. **Verify** — confirm backup integrity with `vmrestore --verify`
+6. **Prune** — auto-detect and prune stale periods from live backup data (archives preserved for PIT testing)
+7. **Clone** — restore representative VMs as clones, verify new UUID + preserved data + disk paths, then destroy clones
+8. **Point-in-time restore** — restore to specific restore points across both active and archived chains (8 sub-tests across 2 VMs), verify each clone boots and the checkfile content matches the expected point in time
+9. **Single-disk restore** — replace a single disk via `vmrestore --disk` on a multi-disk VM, verify `.pre-restore` backup creation, disk integrity, VM boot, vmbackup auto-heal after chain invalidation, and `--no-pre-restore` mode
+10. **Destroy everything** — delete all original VMs including definitions, disks and NVRAM
+11. **DR restore** — restore all VMs from backup to a clean path
+12. **Post-restore verification** — for every restored VM, confirm:
     - UUID and MAC addresses match originals
     - All disks present and in the correct restore path
+    - Disk integrity verified via `qemu-img check` (before VM boot)
     - TPM device and swtpm state directory preserved
     - Checkfile inside the guest survived the full backup → destroy → restore cycle
     - BitLocker not triggered on Windows VMs (disk unlocked, no recovery prompt)
+13. **Summary** — final scorecard with pass/fail/warn counts and elapsed time
 
 ## Documentation
 
@@ -331,14 +338,6 @@ Linux guests are unaffected (the kernel coalesces TRIMs regardless). SATA guests
 **Fix:** Add a `discard_granularity` override (32 MiB recommended) to each VirtIO disk in the VM's libvirt XML. vmbackup detects missing overrides automatically at backup time and logs the exact XML to add.
 
 Full details, performance benchmarks and step-by-step XML instructions: [VirtIO discard_granularity & Windows TRIM Performance](vmbackup.md#virtio-discard_granularity--windows-trim-performance)
-
-### vmrestore: `--disk` on single-disk VMs
-
-`vmrestore --disk` is designed for in-place disk replacement without touching the VM definition. However, on VMs with only one disk, vmrestore silently falls through to full-VM restore mode — which undefines the VM from libvirt. This is unexpected when the intent is to swap out a single disk file.
-
-**Workaround:** Use `--disk` only on multi-disk VMs. For single-disk VMs, use a standard DR restore instead.
-
-**Status:** Will be fixed in a future vmrestore release. `--disk` on a single-disk VM should perform an in-place disk replacement, not a full-VM restore.
 
 ## Issues
 
