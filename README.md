@@ -1,4 +1,4 @@
-# vmbackup
+# vmbackup — Automated KVM/libvirt Backup Manager
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Version](https://img.shields.io/github/v/release/doutsis/vmbackup)](https://github.com/doutsis/vmbackup/releases)
