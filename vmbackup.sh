@@ -74,10 +74,13 @@ set -o pipefail
 umask 027
 
 # Version - used by Debian packaging and --version flag
-VMBACKUP_VERSION="0.5.3"
+VMBACKUP_VERSION="0.5.4"
 
 # Dry-run mode: show what would happen without executing destructive operations
 DRY_RUN=false
+
+# Guard against duplicate email reports (BUG-02: double email on SIGTERM)
+_EMAIL_SENT=false
 
 #################################################################################
 # ARGUMENT PARSING (must happen before config load)
@@ -327,7 +330,11 @@ _VMBACKUP_SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && 
 SCRIPT_DIR="$_VMBACKUP_SCRIPT_DIR"  # Export for modules that expect SCRIPT_DIR
 _VMBACKUP_ENV_BACKUP_PATH="${BACKUP_PATH:-}"
 _VMBACKUP_CONFIG="${_VMBACKUP_SCRIPT_DIR}/config/${CONFIG_INSTANCE}/vmbackup.conf"
-[[ -f "$_VMBACKUP_CONFIG" ]] && source "$_VMBACKUP_CONFIG"
+if [[ ! -f "$_VMBACKUP_CONFIG" ]]; then
+    echo "Error: Config instance '${CONFIG_INSTANCE}' not found: $_VMBACKUP_CONFIG" >&2
+    exit 1
+fi
+source "$_VMBACKUP_CONFIG"
 # Restore env var if it was set (env takes precedence over config)
 [[ -n "$_VMBACKUP_ENV_BACKUP_PATH" ]] && BACKUP_PATH="$_VMBACKUP_ENV_BACKUP_PATH"
 
@@ -615,8 +622,10 @@ ensure_backup_path_sgid() {
   has_sgid=$(stat -c '%a' "$BACKUP_PATH" 2>/dev/null)
 
   if [[ "$current_group" != "backup" || "${has_sgid:0:1}" != "2" ]]; then
-    chown root:backup "$BACKUP_PATH" 2>/dev/null || true
-    chmod 2750 "$BACKUP_PATH" 2>/dev/null || true
+    chown root:backup "$BACKUP_PATH" 2>/dev/null ||
+      echo "[vmbackup] WARN: Failed to set ownership root:backup on $BACKUP_PATH" >&2
+    chmod 2750 "$BACKUP_PATH" 2>/dev/null ||
+      echo "[vmbackup] WARN: Failed to set permissions 2750 on $BACKUP_PATH" >&2
     # Log to stderr since logging isn't initialised yet
     echo "[vmbackup] SGID bootstrap: set $BACKUP_PATH to root:backup 2750" >&2
   fi
@@ -649,16 +658,20 @@ set_backup_permissions() {
       # Exclude tpm-state/ from ownership change (TPM private keys — root:root 600)
       find "$target_path" \
         -not -path '*/tpm-state/*' -not -path '*/tpm-state' \
-        -exec chown root:backup {} + 2>/dev/null || true
+        -exec chown root:backup {} + 2>/dev/null ||
+        log_warn "vmbackup.sh" "set_backup_permissions" "Failed to set ownership on $target_path (recursive)"
       # Set SGID on directories for automatic group inheritance
       find "$target_path" -type d \
         -not -path '*/tpm-state/*' -not -path '*/tpm-state' \
-        -exec chmod g+s {} + 2>/dev/null || true
+        -exec chmod g+s {} + 2>/dev/null ||
+        log_warn "vmbackup.sh" "set_backup_permissions" "Failed to set SGID on directories in $target_path"
     else
-      chown root:backup "$target_path" 2>/dev/null || true
+      chown root:backup "$target_path" 2>/dev/null ||
+        log_warn "vmbackup.sh" "set_backup_permissions" "Failed to set ownership on $target_path"
       # Set SGID on directories for automatic group inheritance
       if [[ -d "$target_path" ]]; then
-        chmod g+s "$target_path" 2>/dev/null || true
+        chmod g+s "$target_path" 2>/dev/null ||
+          log_warn "vmbackup.sh" "set_backup_permissions" "Failed to set SGID on $target_path"
       fi
     fi
   fi
@@ -3400,6 +3413,18 @@ perform_backup() {
         log_warn "vmbackup.sh" "perform_backup" \
           "AUTO backup failed, converting to FULL backup (attempt $attempt of $((MAX_RETRIES + 1)))"
         
+        # Ensure virtnbdbackup and children are fully terminated
+        if pgrep -f "virtnbdbackup.*${vm_name}" &>/dev/null; then
+            log_warn "vmbackup.sh" "perform_backup" "virtnbdbackup still running for $vm_name — killing"
+            pkill -f "virtnbdbackup.*${vm_name}" 2>/dev/null || true
+            sleep 2
+            # Force kill if still alive
+            pgrep -f "virtnbdbackup.*${vm_name}" &>/dev/null && \
+                pkill -9 -f "virtnbdbackup.*${vm_name}" 2>/dev/null || true
+        fi
+        # Abort any lingering libvirt backup job
+        virsh domjobabort "$vm_name" 2>/dev/null || true
+        
         # STEP 1: Archive existing valid backup chain before cleanup destroys it
         # Check if there's restorable backup data (*.full.data or *.copy.data present)
         local has_valid_chain=false
@@ -3440,6 +3465,18 @@ perform_backup() {
       if (( attempt <= MAX_RETRIES + 1 )); then
         log_warn "vmbackup.sh" "perform_backup" \
           "Retrying $backup_type backup in $RETRY_DELAY seconds (attempt $attempt of $((MAX_RETRIES + 1)))"
+        
+        # Ensure virtnbdbackup and children are fully terminated
+        if pgrep -f "virtnbdbackup.*${vm_name}" &>/dev/null; then
+            log_warn "vmbackup.sh" "perform_backup" "virtnbdbackup still running for $vm_name — killing"
+            pkill -f "virtnbdbackup.*${vm_name}" 2>/dev/null || true
+            sleep 2
+            # Force kill if still alive
+            pgrep -f "virtnbdbackup.*${vm_name}" &>/dev/null && \
+                pkill -9 -f "virtnbdbackup.*${vm_name}" 2>/dev/null || true
+        fi
+        # Abort any lingering libvirt backup job
+        virsh domjobabort "$vm_name" 2>/dev/null || true
         
         # STEP 1: Archive existing valid backup chain before cleanup destroys it
         local has_valid_chain=false
@@ -5064,10 +5101,13 @@ cleanup_on_exit() {
     log_error "vmbackup.sh" "cleanup_on_exit" "  3. Next run will auto-cleanup stale locks and orphaned checkpoints"
   fi
   
-  # Finalize SQLite session if interrupted (exit codes 130=SIGINT, 143=SIGTERM)
-  if [[ $exit_code -eq 130 ]] || [[ $exit_code -eq 143 ]]; then
-    if sqlite_is_available 2>/dev/null && [[ -n "$SQLITE_CURRENT_SESSION_ID" ]] && [[ "$DRY_RUN" != true ]]; then
-      # Count current results from VM_BACKUP_RESULTS array
+  # Finalize SQLite session if not already ended
+  # Normal exits finalize in main()/prune/replicate-only, but early errors,
+  # unhandled exits, or edge cases may skip those. This catch-all is safe
+  # because sqlite_session_end() has an idempotency guard (_SQLITE_SESSION_ENDED).
+  if sqlite_is_available 2>/dev/null && [[ -n "${SQLITE_CURRENT_SESSION_ID:-}" ]] && [[ "$DRY_RUN" != true ]]; then
+    if [[ $exit_code -eq 130 ]] || [[ $exit_code -eq 143 ]]; then
+      # Signal exit — count results from what we processed so far
       local int_total=0 int_success=0 int_failed=0 int_skipped=0 int_excluded=0
       for result in "${VM_BACKUP_RESULTS[@]}"; do
         IFS='|' read -r vm status rest <<< "$result"
@@ -5083,22 +5123,32 @@ cleanup_on_exit() {
       [[ $exit_code -eq 143 ]] && int_status="killed"
       sqlite_session_end "$int_total" "$int_success" "$int_failed" "$int_skipped" "$int_excluded" "0" "$int_status"
       log_info "vmbackup.sh" "cleanup_on_exit" "SQLite session finalized as '$int_status'"
+    else
+      # Non-signal exit that didn't finalize normally (early error, unexpected path)
+      sqlite_session_end "0" "0" "0" "0" "0" "0" "incomplete"
+      log_warn "vmbackup.sh" "cleanup_on_exit" "SQLite session finalized as 'incomplete' (exit code $exit_code)"
     fi
   fi
   
   log_info "vmbackup.sh" "cleanup_on_exit" "Cleaning up temporary files before exit (exit code: $exit_code)"
   
-  # Remove temporary lock files if script exits unexpectedly
+  # Remove stale lock files — only those whose owning process is no longer running.
+  # Uses vmbackup-*.lock glob to avoid touching locks from other tools.
   if [[ -d "$LOCK_DIR" ]]; then
-    # Clean only lock files older than 1 hour (stale locks)
-    local stale_locks=$(find "$LOCK_DIR" -name "*.lock" -type f -mmin +60 2>/dev/null)
-    if [[ -n "$stale_locks" ]]; then
-      while IFS= read -r lock_file; do
+    local stale_found=false
+    while IFS= read -r lock_file; do
+      [[ -z "$lock_file" ]] && continue
+      local lock_pid
+      lock_pid=$(cat "$lock_file" 2>/dev/null)
+      # Only delete if the owning process is gone (or PID is empty/unreadable)
+      if [[ -z "$lock_pid" ]] || ! kill -0 "$lock_pid" 2>/dev/null; then
         if rm -f "$lock_file"; then
-          log_debug "vmbackup.sh" "cleanup_on_exit" "Deleted stale lock file: $(basename "$lock_file")"
+          log_debug "vmbackup.sh" "cleanup_on_exit" "Deleted stale lock file: $(basename "$lock_file") (PID ${lock_pid:-unknown} not running)"
+          stale_found=true
         fi
-      done <<< "$stale_locks"
-    else
+      fi
+    done < <(find "$LOCK_DIR" -name "vmbackup-*.lock" -type f -mmin +60 2>/dev/null)
+    if [[ "$stale_found" != true ]]; then
       log_debug "vmbackup.sh" "cleanup_on_exit" "No stale lock files found"
     fi
   fi
@@ -5185,6 +5235,8 @@ handle_sigterm() {
   local session_end_time=$(date '+%Y-%m-%d %H:%M:%S %Z')
   if [[ "$DRY_RUN" == true ]]; then
     log_info "vmbackup.sh" "handle_sigterm" "[DRY-RUN] Skipping email report"
+  elif [[ "${_EMAIL_SENT:-false}" == "true" ]]; then
+    log_info "vmbackup.sh" "handle_sigterm" "Email already sent — skipping duplicate report"
   elif [[ -f "${SCRIPT_DIR}/modules/email_report_module.sh" ]]; then
     log_info "vmbackup.sh" "handle_sigterm" "Loading email report module..."
     source "${SCRIPT_DIR}/modules/email_report_module.sh"
@@ -5192,6 +5244,7 @@ handle_sigterm() {
       log_info "vmbackup.sh" "handle_sigterm" "Sending email report before SIGTERM exit..."
       if send_backup_report "${session_start_time:-unknown}" "$session_end_time" "failed"; then
         log_info "vmbackup.sh" "handle_sigterm" "Email report sent successfully"
+        _EMAIL_SENT=true
       else
         log_warn "vmbackup.sh" "handle_sigterm" "Failed to send email report"
       fi
@@ -5605,6 +5658,7 @@ _run_replicate_only() {
     if load_email_config; then
       log_info "vmbackup.sh" "main" "Sending email report to $EMAIL_RECIPIENT"
       send_backup_report "$session_start_time" "$session_end_time" "$final_status" || true
+      _EMAIL_SENT=true
     else
       log_debug "vmbackup.sh" "main" "Email disabled or not configured"
     fi
@@ -5998,25 +6052,26 @@ main() {
   
   log_info "vmbackup.sh" "main" "Configuration: COMPRESS_LEVEL=$VIRTNBD_COMPRESS_LEVEL, HEALTH_CHECK=$CHECKPOINT_HEALTH_CHECK"
   
-  # Global session lock — prevent concurrent vmbackup invocations
+  # Global session lock — prevent concurrent vmbackup invocations (atomic)
   local session_pidfile="$STATE_DIR/vmbackup.pid"
-  if [[ -f "$session_pidfile" ]]; then
+  if ! ( set -o noclobber; echo "$$" > "$session_pidfile" ) 2>/dev/null; then
+    # Lock file exists — check if holder is still alive
     local existing_pid
     existing_pid=$(cat "$session_pidfile" 2>/dev/null)
     if [[ -n "$existing_pid" ]] && kill -0 "$existing_pid" 2>/dev/null; then
-      local proc_cmd
-      proc_cmd=$(cat "/proc/$existing_pid/cmdline" 2>/dev/null | tr '\0' ' ')
-      if [[ "$proc_cmd" == *"vmbackup"* ]]; then
-        log_error "vmbackup.sh" "main" "Another vmbackup session is already running (PID $existing_pid) — aborting"
-        echo "Error: Another vmbackup session is already running (PID $existing_pid)" >&2
-        exit 1
-      fi
+      log_error "vmbackup.sh" "main" "Another vmbackup session is already running (PID $existing_pid) — aborting"
+      echo "Error: Another vmbackup session is already running (PID $existing_pid)" >&2
+      exit 1
     fi
-    # PID not running or not vmbackup — stale file
+    # Stale PID file — remove and retry once
     rm -f "$session_pidfile"
-    log_debug "vmbackup.sh" "main" "Removed stale session PID file (PID $existing_pid no longer running)"
+    log_debug "vmbackup.sh" "main" "Removed stale session PID file (PID ${existing_pid:-unknown} no longer running)"
+    if ! ( set -o noclobber; echo "$$" > "$session_pidfile" ) 2>/dev/null; then
+      log_error "vmbackup.sh" "main" "Failed to acquire session lock after stale removal — aborting"
+      echo "Error: Failed to acquire session lock" >&2
+      exit 1
+    fi
   fi
-  echo "$$" > "$session_pidfile"
   log_debug "vmbackup.sh" "main" "Session PID file created: $session_pidfile (PID $$)"
   
   # Track session start time for email report (include %Z for unambiguous
@@ -6551,6 +6606,7 @@ main() {
       log_info "vmbackup.sh" "main" "Sending email report to $EMAIL_RECIPIENT"
       if send_backup_report "$session_start_time" "$session_end_time" "$overall_status"; then
         log_info "vmbackup.sh" "main" "Email report sent successfully"
+        _EMAIL_SENT=true
       else
         log_warn "vmbackup.sh" "main" "Failed to send email report (backup data preserved)"
       fi

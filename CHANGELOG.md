@@ -4,6 +4,18 @@ All notable changes to [vmbackup](https://github.com/doutsis/vmbackup) will be d
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.5.4] - 2026-04-12
+
+### Fixed
+
+- **Session PID lock race condition** — Replaced non-atomic check-then-write PID lock with the `noclobber` pattern (already proven in `lib/vm_lock.sh`). Prevents duplicate concurrent sessions when two vmbackup invocations start simultaneously.
+- **Reorder config-instance validation before session lock** — `--config-instance nonexistent` now fails immediately at startup instead of blocking on the global session lock while another backup is running. Config existence is validated during early config load, before `main()` and lock acquisition.
+- **Double email on SIGTERM** — Added `_EMAIL_SENT` guard flag to prevent duplicate email reports when SIGTERM arrives after normal email send but before process exits.
+- **virtnbdbackup not confirmed dead before retry** — Added `pgrep`/`pkill` cleanup and `virsh domjobabort` before retry to ensure orphaned virtnbdbackup children and lingering libvirt backup jobs are terminated. Prevents data corruption from concurrent backup processes on the same VM.
+- **SQLite session not finalised on normal exit** — `sqlite_session_end()` was only called for SIGINT/SIGTERM exits, not for early errors or unexpected exit paths. Sessions could be left permanently "in progress" in the database. Now finalised unconditionally in `cleanup_on_exit()` (idempotency guard prevents double-close).
+- **Silent permission failures on backup path** — `chown`/`chmod` failures in `ensure_backup_path_sgid()` and `set_backup_permissions()` were suppressed with `|| true`. Now logs warnings so filesystem permission issues are visible instead of silently degrading backup security.
+- **Stale lock cleanup could delete active locks** — `cleanup_on_exit()` deleted any `*.lock` file older than 1 hour without checking whether the owning process was still running. A backup taking >1 hour could have its lock deleted by a concurrent session exiting. Now validates PID liveness before deletion and uses the correct `vmbackup-*.lock` glob.
+
 ## [0.5.3] - 2026-04-10
 
 ### Added

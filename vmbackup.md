@@ -196,8 +196,8 @@ vmbackup is a wrapper around [virtnbdbackup](https://github.com/abbbi/virtnbdbac
 Download the latest `.deb` from [Releases](https://github.com/doutsis/vmbackup/releases):
 
 ```bash
-wget https://github.com/doutsis/vmbackup/releases/download/v0.5.3/vmbackup_0.5.3_all.deb
-sudo dpkg -i vmbackup_0.5.3_all.deb
+wget https://github.com/doutsis/vmbackup/releases/download/v0.5.4/vmbackup_0.5.4_all.deb
+sudo dpkg -i vmbackup_0.5.4_all.deb
 ```
 
 ### From Source
