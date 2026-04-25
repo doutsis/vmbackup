@@ -96,8 +96,6 @@ load_email_config() {
     EMAIL_SUBJECT_PREFIX="${EMAIL_SUBJECT_PREFIX:-[VM Backup]}"
     EMAIL_ON_SUCCESS="${EMAIL_ON_SUCCESS:-yes}"
     EMAIL_ON_FAILURE="${EMAIL_ON_FAILURE:-yes}"
-    EMAIL_INCLUDE_REPLICATION="${EMAIL_INCLUDE_REPLICATION:-yes}"
-    EMAIL_INCLUDE_DISK_SPACE="${EMAIL_INCLUDE_DISK_SPACE:-yes}"
     
     # Check msmtp is available
     if ! command -v msmtp >/dev/null 2>&1; then

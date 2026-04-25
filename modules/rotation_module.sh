@@ -95,6 +95,18 @@ load_rotation_config() {
         [[ -n "$BACKUP_PATH" && "$BACKUP_PATH" != */ ]] && BACKUP_PATH="${BACKUP_PATH}/"
         log_config_event "config_loaded" "$main_config" "" \
             "BACKUP_ROTATION_POLICY" "$BACKUP_ROTATION_POLICY" "" "all_vms" "load_rotation_config"
+        log_config_event "config_loaded" "$main_config" "" \
+            "RETENTION_DAYS" "$RETENTION_DAYS" "" "all_vms" "load_rotation_config"
+        log_config_event "config_loaded" "$main_config" "" \
+            "RETENTION_WEEKS" "$RETENTION_WEEKS" "" "all_vms" "load_rotation_config"
+        log_config_event "config_loaded" "$main_config" "" \
+            "RETENTION_MONTHS" "$RETENTION_MONTHS" "" "all_vms" "load_rotation_config"
+        log_config_event "config_loaded" "$main_config" "" \
+            "RETENTION_ORPHAN_ENABLED" "${RETENTION_ORPHAN_ENABLED:-true}" "" "all_vms" "load_rotation_config"
+        log_config_event "config_loaded" "$main_config" "" \
+            "RETENTION_ORPHAN_MAX_AGE_DAYS" "${RETENTION_ORPHAN_MAX_AGE_DAYS:-90}" "" "all_vms" "load_rotation_config"
+        log_config_event "config_loaded" "$main_config" "" \
+            "RETENTION_ORPHAN_MIN_AGE_DAYS" "${RETENTION_ORPHAN_MIN_AGE_DAYS:-7}" "" "all_vms" "load_rotation_config"
     else
         log_debug "rotation_module.sh" "load_rotation_config" \
             "No config file, using defaults: $main_config"

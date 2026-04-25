@@ -27,6 +27,7 @@
     - [On-Demand Cleanup (`--prune`)](#on-demand-cleanup---prune)
     - [Targeted Backup (`--vm`)](#targeted-backup---vm)
     - [Standalone Replication (`--replicate-only`)](#standalone-replication---replicate-only)
+    - [Status Reports (`--status`)](#status-reports---status)
 11. [Failure Detection & Self-Remediation](#failure-detection--self-remediation)
 12. [Security & Permissions](#security--permissions)
     - [Permission Model](#permission-model)
@@ -106,16 +107,21 @@ Exactly one mode is required per invocation. Modes are mutually exclusive.
 | `--run` | Start a backup session. Backs up all VMs (or those specified by `--vm`), then runs replication and retention. |
 | `--prune <target>` | Remove backup data without running a backup. See [On-Demand Cleanup](#on-demand-cleanup---prune) for targets. |
 | `--replicate-only [scope]` | Run replication without backing up. Scope: `local`, `cloud`, or `both` (default). Cannot combine with `--vm`. |
+| `--status [report]` | Query backup history, failures, chain health, storage and policies. Read-only — no locks, no session. See [Status Reports](#status-reports---status). |
 | `--cancel-replication` | Signal a running session to stop its replication phase. Backups in progress are not affected. Cannot combine with any other flag. |
+| `--config-prune-removed` | Comment out configuration variables that have been removed from the codebase in the running release. Idempotent and reversible (lines are commented, not deleted). Operates on `default/` and all custom instances; skips `template/`. Use with `--dry-run` to preview. |
 
 ### Options
 
 | Option | Applies to | Description |
 |--------|-----------|-------------|
-| `--vm NAME` | `--run`, `--prune` | Target specific VM(s), comma-separated. With `--run`, replication is skipped. With `--prune`, only a single VM name is accepted. |
+| `--vm NAME` | `--run`, `--prune`, `--status` | Target specific VM(s), comma-separated. With `--run`, replication is skipped. With `--prune`, only a single VM name is accepted. With `--status`, selects a VM for `--status` (history) or `--status --chains` (detail). |
 | `--dry-run` | `--run`, `--prune`, `--replicate-only` | Preview without writing anything. |
 | `--config-instance NAME` | all modes | Load config from `config/NAME/` instead of `config/default/`. |
 | `--yes`, `-y` | `--prune` | Skip confirmation prompt (for scripted use). |
+| `--days N` | `--status` | Time window in days (default: 1 = today). |
+| `--csv` | `--status` | CSV output with both raw and human-readable columns. |
+| `--all-instances` | `--status` (sessions) | Show sessions from all config instances sharing the active database (default: scoped to `--config-instance`). |
 | `--help`, `-h` | — | Show help and exit. |
 | `--version` | — | Show version and exit. |
 
@@ -131,7 +137,10 @@ The following combinations are rejected at startup:
 | `--prune` + `--replicate-only` | Separate operations |
 | `--cancel-replication` + anything | Standalone signal only |
 | `--prune` + multiple VMs | Prune requires a single VM name |
-| `--vm` without `--run` or `--prune` | `--vm` modifies a mode; it is not a mode itself |
+| `--status` + `--run` | Status is read-only; backup is a separate operation |
+| `--status` + `--prune` | Separate operations |
+| `--status` + `--replicate-only` | Separate operations |
+| `--vm` without `--run`, `--prune` or `--status` | `--vm` modifies a mode; it is not a mode itself |
 
 ### Concurrency
 
@@ -181,6 +190,19 @@ sudo vmbackup --replicate-only local --dry-run
 
 # Cancel replication on a running session
 sudo vmbackup --cancel-replication
+
+# Status reports (read-only — no locks, no session)
+sudo vmbackup --status                           # Today's sessions
+sudo vmbackup --status --days 7                  # Last 7 days
+sudo vmbackup --status --vm web                  # VM backup history
+sudo vmbackup --status --failures --days 30      # Failures last 30 days
+sudo vmbackup --status --replication --days 7    # Replication status
+sudo vmbackup --status --chains                  # Chain health overview
+sudo vmbackup --status --chains --vm web         # Chain detail for one VM
+sudo vmbackup --status --storage                 # Storage per VM
+sudo vmbackup --status --policies                # Rotation policy summary
+sudo vmbackup --status --failures --csv          # CSV export
+sudo vmbackup --status --all-instances --days 7  # Sessions across all instances
 ```
 
 ---
@@ -196,8 +218,8 @@ vmbackup is a wrapper around [virtnbdbackup](https://github.com/abbbi/virtnbdbac
 Download the latest `.deb` from [Releases](https://github.com/doutsis/vmbackup/releases):
 
 ```bash
-wget https://github.com/doutsis/vmbackup/releases/download/v0.5.4/vmbackup_0.5.4_all.deb
-sudo dpkg -i vmbackup_0.5.4_all.deb
+wget https://github.com/doutsis/vmbackup/releases/download/v0.5.5/vmbackup_0.5.5_all.deb
+sudo dpkg -i vmbackup_0.5.5_all.deb
 ```
 
 ### From Source
@@ -677,6 +699,10 @@ All config files are self-documenting — `config/template/` contains every sett
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `BACKUP_PATH` | *(required)* | Backup root directory. Must exist before first run (`mkdir -p`). SGID applied automatically on first run. |
+| `DISK_ABORT_PCT` | `20` | Pre-flight aborts if free space on `BACKUP_PATH` drops below this percent. `0` disables the percent abort. |
+| `DISK_WARN_PCT` | `30` | Pre-flight logs a warning (does not abort) if free space drops below this percent. `0` disables. |
+| `DISK_ABORT_GB` | `10` | Pre-flight aborts if absolute free space drops below this many GB. `0` disables the GB abort. Either threshold can fire independently. |
+| `DISK_WARN_GB` | `50` | Pre-flight warns if absolute free space drops below this many GB. `0` disables. |
 | `PROCESS_PRIORITY` | `10` | CPU nice: −20 (highest) to 19 (lowest) |
 | `IO_PRIORITY_CLASS` | `2` | ionice class: 1=realtime, 2=best-effort, 3=idle |
 | `IO_PRIORITY_LEVEL` | `5` | 0–7 within class (0=highest) |
@@ -701,8 +727,7 @@ All config files are self-documenting — `config/template/` contains every sett
 | `FSTRIM_TIMEOUT` | `300` | Linux guest FSTRIM timeout (seconds) |
 | `FSTRIM_WINDOWS_TIMEOUT` | `600` | Windows guest FSTRIM timeout (seconds) |
 | `FSTRIM_EXCLUDE_FILE` | `fstrim_exclude.conf` | File of VM name patterns to skip |
-| `SKIP_OFFLINE_UNCHANGED_BACKUPS` | `true` | Skip offline VMs whose disks haven't changed since last backup |
-| `OFFLINE_CHANGE_DETECTION_THRESHOLD` | `60` | Seconds threshold for disk change detection |
+| `SKIP_OFFLINE_UNCHANGED_BACKUPS` | `true` | When `true`, skip offline VMs whose disk files have not been modified since the last backup. When `false`, offline VMs are backed up unconditionally on every run. |
 | `ENABLE_AUTO_RECOVERY_ON_CHECKPOINT_CORRUPTION` | `yes` | `yes`=self-heal, `warn`=log remediation steps but fail, `no`=fail immediately |
 | `REPLICATION_ORDER` | `simultaneous` | `simultaneous` / `local_first` / `cloud_first` |
 | `STATE_BACKUP_KEEP_DAYS` | `90` | Days to keep daily `_state/` snapshots |
@@ -760,8 +785,8 @@ One glob pattern per line. `#` comments and blank lines ignored. VMs matching an
 | `EMAIL_SUBJECT_PREFIX` | `[VM Backup]` | Subject line prefix |
 | `EMAIL_ON_SUCCESS` | `yes` | Send on successful backup |
 | `EMAIL_ON_FAILURE` | `yes` | Send on failure |
-| `EMAIL_INCLUDE_REPLICATION` | `yes` | Include replication details |
-| `EMAIL_INCLUDE_DISK_SPACE` | `yes` | Include disk space summary |
+
+Replication summaries and the (future) disk-usage section are rendered automatically when their underlying data is present — there is no per-section toggle.
 
 #### replication_local.conf — Local/NAS Destinations
 
@@ -1545,13 +1570,104 @@ If email is configured, a report is sent with subject `Replication Only — host
 
 ---
 
+### Status Reports (`--status`)
+
+Read-only operational reporting against the SQLite database. No locks, no session lifecycle, no log files — `--status` queries the existing database and exits. Runs the lightest possible code path: config load, `sqlite_init_readonly()` (no WAL, no migrations), query, format, exit.
+
+See [Usage](#usage) for CLI syntax and combination rules.
+
+#### Reports
+
+| Report | Command | What it shows |
+|--------|---------|---------------|
+| Sessions | `--status` | Per-session blocks rendered by job type — backup (VM table), prune (retention summary), replicate-only (per-endpoint table), mixed (`[standard +repl]`) and incomplete. Instance-scoped by default. |
+| VM history | `--status --vm web` | Backup history for a specific VM (type, status, size, duration) |
+| Failures | `--status --failures` | VMs with failures and failure counts |
+| Replication | `--status --replication` | Replication runs (endpoint, transport, status, bytes, duration) |
+| Chains | `--status --chains` | Chain health per VM (active, archived, purged, checkpoints) |
+| Chain detail | `--status --chains --vm web` | Per-chain breakdown for one VM (period, status, policy) |
+| Storage | `--status --storage` | Storage per VM (policy, backup count, avg full/incr, total, current chain) |
+| Policies | `--status --policies` | Rotation policy summary (per-VM policy, retention limits, orphans) |
+
+#### Options
+
+`--days N` sets the time window in days (default: 1 = today). Applies to sessions, VM history, failures and replication reports. Storage, chains and policies report across all history regardless of `--days`.
+
+`--csv` switches output to CSV with both raw and human-readable columns. Byte values get an adjacent `_hr` column (e.g. `bytes_written,bytes_written_hr`). Duration values get a `_hr` column (e.g. `duration_sec,duration_sec_hr`). The policies CSV includes instance-level context columns (`instance_default_policy`, `instance_retention_limit`, `orphan_max_age_days`, `orphan_min_age_days`). The sessions CSV appends three row-count columns (`vm_rows`, `repl_rows`, `retention_rows`) used for client-side classification.
+
+`--all-instances` (sessions report only) opts out of the default `CONFIG_INSTANCE` filter and lists sessions from every instance that has written to the active database. Useful when multiple config instances share a `BACKUP_PATH`.
+
+#### Output Format
+
+Terminal output is pipe-delimited and passed through `column -t` for aligned columns. Byte values are formatted to human-readable units (GiB, MiB, KiB). Duration values are formatted as `Xm Ys` or `Xs`.
+
+The policies report prints a preamble before the table showing the instance-level defaults:
+
+```
+Instance default policy: monthly (RETENTION_MONTHLYS=3)
+Orphan retention: enabled, max_age=90 days, min_age=7 days
+```
+
+If a query returns no data, `--status` prints `No matching records.` to stderr and exits 0.
+
+#### Examples
+
+```bash
+# What happened today?
+sudo vmbackup --status
+
+# Last 7 days of sessions
+sudo vmbackup --status --days 7
+
+# Backup history for a specific VM
+sudo vmbackup --status --vm web-server
+
+# Any failures in the last 30 days?
+sudo vmbackup --status --failures --days 30
+
+# Replication status this week
+sudo vmbackup --status --replication --days 7
+
+# Chain health overview (all VMs, all time)
+sudo vmbackup --status --chains
+
+# Chain detail for one VM
+sudo vmbackup --status --chains --vm web-server
+
+# How much storage is each VM using?
+sudo vmbackup --status --storage
+
+# Rotation policy summary with retention status
+sudo vmbackup --status --policies
+
+# Export failures as CSV for a spreadsheet
+sudo vmbackup --status --failures --days 30 --csv
+
+# Export storage as CSV (includes raw bytes + human-readable)
+sudo vmbackup --status --storage --csv
+```
+
+#### Architecture
+
+Three files, strict separation:
+
+| File | Layer | Responsibility |
+|------|-------|---------------|
+| `vmbackup.sh` | CLI | Flag parsing, conflict validation, dispatch |
+| `lib/sqlite_module.sh` | Data | Query functions returning pipe-delimited or CSV rows |
+| `modules/status_module.sh` | Presentation | Formatting, column alignment, human-readable conversion |
+
+Adding a new report requires one query function in `sqlite_module.sh`, one `_status_*` function in `status_module.sh`, and one case in the dispatch. No changes to vmbackup.sh flag parsing unless a new sub-mode flag is needed.
+
+---
+
 ## Failure Detection & Self-Remediation
 
 ### Multi-Layer Detection
 
 Failure detection runs at four stages:
 
-1. **Session startup** — `check_dependencies()` aborts on missing tools, `check_backup_destination()` aborts if the backup path is unwritable, `check_disk_space()` triggers emergency pruning below 20% free, and `cleanup_stale_locks()` removes orphaned lock files.
+1. **Session startup** — `check_dependencies()` aborts on missing tools, `check_backup_destination()` aborts if the backup path is unwritable, `check_disk_space()` aborts when free space drops below the configured thresholds (`DISK_ABORT_PCT` / `DISK_ABORT_GB`, defaults 20% / 10 GB) and warns at the warn thresholds (`DISK_WARN_PCT` / `DISK_WARN_GB`, defaults 30% / 50 GB), and `cleanup_stale_locks()` removes orphaned lock files. Pre-flight failures (unwritable destination, missing scratch dir, low disk) trigger an email report when notifications are enabled.
 2. **Per-VM validation** — `pre_backup_hook()` excludes VMs with `policy=never`, `validate_backup_state()` runs 5-phase state analysis, and `prepare_backup_directory()` cleans stale state.
 3. **Backup execution** — `perform_backup()` retries with AUTO→FULL conversion on failure, archives broken chains, re-validates, and retries.
 4. **Signal handling** — SIGTERM/SIGINT release locks and log recovery guidance. The next run auto-recovers any stale state left behind.
@@ -1883,6 +1999,8 @@ The schema and all table definitions live in `lib/sqlite_module.sh`. Use `sqlite
 ---
 
 ### Query Cookbook
+
+Most of these queries are available directly from the command line via `--status` — see [Status Reports](#status-reports---status). The raw SQL below is useful for custom queries, ad-hoc investigation, or integration with external tools.
 
 All queries target the SQLite database at `$BACKUP_PATH/_state/vmbackup.db`. Set the path once:
 

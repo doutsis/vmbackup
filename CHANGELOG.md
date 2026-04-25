@@ -4,6 +4,27 @@ All notable changes to [vmbackup](https://github.com/doutsis/vmbackup) will be d
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.5.5] - 2026-04-25
+
+### Added
+
+- **Configurable backup-destination space thresholds** — Four new optional `vmbackup.conf` settings (`DISK_ABORT_PCT`, `DISK_WARN_PCT`, `DISK_ABORT_GB`, `DISK_WARN_GB`) let `check_disk_space()` be tuned per instance. Percent and absolute thresholds are evaluated together so either can fire independently; setting any threshold to `0` disables it. Defaults (20%/30% and 10 GB/50 GB) preserve previous behaviour.
+- **Disk-space snapshot per session (schema v2.1)** — `sessions` table gains `disk_free_bytes` and `disk_total_bytes` columns, populated by `sqlite_session_end()` from a `df` capture against `BACKUP_PATH`. Migration from v2.0 is automatic, idempotent and additive.
+- **`--status` reporting command** — Seven report modes: sessions, VM history, failures, replication, chains, storage, policies. Terminal tables by default, `--csv` for export, `--days N` for time window, `--all-instances` to span every config instance. Sessions output is job-type-aware (backup / prune / replicate-only / mixed) and scoped to the active `CONFIG_INSTANCE` by default. The storage report includes per-VM size trends and a destination-growth projection that names the configured `DISK_ABORT_PCT` threshold.
+- **Post-upgrade config advisory in `postinst`** — On dpkg upgrade, lists `.dpkg-dist` files awaiting merge with per-file `diff -u` commands and points custom config instances at `config/template/vmbackup.conf` for new variables. Visible only on upgrade.
+- **`vmbackup --config-prune-removed`** — Cleanup helper that comments out configuration variables removed in the running release. Idempotent; supports `--dry-run`. Operates on `default/` and all custom instances; skips `template/`. Per-name allowlist keyed to release version, designed to be extended by future config-pruning ENHs.
+
+### Fixed
+
+- **Pre-flight aborts failed silently with no email** — `check_backup_destination()`, `check_scratch_path()` and `check_disk_space()` exit before `main()` reaches its normal email send, so destination/scratch/space failures left no notification (only a journal entry). `cleanup_on_exit()` now sends a failure report on any non-zero exit once a SQLite session has been registered, gated by `_EMAIL_SENT` so the existing success/failure path remains the single source of truth on normal runs.
+- **`SKIP_OFFLINE_UNCHANGED_BACKUPS` is now honoured** — Previously the variable was defined and validated but never read; offline-unchanged VMs were always skipped regardless of the setting. The change-detection call in `backup_vm()` is now gated by this flag.
+
+### Removed
+
+- **`OFFLINE_CHANGE_DETECTION_THRESHOLD`** — Was never read by the change-detection code (which uses strict `mtime > last_backup`). The variable inverted the safe default and would have introduced false negatives if implemented. Existing values in operator configs are inert; run `vmbackup --config-prune-removed` to clean them up.
+- **`EMAIL_INCLUDE_REPLICATION`** — Was never read. Hiding replication results from the email is operator-hostile (silent on success, dangerous on failure). The empty-section logic already handles the no-replication case.
+- **`EMAIL_INCLUDE_DISK_SPACE`** — Was never read; gated a section that was never built. A real disk-usage email section is tracked as ENH-16.
+
 ## [0.5.4] - 2026-04-12
 
 ### Fixed

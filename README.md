@@ -20,8 +20,8 @@ vmbackup is that wrapper. It orchestrates virtnbdbackup across your entire fleet
 **Debian / Ubuntu:**
 
 ```bash
-wget https://github.com/doutsis/vmbackup/releases/download/v0.5.4/vmbackup_0.5.4_all.deb
-sudo dpkg -i vmbackup_0.5.4_all.deb
+wget https://github.com/doutsis/vmbackup/releases/download/v0.5.5/vmbackup_0.5.5_all.deb
+sudo dpkg -i vmbackup_0.5.5_all.deb
 ```
 
 **Any distro (Arch, Fedora, openSUSE, etc.):**
@@ -49,8 +49,8 @@ For the full step-by-step walkthrough — backup path setup, per-VM overrides, e
 - **Self-healing** — failed incrementals convert to fulls, broken chains are archived and restarted, interrupted runs clean up after themselves. Scheduled backups should never need manual intervention
 - **Multi-destination replication** — rsync to any mounted filesystem, rclone to cloud. Failed replication can be re-run independently without repeating a backup
 - **TPM and BitLocker handled** — TPM state and BitLocker recovery keys are extracted and stored alongside each VM backup
-- **Host environment captured** — libvirt configuration, network definitions and dependent service config are backed up so you can rebuild the host, not just the VMs
 - **FSTRIM optimisation** — trims guest filesystems via the QEMU agent before backup so qcow2 images compress better and incrementals are smaller. Per-path logging, configurable minimum extent, per-VM exclusions, and automatic detection of missing Windows VirtIO `discard_granularity` overrides
+- **Status at a glance** — query backup history, failures, chain health, storage and retention policies from the command line with `--status`. Human-readable terminal tables by default, `--csv` for export
 - **Paired with vmrestore** — single-command disaster recovery, clones and point-in-time restores via [vmrestore](https://github.com/doutsis/vmrestore)
 - **Minimal dependencies** — pure Bash + SQLite with no additional runtimes, frameworks or services to install. If your host runs libvirt, vmbackup runs too
 
@@ -63,7 +63,7 @@ vmbackup wraps `virtnbdbackup` and manages the full backup lifecycle:
 3. **Rotation** — organises backups into period-based directories. Daily, weekly and monthly policies archive the previous period and start a fresh full automatically. The accumulate policy runs incrementals indefinitely until a configurable limit is reached. Per-VM overrides apply here too.
 4. **Retention** — removes expired archives based on configurable age and count limits per policy. Runs after every backup so storage stays predictable without manual cleanup.
 5. **Replication** — copies the backup tree to local and cloud destinations so backups exist in more than one place. Local targets use rsync; cloud targets use rclone. Both can run in parallel. If replication fails or is interrupted, it can be re-run independently without repeating the backup.
-6. **Reporting** — sends an email summary with per-VM status, duration, errors and replication results.
+6. **Reporting** — sends an email summary with per-VM status, duration, errors and replication results. Between backup windows, `--status` gives instant read-only access to the same data from the command line.
 
 ## Installation
 
@@ -80,8 +80,8 @@ Also requires `bash >= 5.0`, `libvirt-daemon-system`, `qemu-utils`, `sqlite3` an
 Download the latest `.deb` from [Releases](https://github.com/doutsis/vmbackup/releases):
 
 ```bash
-wget https://github.com/doutsis/vmbackup/releases/download/v0.5.4/vmbackup_0.5.4_all.deb
-sudo dpkg -i vmbackup_0.5.4_all.deb
+wget https://github.com/doutsis/vmbackup/releases/download/v0.5.5/vmbackup_0.5.5_all.deb
+sudo dpkg -i vmbackup_0.5.5_all.deb
 ```
 
 ### From Source (any distro)
@@ -178,6 +178,12 @@ sudo vmbackup --replicate-only
 
 # Clean up archived chains and old periods
 sudo vmbackup --prune list
+
+# Check backup status (no locks, no session — read-only)
+sudo vmbackup --status                        # today's sessions
+sudo vmbackup --status --failures --days 7     # failures last 7 days
+sudo vmbackup --status --storage               # storage per VM
+sudo vmbackup --status --chains --csv          # chain health as CSV
 ```
 
 All commands accept `--config-instance` and `--dry-run`. See [vmbackup.md](vmbackup.md) for the full CLI reference.

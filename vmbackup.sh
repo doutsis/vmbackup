@@ -23,7 +23,7 @@
 #
 # MODULE ARCHITECTURE
 # ===================
-# This script uses a cascaded module loading pattern. Not all modules are 
+# This script uses a cascaded module loading pattern. Not all modules are
 # loaded directly by vmbackup.sh - some are loaded through vmbackup_integration.sh.
 #
 # Loading chain (in main() starting ~line 5600):
@@ -74,7 +74,7 @@ set -o pipefail
 umask 027
 
 # Version - used by Debian packaging and --version flag
-VMBACKUP_VERSION="0.5.4"
+VMBACKUP_VERSION="0.5.5"
 
 # Dry-run mode: show what would happen without executing destructive operations
 DRY_RUN=false
@@ -98,8 +98,17 @@ _PRUNE_CONFIRM_SKIP=false
 # Replicate-only mode (empty = normal backup, local|cloud|both = replicate-only)
 _REPLICATE_ONLY_MODE=""
 
+# Status report mode (--status)
+_STATUS_MODE=false
+_STATUS_SUB=""
+_STATUS_DAYS=""
+_STATUS_CSV=false
+
 # Backup mode (requires explicit --run)
 _BACKUP_MODE=false
+
+# Config maintenance: --config-prune-removed (cleanup helper for ghost vars)
+_CONFIG_PRUNE_REMOVED=false
 
 # Parse arguments early to get --config-instance before config load
 for arg in "$@"; do
@@ -148,6 +157,51 @@ while [[ $# -gt 0 ]]; do
                 exit 1
             fi
             ;;
+        --status)
+            _STATUS_MODE=true
+            shift
+            ;;
+        --config-prune-removed)
+            _CONFIG_PRUNE_REMOVED=true
+            shift
+            ;;
+        --failures)
+            _STATUS_SUB="failures"
+            shift
+            ;;
+        --replication)
+            _STATUS_SUB="replication"
+            shift
+            ;;
+        --chains)
+            _STATUS_SUB="chains"
+            shift
+            ;;
+        --storage)
+            _STATUS_SUB="storage"
+            shift
+            ;;
+        --policies)
+            _STATUS_SUB="policies"
+            shift
+            ;;
+        --days)
+            if [[ -n "${2:-}" && "${2:0:1}" != "-" ]]; then
+                _STATUS_DAYS="$2"
+                shift 2
+            else
+                echo "Error: --days requires a number" >&2
+                exit 1
+            fi
+            ;;
+        --csv)
+            _STATUS_CSV=true
+            shift
+            ;;
+        --all-instances)
+            _STATUS_ALL_INSTANCES=true
+            shift
+            ;;
         --yes|-y)
             _PRUNE_CONFIRM_SKIP=true
             shift
@@ -194,10 +248,31 @@ PRUNE (standalone cleanup — no backup session):
 REPLICATE-ONLY (run replication without backups):
     --replicate-only [SCOPE]  SCOPE: local, cloud, both (default: both)
 
+STATUS REPORTS (read-only — no locks, no session):
+    --status                Today's session summary
+    --status --vm NAME      Backup history for a VM
+    --status --failures     Recent failures
+    --status --replication  Replication status
+    --status --chains       Chain health overview
+    --status --storage      Storage per VM (all history)
+    --status --policies     Rotation policy summary
+
+    --days N                Time window (default: 1 = today)
+    --csv                   CSV output with raw + formatted columns
+    --all-instances         Show sessions from all config instances
+                            (default: scoped to --config-instance)
+
 SIGNAL:
     --cancel-replication    Signal running session to cancel replication phase.
                             Creates flag file in STATE_DIR; replication checks
                             this file and terminates gracefully.
+
+CONFIG MAINTENANCE:
+    --config-prune-removed  Comment out config variables removed in the running
+                            release. Idempotent and reversible (lines are
+                            commented, not deleted). Operates on default/ and
+                            all custom instances; skips template/.
+                            Use with --dry-run to preview.
 
 CONFIG INSTANCES:
     Each instance (config/<name>/) contains vmbackup.conf, vm_overrides.conf,
@@ -217,6 +292,13 @@ EXAMPLES:
     sudo vmbackup.sh --replicate-only                         # Both local + cloud
     sudo vmbackup.sh --replicate-only local --dry-run         # Preview local only
     sudo vmbackup.sh --cancel-replication                     # Cancel replication
+    sudo vmbackup.sh --status                                 # Today's backup sessions
+    sudo vmbackup.sh --status --days 7                        # Last 7 days
+    sudo vmbackup.sh --status --vm web                        # VM backup history
+    sudo vmbackup.sh --status --failures --days 30            # Failures last 30 days
+    sudo vmbackup.sh --status --chains                        # Chain health overview
+    sudo vmbackup.sh --status --policies                      # Rotation policy summary
+    sudo vmbackup.sh --status --failures --csv                # CSV export
 
     See full documentation: https://github.com/doutsis/vmbackup
 HELP_EOF
@@ -278,8 +360,22 @@ if [[ "${_BACKUP_MODE}" == "true" && "${_CANCEL_REPLICATION_REQUESTED:-false}" =
     echo "Error: --run and --cancel-replication cannot be used together" >&2
     exit 1
 fi
-if [[ -n "${_TARGET_VM}" && "${_BACKUP_MODE}" == "false" && "${_PRUNE_MODE}" == "false" ]]; then
-    echo "Error: --vm requires --run (for backup) or --prune (for cleanup)" >&2
+if [[ "${_STATUS_MODE}" == "true" ]]; then
+    if [[ "${_BACKUP_MODE}" == "true" ]]; then
+        echo "Error: --status cannot be combined with --run" >&2
+        exit 1
+    fi
+    if [[ "${_PRUNE_MODE}" == "true" ]]; then
+        echo "Error: --status cannot be combined with --prune" >&2
+        exit 1
+    fi
+    if [[ -n "${_REPLICATE_ONLY_MODE}" ]]; then
+        echo "Error: --status cannot be combined with --replicate-only" >&2
+        exit 1
+    fi
+fi
+if [[ -n "${_TARGET_VM}" && "${_BACKUP_MODE}" == "false" && "${_PRUNE_MODE}" == "false" && "${_STATUS_MODE}" == "false" ]]; then
+    echo "Error: --vm requires --run (for backup), --prune (for cleanup), or --status (for reports)" >&2
     echo "Example: sudo vmbackup.sh --run --vm ${_TARGET_VM}" >&2
     exit 1
 fi
@@ -287,6 +383,8 @@ fi
 # If no mode flag given, show usage and exit
 if [[ "${_BACKUP_MODE}" == "false" \
    && "${_PRUNE_MODE}" == "false" \
+   && "${_STATUS_MODE}" == "false" \
+   && "${_CONFIG_PRUNE_REMOVED}" == "false" \
    && -z "${_REPLICATE_ONLY_MODE}" \
    && "${_CANCEL_REPLICATION_REQUESTED:-false}" != "true" ]]; then
     cat << USAGE_EOF
@@ -348,6 +446,117 @@ source "$_VMBACKUP_CONFIG"
 # Backup destination path (ensure trailing slash)
 BACKUP_PATH="${BACKUP_PATH:-/mnt/backup/vms/}"
 [[ "$BACKUP_PATH" != */ ]] && BACKUP_PATH="${BACKUP_PATH}/"
+
+# ── STATUS MODE: dispatch early (read-only, no session lifecycle) ──────────
+# Sources sqlite_module.sh directly with sqlite_init_readonly() — no WAL,
+# no migrations, no session tracking. Lightest possible code path.
+if [[ "${_STATUS_MODE}" == "true" ]]; then
+    source "$SCRIPT_DIR/lib/sqlite_module.sh" 2>/dev/null || {
+        echo "Error: SQLite module not found" >&2; exit 1
+    }
+    source "$SCRIPT_DIR/modules/status_module.sh" 2>/dev/null || {
+        echo "Error: Status module not found" >&2; exit 1
+    }
+    # Determine sub-mode
+    local_sub="${_STATUS_SUB:-default}"
+    [[ -n "${_TARGET_VM}" && "$local_sub" == "default" ]] && local_sub="vm"
+    # Export instance-scoping flag for sqlite_query_today_sessions()
+    export STATUS_ALL_INSTANCES="${_STATUS_ALL_INSTANCES:-false}"
+    run_status_report "$local_sub" "$_TARGET_VM" "${_STATUS_DAYS:-1}" "${_STATUS_CSV}"
+    exit $?
+fi
+
+#################################################################################
+# CONFIG PRUNE REMOVED HELPER
+#
+# Comments out configuration variables that have been removed from the
+# codebase. Per-name allowlist with version annotation. Idempotent.
+# Honours global DRY_RUN flag.
+#
+# To extend in future releases: add entries to _CONFIG_REMOVED_IN below.
+#################################################################################
+
+# Map: variable_name -> version_in_which_it_was_removed
+declare -A _CONFIG_REMOVED_IN=(
+    [OFFLINE_CHANGE_DETECTION_THRESHOLD]="0.5.5"
+    [EMAIL_INCLUDE_REPLICATION]="0.5.5"
+    [EMAIL_INCLUDE_DISK_SPACE]="0.5.5"
+)
+
+_config_prune_removed() {
+    local config_root="${SCRIPT_DIR}/config"
+    local files_scanned=0 lines_changed=0 files_changed=0
+    local dry_label=""
+    [[ "${DRY_RUN:-false}" == "true" ]] && dry_label=" (dry-run)"
+
+    echo "vmbackup --config-prune-removed${dry_label}"
+    echo "Scanning ${config_root} (excluding template/)..."
+    echo ""
+
+    # Collect allowlist keys.
+    local var_names=()
+    local key
+    for key in "${!_CONFIG_REMOVED_IN[@]}"; do
+        var_names+=("$key")
+    done
+
+    # Find all *.conf files outside template/.
+    local conf_file
+    while IFS= read -r -d '' conf_file; do
+        ((files_scanned++))
+        local file_changes=0
+        local var
+        for var in "${var_names[@]}"; do
+            local removed_in="${_CONFIG_REMOVED_IN[$var]}"
+            # Match lines that start with optional whitespace + VAR= (live, not commented).
+            local match_pattern="^[[:space:]]*${var}="
+            if grep -qE "$match_pattern" "$conf_file" 2>/dev/null; then
+                local matches
+                matches=$(grep -cE "$match_pattern" "$conf_file" 2>/dev/null)
+                file_changes=$((file_changes + matches))
+                if [[ "${DRY_RUN:-false}" == "true" ]]; then
+                    echo "  [${conf_file}] would comment ${matches} line(s) for ${var}"
+                else
+                    # Comment out matching lines, prefixing with marker. Uses awk for
+                    # safety vs sed-with-special-chars in arbitrary captured values.
+                    local tmp_file
+                    tmp_file=$(mktemp) || { echo "Error: mktemp failed" >&2; return 1; }
+                    awk -v var="$var" -v ver="$removed_in" '
+                        $0 ~ "^[[:space:]]*"var"=" {
+                            print "# REMOVED in v"ver" — was: "$0
+                            next
+                        }
+                        { print }
+                    ' "$conf_file" > "$tmp_file" || { rm -f "$tmp_file"; echo "Error: awk failed on $conf_file" >&2; return 1; }
+                    # Preserve original ownership and permissions.
+                    chmod --reference="$conf_file" "$tmp_file"
+                    chown --reference="$conf_file" "$tmp_file"
+                    mv "$tmp_file" "$conf_file"
+                    echo "  [${conf_file}] commented ${matches} line(s) for ${var}"
+                fi
+            fi
+        done
+        if (( file_changes > 0 )); then
+            ((files_changed++))
+            lines_changed=$((lines_changed + file_changes))
+        fi
+    done < <(find "$config_root" -mindepth 2 -path "${config_root}/template" -prune -o -type f -name '*.conf' -print0 2>/dev/null)
+
+    echo ""
+    echo "Scanned ${files_scanned} file(s); ${files_changed} file(s) with matches; ${lines_changed} line(s)${dry_label}."
+    if [[ "${DRY_RUN:-false}" == "true" && $lines_changed -gt 0 ]]; then
+        echo "Re-run without --dry-run to apply."
+    fi
+    return 0
+}
+
+# ── CONFIG PRUNE REMOVED MODE: dispatch early ─────────────────────────────────
+# Cleans up configuration variables removed in this release. Comments lines
+# rather than deleting them; idempotent; honours --dry-run.
+if [[ "${_CONFIG_PRUNE_REMOVED}" == "true" ]]; then
+    _config_prune_removed
+    exit $?
+fi
 
 
 #################################################################################
@@ -773,15 +982,6 @@ validate_operational_settings() {
     ((missing_count++))
   else
     log_debug "vmbackup.sh" "validate_operational_settings" "SKIP_OFFLINE_UNCHANGED_BACKUPS=$SKIP_OFFLINE_UNCHANGED_BACKUPS (from config)"
-  fi
-  
-  if [[ -z "${OFFLINE_CHANGE_DETECTION_THRESHOLD+x}" ]]; then
-    OFFLINE_CHANGE_DETECTION_THRESHOLD=60
-    log_warn "vmbackup.sh" "validate_operational_settings" "MISSING: OFFLINE_CHANGE_DETECTION_THRESHOLD not set in config/$instance/vmbackup.conf"
-    log_warn "vmbackup.sh" "validate_operational_settings" "USING DEFAULT: OFFLINE_CHANGE_DETECTION_THRESHOLD=60 (60 second change window)"
-    ((missing_count++))
-  else
-    log_debug "vmbackup.sh" "validate_operational_settings" "OFFLINE_CHANGE_DETECTION_THRESHOLD=$OFFLINE_CHANGE_DETECTION_THRESHOLD (from config)"
   fi
   
   #-----------------------------------------------------------------------------
@@ -1866,45 +2066,57 @@ check_scratch_path() {
 # Check disk space
 # NOTE: GitHub issue virtnbdbackup#226 - Bitmap corruption occurs when backup destination fills up mid-backup
 # See: https://github.com/abbbi/virtnbdbackup/discussions/226
-# MITIGATION: Enhanced threshold checking (20% free = critical threshold)
+# Thresholds are configurable per-instance via vmbackup.conf:
+#   DISK_ABORT_PCT (default 20)  — abort if < this % free
+#   DISK_WARN_PCT  (default 30)  — log warn if < this % free
+#   DISK_ABORT_GB  (default 10)  — abort if < this GB free (0 = disabled)
+#   DISK_WARN_GB   (default 50)  — log warn if < this GB free (0 = disabled)
+# Fallback defaults match the historic hardcoded behaviour for backward compat.
 check_disk_space() {
+  local abort_pct="${DISK_ABORT_PCT:-20}"
+  local warn_pct="${DISK_WARN_PCT:-30}"
+  local abort_gb="${DISK_ABORT_GB:-10}"
+  local warn_gb="${DISK_WARN_GB:-50}"
+  local abort_mb=$(( abort_gb * 1024 ))
+  local warn_mb=$(( warn_gb * 1024 ))
+
   local available_mb=$(get_available_space_mb "$BACKUP_PATH")
   local available_gb=$(( available_mb / 1024 ))
   # df -k to ensure consistent 1K-block output, then convert to MB
   local total_kb=$(df -k "$BACKUP_PATH" 2>/dev/null | tail -1 | awk '{print $2}')
   local total_mb=$(( ${total_kb:-0} / 1024 ))
   local total_gb=$(( total_mb / 1024 ))
-  
+
   # Guard against division by zero (df failure, empty/unmounted path)
   if (( total_mb == 0 )); then
     log_error "vmbackup.sh" "check_disk_space" "Cannot determine disk space for $BACKUP_PATH (total_mb=0)"
     return 1
   fi
-  
+
   local percentage_free=$(( available_mb * 100 / total_mb ))
-  
-  log_info "vmbackup.sh" "check_disk_space" "Available space: ${available_gb}GB / ${total_gb}GB (${percentage_free}% free)"
-  
-  # CRITICAL: If destination < 20% free, bitmap corruption risk is HIGH
-  # This matches virtnbdbackup issue: full destination causes incomplete backups
-  if (( percentage_free < 20 )); then
-    log_error "vmbackup.sh" "check_disk_space" "CRITICAL: Destination only has ${percentage_free}% free space (${available_gb}GB)"
+
+  log_info "vmbackup.sh" "check_disk_space" \
+    "Available space: ${available_gb}GB / ${total_gb}GB (${percentage_free}% free) — thresholds: abort<${abort_pct}%/${abort_gb}GB, warn<${warn_pct}%/${warn_gb}GB"
+
+  # CRITICAL: percentage abort
+  if (( percentage_free < abort_pct )); then
+    log_error "vmbackup.sh" "check_disk_space" "CRITICAL: Destination only has ${percentage_free}% free space (${available_gb}GB), threshold: ${abort_pct}%"
     log_error "vmbackup.sh" "check_disk_space" "Risk: Backup may fail mid-operation causing bitmap corruption (GitHub issue #226)"
-    log_error "vmbackup.sh" "check_disk_space" "Action: Free up space or this backup will be skipped to prevent corruption"
+    log_error "vmbackup.sh" "check_disk_space" "Action: Free space, lower DISK_ABORT_PCT in vmbackup.conf, or this backup will be skipped to prevent corruption"
     return 1
   fi
-  
-  # Warn if < 50GB or < 30%
-  if (( available_mb < 51200 )) || (( percentage_free < 30 )); then
-    log_warn "vmbackup.sh" "check_disk_space" "Low disk space: ${available_gb}GB / ${total_gb}GB (${percentage_free}% free, threshold: 50GB or 30%)"
+
+  # Warn: below warn percentage OR below absolute warn GB
+  if { (( warn_mb > 0 )) && (( available_mb < warn_mb )); } || (( percentage_free < warn_pct )); then
+    log_warn "vmbackup.sh" "check_disk_space" "Low disk space: ${available_gb}GB / ${total_gb}GB (${percentage_free}% free, threshold: ${warn_gb}GB or ${warn_pct}%)"
   fi
-  
-  # Error if < 10GB absolute (catches small disks where 20% is still too little)
-  if (( available_mb < 10240 )); then
-    log_error "vmbackup.sh" "check_disk_space" "Critical: Insufficient space for backup: ${available_gb}GB (${percentage_free}% free)"
+
+  # Absolute abort (0 disables)
+  if (( abort_mb > 0 )) && (( available_mb < abort_mb )); then
+    log_error "vmbackup.sh" "check_disk_space" "Critical: Insufficient absolute space: ${available_gb}GB free (minimum: ${abort_gb}GB)"
     return 1
   fi
-  
+
   return 0
 }
 
@@ -4425,8 +4637,19 @@ backup_vm() {
   if [[ "$vm_status" == "shut off" ]]; then
     log_info "vmbackup.sh" "backup_vm" "Offline VM detected: $vm_name - checking if disk changes present"
     
-    # Check if offline VM disks have changed
-    if ! has_offline_vm_changed "$vm_name"; then
+    # Check if offline VM disks have changed (honour SKIP_OFFLINE_UNCHANGED_BACKUPS).
+    # When SKIP_OFFLINE_UNCHANGED_BACKUPS=false, force the "changed" path so the
+    # offline VM is backed up unconditionally.
+    local _offline_unchanged=false
+    if [[ "$SKIP_OFFLINE_UNCHANGED_BACKUPS" == "true" ]]; then
+      if ! has_offline_vm_changed "$vm_name"; then
+        _offline_unchanged=true
+      fi
+    else
+      log_info "vmbackup.sh" "backup_vm" "SKIP_OFFLINE_UNCHANGED_BACKUPS=false — backing up offline VM $vm_name unconditionally"
+    fi
+    
+    if [[ "$_offline_unchanged" == "true" ]]; then
       # No changes detected: SKIP backup entirely
       log_info "vmbackup.sh" "backup_vm" "SKIPPING backup for offline VM: $vm_name (disks unchanged since last backup)"
       
@@ -5129,7 +5352,40 @@ cleanup_on_exit() {
       log_warn "vmbackup.sh" "cleanup_on_exit" "SQLite session finalized as 'incomplete' (exit code $exit_code)"
     fi
   fi
-  
+
+  # Email on pre-flight / non-signal failure (104 Change B).
+  # Only fires when:
+  #   - exit code is non-zero (something went wrong),
+  #   - a SQLite session was registered (excludes failures earlier than
+  #     sqlite_session_start: check_dependencies, lock contention, missing
+  #     config, and all read-only modes such as --status / --prune list),
+  #   - no email was already sent by main()'s normal path or by handle_sigterm,
+  #   - DRY_RUN is off,
+  #   - the email module file is present.
+  # Catches all three pre-flight aborts (check_backup_destination,
+  # check_scratch_path, check_disk_space) which previously failed silently.
+  if [[ $exit_code -ne 0 ]] && \
+     [[ -n "${SQLITE_CURRENT_SESSION_ID:-}" ]] && \
+     [[ "${_EMAIL_SENT:-false}" != "true" ]] && \
+     [[ "$DRY_RUN" != true ]] && \
+     [[ -f "${SCRIPT_DIR}/modules/email_report_module.sh" ]]; then
+    log_info "vmbackup.sh" "cleanup_on_exit" "Sending email report after non-zero exit (code $exit_code)"
+    # shellcheck source=/dev/null
+    source "${SCRIPT_DIR}/modules/email_report_module.sh"
+    if load_email_config; then
+      local _session_end_time
+      _session_end_time=$(date '+%Y-%m-%d %H:%M:%S %Z')
+      if send_backup_report "${session_start_time:-unknown}" "$_session_end_time" "failed"; then
+        _EMAIL_SENT=true
+        log_info "vmbackup.sh" "cleanup_on_exit" "Email report sent (cleanup path)"
+      else
+        log_warn "vmbackup.sh" "cleanup_on_exit" "Failed to send email report from cleanup path"
+      fi
+    else
+      log_debug "vmbackup.sh" "cleanup_on_exit" "Email disabled or not configured for this instance"
+    fi
+  fi
+
   log_info "vmbackup.sh" "cleanup_on_exit" "Cleaning up temporary files before exit (exit code: $exit_code)"
   
   # Remove stale lock files — only those whose owning process is no longer running.
@@ -6137,9 +6393,13 @@ main() {
     [[ -n "$_TARGET_VM" && "$_PRUNE_MODE" != "true" ]] && _session_type="targeted"
     [[ -n "$_REPLICATE_ONLY_MODE" ]] && _session_type="replicate_only"
     [[ "$_PRUNE_MODE" == "true" ]] && _session_type="prune"
-    # Start SQLite session tracking (skip in dry-run to avoid polluting DB)
+    # --prune list is read-only (like --status) — skip session tracking
+    [[ "$_PRUNE_MODE" == "true" && "$_PRUNE_TARGET" == "list" ]] && _session_type=""
+    # Start SQLite session tracking (skip in dry-run and read-only modes)
     if [[ "$DRY_RUN" == true ]]; then
       log_info "vmbackup.sh" "main" "[DRY-RUN] SQLite session tracking disabled - no DB writes"
+    elif [[ -z "$_session_type" ]]; then
+      log_debug "vmbackup.sh" "main" "Read-only mode — SQLite session tracking skipped"
     elif sqlite_session_start "${CONFIG_INSTANCE:-default}" "$LOG_FILE" "$_session_type"; then
       log_debug "vmbackup.sh" "main" "SQLite session started: $(sqlite_get_session_id) type=$_session_type"
     fi
@@ -6178,12 +6438,26 @@ main() {
     run_prune_mode
     local rc=$?
     log_info "vmbackup.sh" "main" "===== PRUNE MODE END (exit=$rc) ====="
-    # End SQLite session so the row doesn't become an orphan
-    if declare -f sqlite_session_end >/dev/null 2>&1; then
+    # End SQLite session (skipped for --prune list which has no session)
+    if [[ "$_PRUNE_TARGET" != "list" ]] && declare -f sqlite_session_end >/dev/null 2>&1; then
       local prune_status="success"
       [[ $rc -ne 0 ]] && prune_status="failed"
+      # Count VMs evaluated: 1 if --vm specified, else count VM dirs in BACKUP_PATH
+      local _prune_vms_total=0
+      if [[ -n "$_TARGET_VM" ]]; then
+        _prune_vms_total=1
+      else
+        local _pvd
+        for _pvd in "$BACKUP_PATH"*/; do
+          [[ -d "$_pvd" ]] || continue
+          local _pvn
+          _pvn=$(basename "$_pvd")
+          [[ "$_pvn" == _* || "$_pvn" == .* ]] && continue
+          (( _prune_vms_total++ ))
+        done
+      fi
       # Args: vms_total vms_success vms_failed vms_skipped vms_excluded bytes_total final_status
-      sqlite_session_end "0" "0" "0" "0" "0" "0" "$prune_status"
+      sqlite_session_end "$_prune_vms_total" "0" "0" "0" "0" "0" "$prune_status"
     fi
     exit $rc
   fi

@@ -65,6 +65,88 @@ case "$1" in
             systemctl enable vmbackup.timer 2>/dev/null || true
         fi
 
+        # ---------------------------------------------------------------
+        # Post-upgrade advisory: surface .dpkg-dist files awaiting merge
+        # and any custom config instances not managed by dpkg. Runs only
+        # on upgrade ($2 is the previously-installed version).
+        # ---------------------------------------------------------------
+        if [[ -n "${2:-}" ]]; then
+            # Collect any .dpkg-dist files (default/ is the only conffile,
+            # but be future-proof and scan the whole tree).
+            mapfile -t _dpkg_dist < <(find /opt/vmbackup/config -name '*.dpkg-dist' 2>/dev/null)
+            if (( ${#_dpkg_dist[@]} > 0 )); then
+                echo ""
+                echo "  NOTICE: This upgrade introduced new config defaults."
+                echo "  The package shipped a new vmbackup.conf but kept your"
+                echo "  customised file intact. To pick up the new variables,"
+                echo "  review and merge:"
+                for _f in "${_dpkg_dist[@]}"; do
+                    echo "    diff -u ${_f%.dpkg-dist} $_f"
+                done
+                echo "  Until merged, the running config will use built-in fallbacks"
+                echo "  (behaviour is byte-for-byte identical to the previous version)."
+                echo "  See /opt/vmbackup/config/template/vmbackup.conf for the full set."
+            fi
+
+            # List custom instances (anything under config/ that is not
+            # default or template). These are NOT managed by dpkg.
+            mapfile -t _custom_instances < <(
+                find /opt/vmbackup/config -mindepth 1 -maxdepth 1 -type d \
+                    ! -name default ! -name template -printf '%f\n' 2>/dev/null
+            )
+            if (( ${#_custom_instances[@]} > 0 )); then
+                echo ""
+                echo "  NOTICE: Custom config instances detected:"
+                for _inst in "${_custom_instances[@]}"; do
+                    echo "    /opt/vmbackup/config/$_inst/"
+                done
+                echo "  These are NOT managed by dpkg. New variables introduced"
+                echo "  in this release will not be added automatically. To enable"
+                echo "  per-instance tuning of the new options, review:"
+                echo "    /opt/vmbackup/config/template/vmbackup.conf"
+                echo "  and copy any new sections (e.g. # DISK SPACE THRESHOLDS)"
+                echo "  into each custom instance config that needs them."
+                echo "  Built-in fallbacks apply for any variables not present."
+            fi
+
+            # ---------------------------------------------------------------
+            # 0.5.5: scan for removed configuration variables.
+            # Variables deleted in this release: OFFLINE_CHANGE_DETECTION_THRESHOLD,
+            # EMAIL_INCLUDE_REPLICATION, EMAIL_INCLUDE_DISK_SPACE.
+            # Stale entries in operator config files are inert (no longer read)
+            # but cosmetically misleading. Surface them for cleanup.
+            # ---------------------------------------------------------------
+            _removed_vars="OFFLINE_CHANGE_DETECTION_THRESHOLD|EMAIL_INCLUDE_REPLICATION|EMAIL_INCLUDE_DISK_SPACE"
+            mapfile -t _files_with_removed < <(
+                grep -rlE "^[[:space:]]*(${_removed_vars})=" \
+                    /opt/vmbackup/config 2>/dev/null \
+                    | grep -v '/template/' || true
+            )
+            if (( ${#_files_with_removed[@]} > 0 )); then
+                echo ""
+                echo "  NOTICE: This release removed three configuration variables. The"
+                echo "  running code no longer reads them; existing entries in your"
+                echo "  config files are inert and safe to delete:"
+                echo ""
+                echo "    - OFFLINE_CHANGE_DETECTION_THRESHOLD  (was never read; replaced"
+                echo "                                            by strict mtime comparison)"
+                echo "    - EMAIL_INCLUDE_REPLICATION           (replication is always reported"
+                echo "                                            when present)"
+                echo "    - EMAIL_INCLUDE_DISK_SPACE            (gated a section that was never"
+                echo "                                            built; future replacement"
+                echo "                                            tracked as ENH-16)"
+                echo ""
+                echo "  The following files still contain one or more of these settings:"
+                for _f in "${_files_with_removed[@]}"; do
+                    echo "    $_f"
+                done
+                echo ""
+                echo "  To clean them up automatically, run:"
+                echo "    sudo vmbackup --config-prune-removed --dry-run    # preview"
+                echo "    sudo vmbackup --config-prune-removed              # apply"
+            fi
+        fi
+
         echo ""
         echo "=== vmbackup $(cat /opt/vmbackup/vmbackup.sh | grep '^VMBACKUP_VERSION=' | sed 's/.*"\(.*\)"/\1/') installed ==="
         echo ""

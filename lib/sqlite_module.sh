@@ -52,8 +52,8 @@
 
 # Module identification
 readonly SQLITE_MODULE_NAME="sqlite_module"
-readonly SQLITE_MODULE_VERSION="2.0"
-readonly SQLITE_SCHEMA_VERSION="2.0"
+readonly SQLITE_MODULE_VERSION="2.1"
+readonly SQLITE_SCHEMA_VERSION="2.1"
 
 # Ensure module is only loaded once
 if [[ "${_SQLITE_MODULE_LOADED:-}" == "1" ]]; then
@@ -163,6 +163,33 @@ sqlite_init_database() {
     SQLITE_MODULE_AVAILABLE=1
     log_info "$SQLITE_MODULE_NAME" "sqlite_init_database" \
         "SQLite database initialized (schema v${SQLITE_SCHEMA_VERSION})"
+    return 0
+}
+
+# Initialize database in read-only mode for --status queries
+# No mkdir, no WAL, no migrations, no session tracking
+# Sets: SQLITE_DB_PATH, SQLITE_MODULE_AVAILABLE
+# Returns: 0 on success, 1 on failure
+sqlite_init_readonly() {
+    if ! command -v sqlite3 &>/dev/null; then
+        echo "Error: sqlite3 not found" >&2
+        return 1
+    fi
+
+    local state_dir="${STATE_DIR:-${BACKUP_PATH}/_state}"
+    SQLITE_DB_PATH="${state_dir}/vmbackup.db"
+
+    if [[ ! -f "$SQLITE_DB_PATH" ]]; then
+        echo "No backup database found at $SQLITE_DB_PATH" >&2
+        return 1
+    fi
+
+    if ! sqlite3 "$SQLITE_DB_PATH" "PRAGMA query_only=ON; SELECT 1;" &>/dev/null; then
+        echo "Database not accessible: $SQLITE_DB_PATH" >&2
+        return 1
+    fi
+
+    SQLITE_MODULE_AVAILABLE=1
     return 0
 }
 
@@ -536,6 +563,29 @@ MIGRATE_1_5_EOF
         log_info "$SQLITE_MODULE_NAME" "_sqlite_migrate_schema" \
             "Schema migrated to v2.0 (added session_type to sessions)"
     fi
+
+    # Migration: 2.0 -> 2.1 (add disk space snapshot columns to sessions)
+    if [[ "$current_version" < "2.1" ]]; then
+        log_info "$SQLITE_MODULE_NAME" "_sqlite_migrate_schema" \
+            "Migrating schema from v$current_version to v2.1 (disk space snapshot columns)"
+
+        local _sess_cols_21
+        _sess_cols_21=$(sqlite3 "$SQLITE_DB_PATH" "SELECT name FROM pragma_table_info('sessions');" 2>/dev/null)
+
+        echo "$_sess_cols_21" | grep -qx 'disk_free_bytes' || \
+            sqlite3 "$SQLITE_DB_PATH" "ALTER TABLE sessions ADD COLUMN disk_free_bytes INTEGER DEFAULT 0;" 2>/dev/null
+        echo "$_sess_cols_21" | grep -qx 'disk_total_bytes' || \
+            sqlite3 "$SQLITE_DB_PATH" "ALTER TABLE sessions ADD COLUMN disk_total_bytes INTEGER DEFAULT 0;" 2>/dev/null
+
+        if ! sqlite3 "$SQLITE_DB_PATH" "UPDATE schema_info SET value = '2.1' WHERE key = 'version';" 2>/dev/null; then
+            log_error "$SQLITE_MODULE_NAME" "_sqlite_migrate_schema" \
+                "Schema migration v$current_version→v2.1 FAILED"
+            return 1
+        fi
+
+        log_info "$SQLITE_MODULE_NAME" "_sqlite_migrate_schema" \
+            "Schema migrated to v2.1 (added disk_free_bytes, disk_total_bytes to sessions)"
+    fi
 }
 
 # Create database schema (tables and indexes)
@@ -549,7 +599,7 @@ CREATE TABLE IF NOT EXISTS schema_info (
     key   TEXT PRIMARY KEY,
     value TEXT
 );
-INSERT OR REPLACE INTO schema_info (key, value) VALUES ('version', '2.0');
+INSERT OR REPLACE INTO schema_info (key, value) VALUES ('version', '2.1');
 INSERT OR REPLACE INTO schema_info (key, value) VALUES ('created', datetime('now'));
 
 /* A backup session (one vmbackup.sh invocation) */
@@ -567,7 +617,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     bytes_total     INTEGER DEFAULT 0,
     status          TEXT DEFAULT 'running',
     log_file        TEXT,
-    session_type    TEXT
+    session_type    TEXT,
+    disk_free_bytes  INTEGER DEFAULT 0,
+    disk_total_bytes INTEGER DEFAULT 0
 );
 
 /* Individual VM backup within a session */
@@ -880,7 +932,23 @@ sqlite_session_end() {
     if [[ -n "$actual_bytes" ]] && [[ "$actual_bytes" =~ ^[0-9]+$ ]] && [[ "$actual_bytes" -gt 0 ]]; then
         bytes_total="$actual_bytes"
     fi
-    
+
+    # Snapshot BACKUP_PATH disk usage (schema v2.1+).
+    # Failures default cleanly to 0; the storage report (Change C) filters
+    # WHERE disk_total_bytes > 0 so unmounted/missing paths are excluded
+    # from growth math rather than treated as zero-size disks.
+    local _disk_free_bytes=0 _disk_total_bytes=0
+    if [[ -n "${BACKUP_PATH:-}" ]] && [[ -d "$BACKUP_PATH" ]]; then
+        local _df_out
+        _df_out=$(df -PB1 "$BACKUP_PATH" 2>/dev/null | awk 'NR==2 {print $2 " " $4}')
+        if [[ -n "$_df_out" ]]; then
+            read -r _disk_total_bytes _disk_free_bytes <<< "$_df_out"
+            # Defensive: ensure numeric (df can emit "-" on exotic mounts)
+            [[ "$_disk_total_bytes" =~ ^[0-9]+$ ]] || _disk_total_bytes=0
+            [[ "$_disk_free_bytes"  =~ ^[0-9]+$ ]] || _disk_free_bytes=0
+        fi
+    fi
+
     local sql="UPDATE sessions SET
         end_time = '$end_time',
         duration_sec = $duration_sec,
@@ -890,7 +958,9 @@ sqlite_session_end() {
         vms_skipped = $vms_skipped,
         vms_excluded = $vms_excluded,
         bytes_total = $bytes_total,
-        status = '$final_status'
+        status = '$final_status',
+        disk_free_bytes = $_disk_free_bytes,
+        disk_total_bytes = $_disk_total_bytes
         WHERE id = $SQLITE_CURRENT_SESSION_ID;"
     
     if ! sqlite3 "$SQLITE_DB_PATH" "$sql" 2>/dev/null; then
@@ -1173,35 +1243,166 @@ sqlite_log_replication_vms() {
 # QUERY FUNCTIONS
 #=============================================================================
 
-# Get session summary for today
-# Returns: JSON-like output with session info
+# Run a sqlite3 query with the appropriate output format
+# Arguments:
+#   $1 - output_mode: pipe (default) or csv
+#   $2 - SQL query string
+# Uses: SQLITE_DB_PATH
+_sqlite_query_formatted() {
+    local output_mode="${1:-pipe}"
+    local sql="$2"
+
+    if [[ "$output_mode" == "csv" ]]; then
+        sqlite3 -csv -header "$SQLITE_DB_PATH" "$sql"
+    else
+        sqlite3 -separator '|' -header "$SQLITE_DB_PATH" "$sql"
+    fi
+}
+
+# Get session summary for the last N days
+# Arguments:
+#   $1 - days (default 1 = today)
+#   $2 - output_mode: pipe (default) or csv
+# Reads (env):
+#   CONFIG_INSTANCE        - default "default"; restricts results to one instance
+#   STATUS_ALL_INSTANCES   - if "true", omits the instance filter (cross-instance view)
+# Returns: Session summary rows including 3 trailing row-count columns
+#          (vm_rows, repl_rows, retention_rows) for job-type classification
 sqlite_query_today_sessions() {
+    local days="${1:-1}"
+    local output_mode="${2:-pipe}"
+
     if [[ "$SQLITE_MODULE_AVAILABLE" -ne 1 ]]; then
         return 1
     fi
-    
-    sqlite3 -header -column "$SQLITE_DB_PATH" \
-        "SELECT id, instance, start_time, status, vms_success, vms_failed 
-         FROM sessions 
-         WHERE date(start_time) = date('now') 
-         ORDER BY start_time DESC;"
+
+    local instance_filter=""
+    if [[ "${STATUS_ALL_INSTANCES:-false}" != "true" ]]; then
+        local instance="${CONFIG_INSTANCE:-default}"
+        local esc_instance="${instance//\'/\'\'}"
+        instance_filter="AND instance = '$esc_instance'"
+    fi
+
+    _sqlite_query_formatted "$output_mode" \
+        "SELECT s.id, COALESCE(s.instance, '<unknown>') as instance,
+                COALESCE(s.session_type, '') as session_type, s.start_time,
+                COALESCE(s.duration_sec, 0) as duration_sec, s.status,
+                s.vms_success, s.vms_failed, COALESCE(s.vms_skipped, 0) as vms_skipped,
+                COALESCE(s.bytes_total, 0) as bytes_total,
+                (SELECT COUNT(*) FROM vm_backups       vb WHERE vb.session_id = s.id) AS vm_rows,
+                (SELECT COUNT(*) FROM replication_runs rr WHERE rr.session_id = s.id) AS repl_rows,
+                (SELECT COUNT(*) FROM retention_events re WHERE re.session_id = s.id) AS retention_rows
+         FROM sessions s
+         WHERE s.start_time >= datetime('now', '-$days days')
+           $instance_filter
+         ORDER BY s.start_time DESC;"
+}
+
+# Get per-VM backup rows for a specific session (for --status VM breakdown)
+# Returns sanitized 6-column rows for display: vm_name, state, type, status, bytes, duration_sec
+# Arguments:
+#   $1 - session_id
+# Returns: One row per VM in the session: vm_name, state, type, status, bytes, duration_sec
+sqlite_query_session_vm_backups_display() {
+    local session_id="$1"
+
+    [[ "$SQLITE_MODULE_AVAILABLE" -ne 1 ]] && return 1
+    [[ -z "$session_id" ]] && return 1
+
+    sqlite3 -separator '|' "$SQLITE_DB_PATH" \
+        "SELECT vm_name,
+                COALESCE(NULLIF(vm_status, ''), '-') as state,
+                CASE WHEN LOWER(COALESCE(backup_type,'')) IN
+                         ('running','shut off','shut-off','paused','crashed',
+                          'pmsuspended','idle','off','auto','none','')
+                     THEN '-'
+                     ELSE backup_type
+                END as type,
+                CASE WHEN LOWER(COALESCE(status,'')) IN
+                         ('auto','none','unknown','')
+                     THEN '-'
+                     ELSE COALESCE(status, '-')
+                END as status,
+                CASE WHEN COALESCE(bytes_written, 0) > 0 THEN bytes_written
+                     WHEN COALESCE(total_dir_bytes, 0) > 0 THEN total_dir_bytes
+                     WHEN COALESCE(chain_size_bytes, 0) > 0 THEN chain_size_bytes
+                     ELSE 0 END as bytes,
+                COALESCE(duration_sec, 0) as duration_sec
+         FROM vm_backups
+         WHERE session_id = $session_id
+         ORDER BY vm_name;" 2>/dev/null
+}
+
+# Get aggregated retention summary for a single session (for --status prune detail)
+# Returns one pipe-delimited row:
+#   actions_total | actions_ok | actions_failed | freed_bytes_total | vm_count |
+#   action_types | target_types | delete_count | evaluate_count | skip_count
+# Arguments:
+#   $1 - session_id
+sqlite_query_session_retention_summary() {
+    local session_id="$1"
+
+    [[ "$SQLITE_MODULE_AVAILABLE" -ne 1 ]] && return 1
+    [[ -z "$session_id" ]] && return 1
+
+    sqlite3 -separator '|' "$SQLITE_DB_PATH" \
+        "SELECT COALESCE(COUNT(*), 0) AS actions_total,
+                COALESCE(SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END), 0) AS actions_ok,
+                COALESCE(SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END), 0) AS actions_failed,
+                COALESCE(SUM(COALESCE(freed_bytes, 0)), 0) AS freed_bytes_total,
+                COALESCE(COUNT(DISTINCT vm_name), 0) AS vm_count,
+                COALESCE(GROUP_CONCAT(DISTINCT action), '') AS action_types,
+                COALESCE(GROUP_CONCAT(DISTINCT target_type), '') AS target_types,
+                COALESCE(SUM(CASE WHEN action = 'delete'   THEN 1 ELSE 0 END), 0) AS delete_count,
+                COALESCE(SUM(CASE WHEN action = 'evaluate' THEN 1 ELSE 0 END), 0) AS evaluate_count,
+                COALESCE(SUM(CASE WHEN action = 'skip'     THEN 1 ELSE 0 END), 0) AS skip_count
+         FROM retention_events
+         WHERE session_id = $session_id;" 2>/dev/null
+}
+
+# Get per-session replication runs (for --status replicate-only / mixed footer)
+# Returns pipe-delimited rows ordered by start_time:
+#   endpoint_name | endpoint_type | transport | status |
+#   bytes_transferred | files_transferred | duration_sec | error_message
+# Arguments:
+#   $1 - session_id
+sqlite_query_session_replication_summary() {
+    local session_id="$1"
+
+    [[ "$SQLITE_MODULE_AVAILABLE" -ne 1 ]] && return 1
+    [[ -z "$session_id" ]] && return 1
+
+    sqlite3 -separator '|' "$SQLITE_DB_PATH" \
+        "SELECT COALESCE(endpoint_name, '<unknown>') AS endpoint_name,
+                COALESCE(endpoint_type, '-')         AS endpoint_type,
+                COALESCE(transport, '-')             AS transport,
+                COALESCE(status, '-')                AS status,
+                COALESCE(bytes_transferred, 0)       AS bytes_transferred,
+                COALESCE(files_transferred, 0)       AS files_transferred,
+                COALESCE(duration_sec, 0)            AS duration_sec,
+                COALESCE(error_message, '')          AS error_message
+         FROM replication_runs
+         WHERE session_id = $session_id
+         ORDER BY start_time;" 2>/dev/null
 }
 
 # Get VM backup history
 # Arguments:
 #   $1 - vm_name
 #   $2 - limit (default 10)
+#   $3 - output_mode: pipe (default) or csv
 # Returns: Recent backup records for the VM
 sqlite_query_vm_history() {
     local vm_name="$1"
     local limit="${2:-10}"
+    local output_mode="${3:-pipe}"
     
     if [[ "$SQLITE_MODULE_AVAILABLE" -ne 1 ]]; then
         return 1
     fi
     
     local esc_vm_name="${vm_name//\'/\'\'}"
-    sqlite3 -header -column "$SQLITE_DB_PATH" \
+    _sqlite_query_formatted "$output_mode" \
         "SELECT s.start_time, vb.backup_type, vb.status, vb.bytes_written, vb.duration_sec
          FROM vm_backups vb
          JOIN sessions s ON vb.session_id = s.id
@@ -1213,16 +1414,18 @@ sqlite_query_vm_history() {
 # Get last successful backup for a VM
 # Arguments:
 #   $1 - vm_name
+#   $2 - output_mode: pipe (default) or csv
 # Returns: Single row with last successful backup info
 sqlite_query_last_success() {
     local vm_name="$1"
+    local output_mode="${2:-pipe}"
     
     if [[ "$SQLITE_MODULE_AVAILABLE" -ne 1 ]]; then
         return 1
     fi
     
     local esc_vm_name="${vm_name//\'/\'\'}"
-    sqlite3 -separator '|' "$SQLITE_DB_PATH" \
+    _sqlite_query_formatted "$output_mode" \
         "SELECT s.start_time, vb.backup_type, vb.backup_path, vb.bytes_written
          FROM vm_backups vb
          JOIN sessions s ON vb.session_id = s.id
@@ -1234,42 +1437,248 @@ sqlite_query_last_success() {
 # Get failed VMs in the last N days
 # Arguments:
 #   $1 - days (default 7)
+#   $2 - output_mode: pipe (default) or csv
 # Returns: List of VMs with failure counts
 sqlite_query_recent_failures() {
     local days="${1:-7}"
+    local output_mode="${2:-pipe}"
     
     if [[ "$SQLITE_MODULE_AVAILABLE" -ne 1 ]]; then
         return 1
     fi
     
-    sqlite3 -header -column "$SQLITE_DB_PATH" \
+    _sqlite_query_formatted "$output_mode" \
         "SELECT vm_name, COUNT(*) as failures, MAX(s.start_time) as last_failure
          FROM vm_backups vb
          JOIN sessions s ON vb.session_id = s.id
          WHERE vb.status = 'failed' 
-           AND s.start_time >= date('now', '-$days days')
+           AND s.start_time >= datetime('now', '-$days days')
          GROUP BY vm_name
          ORDER BY failures DESC;"
 }
 
-# Get replication status for today
-# Returns: Replication runs for today's sessions
+# Get replication status for the last N days
+# Arguments:
+#   $1 - days (default 1 = today)
+#   $2 - output_mode: pipe (default) or csv
+# Returns: Replication runs for recent sessions
 sqlite_query_today_replications() {
+    local days="${1:-1}"
+    local output_mode="${2:-pipe}"
+    
     if [[ "$SQLITE_MODULE_AVAILABLE" -ne 1 ]]; then
         return 1
     fi
     
-    sqlite3 -header -column "$SQLITE_DB_PATH" \
-        "SELECT rr.endpoint_name, rr.endpoint_type, rr.status, 
+    _sqlite_query_formatted "$output_mode" \
+        "SELECT rr.start_time, rr.endpoint_name, rr.endpoint_type, rr.transport, rr.status, 
                 rr.bytes_transferred, rr.duration_sec
          FROM replication_runs rr
          JOIN sessions s ON rr.session_id = s.id
-         WHERE date(s.start_time) = date('now')
+         WHERE s.start_time >= datetime('now', '-$days days')
          ORDER BY rr.start_time DESC;"
 }
 
 # sqlite_query_stats() — REMOVED (dead code, H1 datetime bug)
 # Was never called in production. See DATETIME_BUGS.md H1.
+
+#=============================================================================
+# STATUS REPORT QUERY FUNCTIONS (ENH-10)
+#
+# Query functions for the --status reporting command.
+# Return pipe-delimited or CSV output depending on output_mode parameter.
+#=============================================================================
+
+# Get chain health summary or detail for --status --chains
+# Arguments:
+#   $1 - vm_name (empty = summary, set = detail for that VM)
+#   $2 - output_mode: pipe (default) or csv
+# Returns: Chain health rows grouped by VM (summary) or per-chain (detail)
+sqlite_query_chain_health() {
+    local vm_name="${1:-}"
+    local output_mode="${2:-pipe}"
+
+    [[ "$SQLITE_MODULE_AVAILABLE" -ne 1 ]] && return 1
+
+    if [[ -z "$vm_name" ]]; then
+        # Summary: one row per VM
+        _sqlite_query_formatted "$output_mode" \
+            "SELECT vm_name,
+                    SUM(CASE WHEN chain_status = 'active' THEN 1 ELSE 0 END) as active,
+                    SUM(CASE WHEN chain_status = 'archived' THEN 1 ELSE 0 END) as archived,
+                    SUM(CASE WHEN chain_status = 'purged' THEN 1 ELSE 0 END) as purged,
+                    SUM(total_checkpoints) as checkpoints,
+                    SUM(restorable_count) as restorable,
+                    SUM(CASE WHEN broken_at IS NOT NULL THEN 1 ELSE 0 END) as broken,
+                    SUM(COALESCE(archive_size_bytes, 0)) as archive_size_bytes,
+                    MIN(first_backup) as first_backup,
+                    MAX(last_backup) as last_backup
+             FROM chain_health
+             WHERE chain_status NOT IN ('deleted')
+             GROUP BY vm_name
+             ORDER BY vm_name;"
+    else
+        # Detail: one row per chain for a VM
+        local esc_vm="${vm_name//\'/\'\'}"
+        _sqlite_query_formatted "$output_mode" \
+            "SELECT period_id, chain_status as status,
+                    COALESCE(rotation_policy, '') as policy,
+                    total_checkpoints as checkpoints,
+                    restorable_count as restorable,
+                    CASE WHEN broken_at IS NOT NULL THEN 1 ELSE 0 END as broken,
+                    COALESCE(archive_size_bytes, '') as archive_size_bytes,
+                    first_backup, last_backup
+             FROM chain_health
+             WHERE vm_name = '$esc_vm'
+               AND chain_status NOT IN ('deleted')
+             ORDER BY last_backup DESC;"
+    fi
+}
+
+# Get storage growth per VM for --status --storage
+# Arguments:
+#   $1 - output_mode: pipe (default) or csv
+# Returns: Per-VM storage summary (all history)
+sqlite_query_storage_growth() {
+    local output_mode="${1:-pipe}"
+
+    [[ "$SQLITE_MODULE_AVAILABLE" -ne 1 ]] && return 1
+
+    _sqlite_query_formatted "$output_mode" \
+        "SELECT vb.vm_name,
+                COALESCE(
+                    (SELECT rotation_policy FROM vm_backups
+                     WHERE vm_name = vb.vm_name AND status = 'success'
+                     ORDER BY id DESC LIMIT 1), '') as policy,
+                COUNT(*) as backups,
+                COALESCE(AVG(CASE WHEN vb.backup_type = 'full' THEN vb.bytes_written END), 0) as avg_full,
+                COALESCE(AVG(CASE WHEN vb.backup_type IN ('auto','inc') THEN vb.bytes_written END), 0) as avg_incr,
+                SUM(vb.bytes_written) as total_written,
+                COALESCE(
+                    (SELECT chain_size_bytes FROM vm_backups
+                     WHERE vm_name = vb.vm_name AND status = 'success' AND chain_size_bytes > 0
+                     ORDER BY id DESC LIMIT 1), 0) as current_chain
+         FROM vm_backups vb
+         WHERE vb.status = 'success'
+         GROUP BY vb.vm_name
+         ORDER BY vb.vm_name;"
+}
+
+# Get per-VM storage trend data for --status --storage (104 Change C).
+# Returns success-only rows with bytes>0, scoped to a single instance, with
+# enough columns for the renderer to compute the trend symbol in shell:
+#   vm_name | total_count | avg_full | avg_incr | last_written | last_size | last_5_avg | prev_5_avg
+# `last_*` come from the most recent backup row for that VM.
+# `last_5_avg` / `prev_5_avg` enable the §5.4 trend indicator with the 10-row
+# minimum data guard (renderer prints `—` when total_count < 10).
+# Arguments:
+#   $1 - instance (default: CONFIG_INSTANCE or 'default')
+#   $2 - output_mode: pipe (default) or csv
+sqlite_query_storage_trends() {
+    local instance="${1:-${CONFIG_INSTANCE:-default}}"
+    local output_mode="${2:-pipe}"
+    local esc_instance="${instance//\'/\'\'}"
+
+    [[ "$SQLITE_MODULE_AVAILABLE" -ne 1 ]] && return 1
+
+    _sqlite_query_formatted "$output_mode" \
+        "WITH ranked AS (
+             SELECT vb.vm_name,
+                    vb.backup_type,
+                    vb.bytes_written,
+                    s.start_time,
+                    ROW_NUMBER() OVER (PARTITION BY vb.vm_name ORDER BY vb.id DESC) AS rn,
+                    COUNT(*)     OVER (PARTITION BY vb.vm_name) AS row_count
+             FROM vm_backups vb
+             JOIN sessions s ON s.id = vb.session_id
+             WHERE vb.status = 'success'
+               AND vb.bytes_written > 0
+               AND s.instance = '$esc_instance'
+         )
+         SELECT vm_name,
+                MAX(row_count)                                                          AS total_count,
+                COALESCE(AVG(CASE WHEN backup_type = 'full'           THEN bytes_written END), 0) AS avg_full,
+                COALESCE(AVG(CASE WHEN backup_type IN ('auto','inc')  THEN bytes_written END), 0) AS avg_incr,
+                MAX(CASE WHEN rn = 1 THEN start_time    END)                            AS last_written,
+                MAX(CASE WHEN rn = 1 THEN bytes_written END)                            AS last_size,
+                COALESCE(AVG(CASE WHEN rn <= 5            THEN bytes_written END), 0)   AS last_5_avg,
+                COALESCE(AVG(CASE WHEN rn >  5 AND rn <= 10 THEN bytes_written END), 0) AS prev_5_avg
+         FROM ranked
+         GROUP BY vm_name
+         ORDER BY vm_name;"
+}
+
+# Get destination-level storage summary for --status --storage footer.
+# Returns one row (pipe or CSV), all numeric values raw bytes:
+#   sample_count | oldest_time | newest_time | oldest_used | newest_used | newest_free | newest_total | written_7d | written_30d
+# `sample_count` is the number of v2.1+ sessions in the projection window.
+# Renderer uses (newest_used - oldest_used) / (newest_time - oldest_time) for
+# the slope; <7 samples renders "(insufficient history)" per §5.2.
+# Arguments:
+#   $1 - instance (default: CONFIG_INSTANCE or 'default')
+#   $2 - window_size: how many recent v2.1+ sessions to include (default: 30)
+#   $3 - output_mode: pipe (default) or csv
+sqlite_query_storage_destination_summary() {
+    local instance="${1:-${CONFIG_INSTANCE:-default}}"
+    local window="${2:-30}"
+    local output_mode="${3:-pipe}"
+    local esc_instance="${instance//\'/\'\'}"
+    # Defensive: window must be a positive integer (default 30 if not)
+    [[ "$window" =~ ^[1-9][0-9]*$ ]] || window=30
+
+    [[ "$SQLITE_MODULE_AVAILABLE" -ne 1 ]] && return 1
+
+    _sqlite_query_formatted "$output_mode" \
+        "WITH win AS (
+             SELECT id, start_time, disk_free_bytes, disk_total_bytes,
+                    (disk_total_bytes - disk_free_bytes) AS used_bytes
+             FROM sessions
+             WHERE instance = '$esc_instance'
+               AND status   = 'success'
+               AND disk_total_bytes > 0
+             ORDER BY id DESC
+             LIMIT $window
+         )
+         SELECT
+             (SELECT COUNT(*)   FROM win)                                  AS sample_count,
+             (SELECT MIN(start_time) FROM win)                             AS oldest_time,
+             (SELECT MAX(start_time) FROM win)                             AS newest_time,
+             (SELECT used_bytes FROM win ORDER BY start_time ASC  LIMIT 1) AS oldest_used,
+             (SELECT used_bytes FROM win ORDER BY start_time DESC LIMIT 1) AS newest_used,
+             (SELECT disk_free_bytes  FROM win ORDER BY start_time DESC LIMIT 1) AS newest_free,
+             (SELECT disk_total_bytes FROM win ORDER BY start_time DESC LIMIT 1) AS newest_total,
+             COALESCE((SELECT SUM(bytes_total) FROM sessions
+                       WHERE instance = '$esc_instance' AND status = 'success'
+                         AND start_time > datetime('now','-7 days')),  0) AS written_7d,
+             COALESCE((SELECT SUM(bytes_total) FROM sessions
+                       WHERE instance = '$esc_instance' AND status = 'success'
+                         AND start_time > datetime('now','-30 days')), 0) AS written_30d;"
+}
+
+# Get policy summary per VM for --status --policies
+# Arguments:
+#   $1 - output_mode: pipe (default) or csv
+# Returns: Per-VM chain/orphan counts from chain_health
+sqlite_query_policy_summary() {
+    local output_mode="${1:-pipe}"
+
+    [[ "$SQLITE_MODULE_AVAILABLE" -ne 1 ]] && return 1
+
+    _sqlite_query_formatted "$output_mode" \
+        "SELECT ch.vm_name,
+                SUM(CASE WHEN ch.chain_status IN ('active','archived') THEN 1 ELSE 0 END) as chains,
+                SUM(CASE WHEN ch.chain_status IN ('active','archived')
+                          AND ch.rotation_policy != COALESCE(
+                              (SELECT rotation_policy FROM vm_backups
+                               WHERE vm_name = ch.vm_name AND status = 'success'
+                               ORDER BY id DESC LIMIT 1), '')
+                     THEN 1 ELSE 0 END) as orphans,
+                MIN(CASE WHEN ch.chain_status IN ('active','archived') THEN ch.first_backup END) as oldest_backup
+         FROM chain_health ch
+         WHERE ch.chain_status NOT IN ('deleted','purged')
+         GROUP BY ch.vm_name
+         ORDER BY ch.vm_name;"
+}
 
 #=============================================================================
 # EMAIL REPORT QUERY FUNCTIONS
@@ -1485,11 +1894,11 @@ sqlite_update_chain_health() {
 INSERT INTO chain_health (
     vm_name, period_id, chain_location, chain_status, rotation_policy,
     total_checkpoints, restorable_count, broken_at, 
-    break_reason, last_backup, updated_at
+    break_reason, first_backup, last_backup, updated_at
 ) VALUES (
     '$esc_vm', '$esc_period', '$esc_location', '$chain_status', $esc_policy,
     $checkpoint_count, $restorable_count, $broken_at,
-    $break_reason, '$now', '$now'
+    $break_reason, '$now', '$now', '$now'
 )
 ON CONFLICT(vm_name, period_id) DO UPDATE SET
     chain_location = '$esc_location',
@@ -1541,6 +1950,7 @@ sqlite_archive_chain() {
 UPDATE chain_health SET
     chain_status = 'archived',
     chain_location = '$final_location',
+    archive_size_bytes = $total_size,
     archived_at = '$now',
     updated_at = '$now'
 WHERE vm_name = '$esc_vm' 
@@ -1580,10 +1990,12 @@ sqlite_mark_chain_broken() {
     sqlite3 "$SQLITE_DB_PATH" << SQL_EOF
 INSERT INTO chain_health (
     vm_name, period_id, chain_location, chain_status,
-    total_checkpoints, restorable_count, broken_at, break_reason, updated_at
+    total_checkpoints, restorable_count, broken_at, break_reason,
+    first_backup, updated_at
 ) VALUES (
     '$esc_vm', '$esc_period', '$esc_location', 'broken',
-    $broken_at, $restorable, $broken_at, '$esc_error', '$now'
+    $broken_at, $restorable, $broken_at, '$esc_error',
+    '$now', '$now'
 )
 ON CONFLICT(vm_name, period_id) DO UPDATE SET
     chain_location = '$esc_location',
@@ -2344,6 +2756,9 @@ export -f sqlite_log_file_operation
 export -f sqlite_log_period_event
 export -f sqlite_log_retention_event
 export -f sqlite_query_today_sessions
+export -f sqlite_query_session_vm_backups_display
+export -f sqlite_query_session_retention_summary
+export -f sqlite_query_session_replication_summary
 export -f sqlite_query_vm_history
 export -f sqlite_query_last_success
 export -f sqlite_query_recent_failures

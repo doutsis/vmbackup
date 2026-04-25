@@ -347,7 +347,12 @@ run_retention_for_vm() {
         "$vm_name: policy=$policy count=$period_count limit=$retention_limit"
     
     # Within limits - nothing to do
-    [[ "$period_count" -le "$retention_limit" ]] && return 0
+    if [[ "$period_count" -le "$retention_limit" ]]; then
+        log_retention_action "evaluate" "$vm_name" "vm_retention" \
+            "$vm_dir" "" "$policy" "$retention_limit" "$period_count" \
+            "" "0" "within_limit" "post_backup" "true" "retention_module"
+        return 0
+    fi
     
     # Calculate and remove excess periods
     local to_remove=$((period_count - retention_limit))
@@ -410,7 +415,13 @@ run_orphan_retention_for_vm() {
     
     # Find orphaned periods
     local orphans=$(get_orphaned_periods "$vm_name")
-    [[ -z "$orphans" ]] && return 0
+    if [[ -z "$orphans" ]]; then
+        local safe_name=$(sanitize_vm_name "$vm_name")
+        log_retention_action "evaluate" "$vm_name" "orphan_retention" \
+            "${BACKUP_PATH}${safe_name}" "" "$policy" "" "0" \
+            "" "0" "no_orphans" "post_backup" "true" "retention_module"
+        return 0
+    fi
     
     local orphan_count
     orphan_count=$(echo "$orphans" | grep -c . || true)
