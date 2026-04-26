@@ -4,6 +4,24 @@ All notable changes to [vmbackup](https://github.com/doutsis/vmbackup) will be d
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.5.6] - 2026-04-26
+
+### Changed
+
+- **Structured exit codes** — categorised non-zero exits (config / lock / storage / VM / tool / CLI / dependency) let monitoring distinguish *why* a run failed without parsing logs. Symmetric with vmrestore.
+
+### Fixed
+
+- **Retention not enforced for skipped or excluded VMs** — Retention was wired only to the post-backup success path, so any VM that was skipped (`SKIP_OFFLINE_UNCHANGED_BACKUPS=true`) or excluded (`policy=never`) accumulated period directories indefinitely with no rotation. The same code path also created the period directory via `mkdir -p` *before* deciding whether the backup would run, leaving an empty stub on disk every time a VM was skipped, excluded, or failed before first write. Combined effect on production: VMs at `RETENTION_WEEKS=4` carrying 8+ weekly directories, including pure stubs that no later session would ever clean up. Retention is now invoked from the skip and exclude paths via the new `run_retention_for_unbacked_vm` wrapper, which orders stub cleanup before retention so the period count is correct before the limit check runs. Excluded VMs (`policy=never`) have stubs removed but their populated periods are preserved by the policy short-circuit. Failed-path retention remains intentionally suppressed; failed-path stubs are reaped on the next non-failed session.
+
+### Added
+
+- **Stub-aware retention pipeline for unbacked VMs** — A new `run_retention_for_unbacked_vm` wrapper in `modules/retention_module.sh` runs stub cleanup → retention → orphan retention in that order whenever a VM is skipped or excluded, so the on-disk period count is correct before the limit check fires. Stub cleanup is performed by the new `_remove_empty_period_dirs` helper, which removes pure stub directories (zero `*.data`, no `.archives/`) and is anchored to `BACKUP_PATH` with a path-shape regex guard, deliberately bypassing `_remove_period`'s keep-last, replication, and protected-period guards (all inappropriate for empty directories). Stub deletions in SQLite go through a new UPDATE-only library function `sqlite_mark_chain_deleted_if_exists` (in `lib/sqlite_module.sh`) to avoid injecting phantom `active`-then-`deleted` `chain_health` rows when a pure stub never had a row to begin with.
+
+### Changed
+
+- **`retention_events` audit attribution** — Field 12 (`triggered_by`) no longer carries hardcoded function-name literals; it now records the high-level event that drove the prune, with new enum values `skipped`, `excluded`, and `orphan_dir` joining the existing `post_backup`, `prune`, and `orphan_retention`. The `action` column also gains `remove_stub` for the new stub-cleanup path. Internally, `_remove_period`, `_remove_orphan_period`, `_remove_archive_chain`, `_remove_archives_in_period`, `_remove_vm_all`, `run_retention_for_vm`, and `run_orphan_retention_for_vm` all gain a new `trigger` parameter so the originating event propagates through the call chain into the audit row — making it possible to attribute retention activity to skipped-VM and excluded-VM sessions for the first time.
+
 ## [0.5.5] - 2026-04-25
 
 ### Added

@@ -308,6 +308,12 @@ post_backup_hook() {
     
     # Run retention cleanup (skip on failure to avoid cascading issues)
     if [[ "$backup_status" == "success" ]] && declare -f run_retention_for_vm >/dev/null 2>&1; then
+        # Tier 0 (Bug 1 fix): Stub cleanup MUST run before retention so just-mkdir'd
+        # or pre-existing empty period dirs do not inflate get_vm_periods()'s count.
+        if declare -f _remove_empty_period_dirs >/dev/null 2>&1; then
+            _remove_empty_period_dirs "$vm_name" "post_backup"
+        fi
+
         # Tier 1: Active policy retention (count-based, current policy format)
         run_retention_for_vm "$vm_name"
         

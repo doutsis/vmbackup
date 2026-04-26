@@ -74,7 +74,27 @@ set -o pipefail
 umask 027
 
 # Version - used by Debian packaging and --version flag
-VMBACKUP_VERSION="0.5.5"
+VMBACKUP_VERSION="0.5.6"
+
+# ----- Exit codes -----
+# Categorised exit codes for monitoring integration. Backward-compatible:
+# 0 = success, 1 = generic failure (catch-all). Specific codes only appear
+# at sites where the failure category is unambiguous.
+#
+# NOTE: EXIT_TOOL (6) is currently raised by dependency checks and the
+# replication_cloud_module standalone CLI. In-pipeline tool failures during
+# backup operations (e.g. virtnbdbackup non-zero exit) are reported as
+# EXIT_ERROR (1) — see the SQLite session row and email report for the
+# tool-level detail (tool name, exit code, log tail).
+readonly EXIT_OK=0
+readonly EXIT_ERROR=1
+readonly EXIT_CONFIG=2
+readonly EXIT_LOCK=3
+readonly EXIT_STORAGE=4
+readonly EXIT_VM=5
+readonly EXIT_TOOL=6
+readonly EXIT_USAGE=7
+readonly EXIT_DEPENDENCY=8
 
 # Dry-run mode: show what would happen without executing destructive operations
 DRY_RUN=false
@@ -138,7 +158,7 @@ while [[ $# -gt 0 ]]; do
             if [[ -n "${2:-}" && "${2:0:1}" != "-" ]]; then
                 case "$2" in
                     local|cloud|both) _REPLICATE_ONLY_MODE="$2"; shift ;;
-                    *) echo "Error: --replicate-only accepts: local, cloud, both (got '$2')" >&2; exit 1 ;;
+                    *) echo "Error: --replicate-only accepts: local, cloud, both (got '$2')" >&2; exit "$EXIT_USAGE" ;;
                 esac
             fi
             shift
@@ -154,7 +174,7 @@ while [[ $# -gt 0 ]]; do
                 shift 2
             else
                 echo "Error: --vm requires a VM name" >&2
-                exit 1
+                exit "$EXIT_USAGE"
             fi
             ;;
         --status)
@@ -191,7 +211,7 @@ while [[ $# -gt 0 ]]; do
                 shift 2
             else
                 echo "Error: --days requires a number" >&2
-                exit 1
+                exit "$EXIT_USAGE"
             fi
             ;;
         --csv)
@@ -312,7 +332,7 @@ HELP_EOF
         *)
             echo "Error: Unknown option: $1" >&2
             echo "Run vmbackup.sh --help for usage." >&2
-            exit 1
+            exit "$EXIT_USAGE"
             ;;
     esac
 done
@@ -320,64 +340,64 @@ done
 # Mutual exclusivity guards
 if [[ "${_PRUNE_MODE}" == "true" && -n "${_REPLICATE_ONLY_MODE}" ]]; then
     echo "Error: --prune and --replicate-only cannot be used together" >&2
-    exit 1
+    exit "$EXIT_USAGE"
 fi
 if [[ -n "${_REPLICATE_ONLY_MODE}" && -n "${_TARGET_VM}" ]]; then
     echo "Error: --vm cannot be used with --replicate-only (replication operates on the entire backup path)" >&2
-    exit 1
+    exit "$EXIT_USAGE"
 fi
 if [[ "${_PRUNE_MODE}" == "true" && "${_TARGET_VM}" == *","* ]]; then
     echo "Error: --prune requires a single VM name (comma-separated list not supported)" >&2
-    exit 1
+    exit "$EXIT_USAGE"
 fi
 if [[ "${_CANCEL_REPLICATION_REQUESTED:-false}" == "true" ]]; then
     if [[ "${_PRUNE_MODE}" == "true" ]]; then
         echo "Error: --cancel-replication cannot be combined with --prune" >&2
-        exit 1
+        exit "$EXIT_USAGE"
     fi
     if [[ -n "${_REPLICATE_ONLY_MODE}" ]]; then
         echo "Error: --cancel-replication cannot be combined with --replicate-only" >&2
-        exit 1
+        exit "$EXIT_USAGE"
     fi
     if [[ -n "${_TARGET_VM}" ]]; then
         echo "Error: --cancel-replication cannot be combined with --vm" >&2
-        exit 1
+        exit "$EXIT_USAGE"
     fi
     if [[ "${DRY_RUN}" == "true" ]]; then
         echo "Error: --cancel-replication cannot be combined with --dry-run" >&2
-        exit 1
+        exit "$EXIT_USAGE"
     fi
 fi
 if [[ "${_BACKUP_MODE}" == "true" && "${_PRUNE_MODE}" == "true" ]]; then
     echo "Error: --run and --prune cannot be used together" >&2
-    exit 1
+    exit "$EXIT_USAGE"
 fi
 if [[ "${_BACKUP_MODE}" == "true" && -n "${_REPLICATE_ONLY_MODE}" ]]; then
     echo "Error: --run and --replicate-only cannot be used together" >&2
-    exit 1
+    exit "$EXIT_USAGE"
 fi
 if [[ "${_BACKUP_MODE}" == "true" && "${_CANCEL_REPLICATION_REQUESTED:-false}" == "true" ]]; then
     echo "Error: --run and --cancel-replication cannot be used together" >&2
-    exit 1
+    exit "$EXIT_USAGE"
 fi
 if [[ "${_STATUS_MODE}" == "true" ]]; then
     if [[ "${_BACKUP_MODE}" == "true" ]]; then
         echo "Error: --status cannot be combined with --run" >&2
-        exit 1
+        exit "$EXIT_USAGE"
     fi
     if [[ "${_PRUNE_MODE}" == "true" ]]; then
         echo "Error: --status cannot be combined with --prune" >&2
-        exit 1
+        exit "$EXIT_USAGE"
     fi
     if [[ -n "${_REPLICATE_ONLY_MODE}" ]]; then
         echo "Error: --status cannot be combined with --replicate-only" >&2
-        exit 1
+        exit "$EXIT_USAGE"
     fi
 fi
 if [[ -n "${_TARGET_VM}" && "${_BACKUP_MODE}" == "false" && "${_PRUNE_MODE}" == "false" && "${_STATUS_MODE}" == "false" ]]; then
     echo "Error: --vm requires --run (for backup), --prune (for cleanup), or --status (for reports)" >&2
     echo "Example: sudo vmbackup.sh --run --vm ${_TARGET_VM}" >&2
-    exit 1
+    exit "$EXIT_USAGE"
 fi
 
 # If no mode flag given, show usage and exit
@@ -412,7 +432,7 @@ fi
 # --help and --version exit above before reaching this point.
 if [[ $EUID -ne 0 ]]; then
     echo "Error: vmbackup must be run as root (e.g. sudo $0)" >&2
-    exit 1
+    exit "$EXIT_CONFIG"
 fi
 
 export CONFIG_INSTANCE
@@ -430,7 +450,7 @@ _VMBACKUP_ENV_BACKUP_PATH="${BACKUP_PATH:-}"
 _VMBACKUP_CONFIG="${_VMBACKUP_SCRIPT_DIR}/config/${CONFIG_INSTANCE}/vmbackup.conf"
 if [[ ! -f "$_VMBACKUP_CONFIG" ]]; then
     echo "Error: Config instance '${CONFIG_INSTANCE}' not found: $_VMBACKUP_CONFIG" >&2
-    exit 1
+    exit "$EXIT_CONFIG"
 fi
 source "$_VMBACKUP_CONFIG"
 # Restore env var if it was set (env takes precedence over config)
@@ -452,10 +472,10 @@ BACKUP_PATH="${BACKUP_PATH:-/mnt/backup/vms/}"
 # no migrations, no session tracking. Lightest possible code path.
 if [[ "${_STATUS_MODE}" == "true" ]]; then
     source "$SCRIPT_DIR/lib/sqlite_module.sh" 2>/dev/null || {
-        echo "Error: SQLite module not found" >&2; exit 1
+        echo "Error: SQLite module not found" >&2; exit "$EXIT_DEPENDENCY"
     }
     source "$SCRIPT_DIR/modules/status_module.sh" 2>/dev/null || {
-        echo "Error: Status module not found" >&2; exit 1
+        echo "Error: Status module not found" >&2; exit "$EXIT_DEPENDENCY"
     }
     # Determine sub-mode
     local_sub="${_STATUS_SUB:-default}"
@@ -714,13 +734,13 @@ if [[ "${_PRUNE_MODE:-false}" == "true" ]]; then
     if [[ -z "$_PRUNE_TARGET" ]]; then
         echo "Error: --prune requires a target (e.g. --prune list, --prune archives, --prune all)"
         echo "Run vmbackup.sh --help for usage."
-        exit 1
+        exit "$EXIT_USAGE"
     fi
     
     # Validate: --prune incompatible with --cancel-replication
     if [[ "${_CANCEL_REPLICATION_REQUESTED:-false}" == "true" ]]; then
         echo "Error: --prune cannot be combined with --cancel-replication"
-        exit 1
+        exit "$EXIT_USAGE"
     fi
     
     # Validate target syntax
@@ -733,7 +753,7 @@ if [[ "${_PRUNE_MODE:-false}" == "true" ]]; then
             echo "Error: Unknown prune target: $_PRUNE_TARGET"
             echo "Valid targets: list, archives, archives:<period>, chain:<name>, period:<id>, all"
             echo "Run vmbackup.sh --help for usage."
-            exit 1
+            exit "$EXIT_USAGE"
             ;;
     esac
     
@@ -743,7 +763,7 @@ if [[ "${_PRUNE_MODE:-false}" == "true" ]]; then
             if [[ -z "$_TARGET_VM" ]]; then
                 echo "Error: --vm is required for --prune $_PRUNE_TARGET"
                 echo "Example: sudo ./vmbackup.sh --prune $_PRUNE_TARGET --vm <vm-name>"
-                exit 1
+                exit "$EXIT_USAGE"
             fi
             ;;
     esac
@@ -809,6 +829,17 @@ init_logging() {
 
 # Source shared logging library
 source "${SCRIPT_DIR}/lib/logging.sh"
+
+# ----- die helper -----
+# Log an error and exit with the given code. Default code is EXIT_ERROR (1).
+# Must be defined after lib/logging.sh is sourced (uses log_error).
+die() {
+    local msg="$1"
+    local ctx="${2:-main}"
+    local code="${3:-$EXIT_ERROR}"
+    log_error "vmbackup.sh" "$ctx" "$msg"
+    exit "$code"
+}
 
 #################################################################################
 # SECURITY: BACKUP PERMISSIONS HELPER
@@ -4505,6 +4536,9 @@ backup_vm() {
     if [[ "$_dr_policy" == "never" ]]; then
       log_info "vmbackup.sh" "backup_vm" "[DRY-RUN] VM $vm_name would be EXCLUDED (policy=never)"
       VM_BACKUP_RESULTS+=("$vm_name|EXCLUDED|n/a|00:00:00|0|N/A||$_dr_policy")
+      # Bug 2 fix: run retention + stub cleanup for excluded VMs (DRY_RUN-aware via wrapper)
+      declare -f run_retention_for_unbacked_vm >/dev/null 2>&1 && \
+        run_retention_for_unbacked_vm "$vm_name" "excluded"
       return $BACKUP_RC_EXCLUDED
     fi
     log_info "vmbackup.sh" "backup_vm" "[DRY-RUN] pre_backup_hook: policy=$_dr_policy (chain archiving skipped)"
@@ -4513,6 +4547,9 @@ backup_vm() {
     _log_vm_backup_summary "$vm_name" "$backup_start_time" "$backup_start_epoch" \
       "EXCLUDED" "n/a" "0" "0" "" "0" "$vm_policy" "" \
       "vm_excluded" "excluded by rotation policy (policy=$vm_policy)" "0" "0"
+    # Bug 2 fix: run retention + stub cleanup for excluded VMs
+    declare -f run_retention_for_unbacked_vm >/dev/null 2>&1 && \
+      run_retention_for_unbacked_vm "$vm_name" "excluded"
     return $BACKUP_RC_EXCLUDED  # Return 2 = excluded (don't count as success)
   fi
   
@@ -4668,6 +4705,10 @@ backup_vm() {
         "offline unchanged" "0" "$vm_policy" "$backup_dir" \
         "backup_skipped" "$skip_event_detail" "0" "0"
       
+      # Bug 2 fix: run retention + stub cleanup for skipped VMs
+      declare -f run_retention_for_unbacked_vm >/dev/null 2>&1 && \
+        run_retention_for_unbacked_vm "$vm_name" "skipped"
+
       return 0  # Success - skip backup
     else
       # DISK CHANGES DETECTED on offline VM
@@ -6221,7 +6262,7 @@ run_prune_mode() {
             ;;
         chain)
             local result
-            result=$(_remove_archive_chain "$vm_name" "$found_period" "$target_param" "$dry_run" "prune")
+            result=$(_remove_archive_chain "$vm_name" "$found_period" "$target_param" "$dry_run" "prune" "prune")
             if [[ $? -eq 0 ]]; then
                 total_freed=$(( total_freed + ${result:-0} ))
                 (( success_count++ ))
@@ -6234,7 +6275,7 @@ run_prune_mode() {
             fi
             ;;
         period)
-            _remove_period "$vm_name" "$target_param" "$dry_run" "false" "prune"
+            _remove_period "$vm_name" "$target_param" "$dry_run" "false" "prune" "prune"
             local rc=$?
             if [[ $rc -eq 0 ]]; then
                 # Verify deletion actually happened (protection/keep-last may skip)
@@ -6253,7 +6294,7 @@ run_prune_mode() {
             ;;
         all)
             local result
-            result=$(_remove_vm_all "$vm_name" "$dry_run" "prune")
+            result=$(_remove_vm_all "$vm_name" "$dry_run" "prune" "prune")
             if [[ $? -eq 0 ]]; then
                 total_freed=$(( total_freed + ${result:-0} ))
                 (( success_count++ ))
@@ -6315,17 +6356,13 @@ main() {
     local existing_pid
     existing_pid=$(cat "$session_pidfile" 2>/dev/null)
     if [[ -n "$existing_pid" ]] && kill -0 "$existing_pid" 2>/dev/null; then
-      log_error "vmbackup.sh" "main" "Another vmbackup session is already running (PID $existing_pid) — aborting"
-      echo "Error: Another vmbackup session is already running (PID $existing_pid)" >&2
-      exit 1
+      die "Another vmbackup session is already running (PID $existing_pid) — aborting" "main" "$EXIT_LOCK"
     fi
     # Stale PID file — remove and retry once
     rm -f "$session_pidfile"
     log_debug "vmbackup.sh" "main" "Removed stale session PID file (PID ${existing_pid:-unknown} no longer running)"
     if ! ( set -o noclobber; echo "$$" > "$session_pidfile" ) 2>/dev/null; then
-      log_error "vmbackup.sh" "main" "Failed to acquire session lock after stale removal — aborting"
-      echo "Error: Failed to acquire session lock" >&2
-      exit 1
+      die "Failed to acquire session lock after stale removal — aborting" "main" "$EXIT_LOCK"
     fi
   fi
   log_debug "vmbackup.sh" "main" "Session PID file created: $session_pidfile (PID $$)"
@@ -6340,8 +6377,7 @@ main() {
   else
     log_info "vmbackup.sh" "main" "Checking dependencies"
     if ! check_dependencies; then
-      log_error "vmbackup.sh" "main" "Dependency check failed - aborting session"
-      exit 1
+      die "Dependency check failed - aborting session" "main" "$EXIT_DEPENDENCY"
     fi
   fi
   
@@ -6423,12 +6459,10 @@ main() {
     if source "$integration_module" 2>/dev/null; then
       log_info "vmbackup.sh" "main" "VM-first integration module loaded (v${VMBACKUP_INTEGRATION_VERSION:-unknown})"
     else
-      log_error "vmbackup.sh" "main" "FATAL: Failed to load vmbackup_integration.sh (syntax error?)"
-      exit 1
+      die "FATAL: Failed to load vmbackup_integration.sh (syntax error?)" "main" "$EXIT_DEPENDENCY"
     fi
   else
-    log_error "vmbackup.sh" "main" "FATAL: vmbackup_integration.sh not found at: $integration_module"
-    exit 1
+    die "FATAL: vmbackup_integration.sh not found at: $integration_module" "main" "$EXIT_DEPENDENCY"
   fi
 
   # PRUNE MODE: dispatch now that config, SQLite, and integration modules are loaded
@@ -6512,18 +6546,15 @@ main() {
   check_libvirt_version
   
   if ! check_backup_destination; then
-    log_error "vmbackup.sh" "main" "Backup destination check failed - aborting session"
-    exit 1
+    die "Backup destination check failed - aborting session" "main" "$EXIT_STORAGE"
   fi
   
   if ! check_scratch_path; then
-    log_error "vmbackup.sh" "main" "Scratch path check failed - aborting session"
-    exit 1
+    die "Scratch path check failed - aborting session" "main" "$EXIT_STORAGE"
   fi
   
   if ! check_disk_space; then
-    log_error "vmbackup.sh" "main" "Insufficient disk space - aborting session"
-    exit 1
+    die "Insufficient disk space - aborting session" "main" "$EXIT_STORAGE"
   fi
   
   # Stale state recovery (locks only - checkpoint cleanup handled per-VM in backup_vm())
@@ -6552,9 +6583,7 @@ main() {
     # Validate each VM exists in libvirt
     for _tvm in "${_target_vm_list[@]}"; do
       if ! virsh dominfo "$_tvm" &>/dev/null; then
-        log_error "vmbackup.sh" "main" "Targeted backup: VM not found in libvirt: $_tvm"
-        echo "Error: VM not found: $_tvm" >&2
-        exit 1
+        die "Targeted backup: VM not found in libvirt: $_tvm" "main" "$EXIT_VM"
       fi
     done
     vm_list=("${_target_vm_list[@]}")

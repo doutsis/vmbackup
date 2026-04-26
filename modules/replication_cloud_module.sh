@@ -1365,6 +1365,11 @@ cloud_replication_cli_test() {
 
 # Main CLI entry point (only when executed directly, not sourced)
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    # ----- Exit codes (107) -----
+    # Fallback constants for direct CLI invocation. Inherited from vmbackup.sh
+    # when sourced as a library; defined here for stand-alone runs.
+    : "${EXIT_OK:=0}" "${EXIT_ERROR:=1}" "${EXIT_USAGE:=7}" "${EXIT_STORAGE:=4}" "${EXIT_TOOL:=6}" "${EXIT_DEPENDENCY:=8}"
+
     # Parse CLI arguments
     DRY_RUN=0
     VERBOSE=0
@@ -1401,7 +1406,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
             -*)
                 echo "Unknown option: $1"
                 cloud_replication_cli_usage
-                exit 1
+                exit "$EXIT_USAGE"
                 ;;
             *)
                 SOURCE_PATH="$1"
@@ -1435,7 +1440,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
             
             if [[ ! -d "$SOURCE_PATH" ]]; then
                 echo "ERROR: Source path does not exist: $SOURCE_PATH"
-                exit 1
+                exit "$EXIT_STORAGE"
             fi
             
             # Show backup stats
@@ -1452,7 +1457,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
                 
                 if ! cloud_replication_init; then
                     echo "ERROR: Failed to initialize cloud replication"
-                    exit 1
+                    exit "$EXIT_DEPENDENCY"
                 fi
                 
                 dest_count=$(cloud_replication_get_dest_count)
@@ -1495,7 +1500,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
                 echo "Pre-seed upload completed with errors"
                 echo "════════════════════════════════════════════════════════════"
                 get_cloud_replication_summary
-                exit 1
+                exit "$EXIT_TOOL"
             fi
             ;;
     esac

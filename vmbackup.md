@@ -54,6 +54,7 @@
 21. [Known Issues & Mitigations](#known-issues--mitigations)
     - [VirtIO discard_granularity & Windows TRIM Performance](#virtio-discard_granularity--windows-trim-performance)
     - [QEMU Agent Hang on FSTRIM Interruption](#qemu-agent-hang-on-fstrim-interruption)
+22. [Exit Codes](#exit-codes)
 
 ---
 
@@ -218,8 +219,8 @@ vmbackup is a wrapper around [virtnbdbackup](https://github.com/abbbi/virtnbdbac
 Download the latest `.deb` from [Releases](https://github.com/doutsis/vmbackup/releases):
 
 ```bash
-wget https://github.com/doutsis/vmbackup/releases/download/v0.5.5/vmbackup_0.5.5_all.deb
-sudo dpkg -i vmbackup_0.5.5_all.deb
+wget https://github.com/doutsis/vmbackup/releases/download/v0.5.6/vmbackup_0.5.6_all.deb
+sudo dpkg -i vmbackup_0.5.6_all.deb
 ```
 
 ### From Source
@@ -1332,7 +1333,7 @@ flowchart LR
 
 ### Automated Retention System
 
-Retention runs automatically after each successful backup via the post-backup hook:
+Retention runs automatically for every VM in every session, not only after successful backups. Three entry points cover the full lifecycle:
 
 ```
 post_backup_hook()                     (vmbackup_integration.sh)
@@ -1345,7 +1346,17 @@ post_backup_hook()                     (vmbackup_integration.sh)
       ├── get_orphaned_periods()       Find dirs from previous rotation policies
       ├── calculate_orphan_age()       Age-based threshold (DB-backed)
       └── _remove_orphan_period()      Delete orphans exceeding max age
+
+run_retention_for_unbacked_vm()        (modules/retention_module.sh)
+  Invoked from the skip and exclude paths in vmbackup.sh main() so that
+  VMs which never reach post_backup_hook() still get retention enforced.
+  ├── _remove_empty_period_dirs()      Stub cleanup (zero-data period dirs)
+  ├── run_retention_for_vm()           Tier 1 (skipped only — excluded VMs
+  │                                    short-circuit at policy=never)
+  └── run_orphan_retention_for_vm()    Tier 2
 ```
+
+The `trigger` argument propagates from each entry point through every helper into the `retention_events.triggered_by` audit column. Defined values: `post_backup`, `skipped`, `excluded`, `prune`, `orphan_retention`, `orphan_dir`. The `action` column adds `remove_stub` for empty-period cleanup.
 
 #### Tier 1: Active Policy Retention (Count-Based)
 
@@ -1465,7 +1476,7 @@ WHERE vm_name = 'web-server' AND period_id = '202607';
 
 ### On-Demand Cleanup (`--prune`)
 
-Standalone on-demand cleanup of backup data — archives, periods, or entire VMs — without running a backup session. Addresses the gap where automated retention only runs inside `post_backup_hook()` after each successful backup. See [Usage](#usage) for CLI syntax and options.
+Standalone on-demand cleanup of backup data — archives, periods, or entire VMs — without running a backup session. Useful for reclaiming space on demand, removing decommissioned VMs, or surgically pruning specific archived chains. See [Usage](#usage) for CLI syntax and options.
 
 #### Targets
 
@@ -3015,4 +3026,28 @@ ENABLE_AUTO_RECOVERY_ON_CHECKPOINT_CORRUPTION="yes"  # yes|warn|no
 CHECKPOINT_RETRY_AUTO_TO_FULL="yes"
 CHECKPOINT_MAX_RETRIES_AUTO=1
 ```
+
+---
+
+## Exit Codes
+
+`vmbackup` returns categorised exit codes so monitoring systems can distinguish *why* a run failed without scraping logs. Backward-compatible — `if vmbackup; then` and `(( $? != 0 ))` patterns continue to work.
+
+| Code | Meaning | Example trigger |
+|------|---------|-----------------|
+| 0    | Success | Normal completion, `--help`, `--version`, dry-run, `--cancel-replication` |
+| 1    | General error | Backup session ended with one or more VM failures |
+| 2    | Configuration error | Missing config file, named instance not found, not running as root |
+| 3    | Lock conflict | Another vmbackup session already running |
+| 4    | Storage error | Backup destination unreachable, disk full, scratch path missing |
+| 5    | VM problem | Targeted VM not found in libvirt |
+| 6    | External tool failure | Dependency check on external tool failed; cloud upload errors. *Note:* `virtnbdbackup` failures during a backup pipeline are reported as `1` (see SQLite session row and email report for tool-level detail). |
+| 7    | CLI usage error | Unknown flag, missing required argument, mutually exclusive flags combined |
+| 8    | Missing dependency | Required tool not installed, integration module not found |
+| 130  | SIGINT (Ctrl-C) | Shell convention 128 + 2 |
+| 143  | SIGTERM | Shell convention 128 + 15 |
+
+Symmetric with `vmrestore` — the same number means the same category in both tools, so monitoring rules can be written once and applied to either binary.
+
+**Monitoring integration patterns:** page on 4 or 6 (storage/tool — usually needs immediate attention), log-only on 3 (lock conflicts often resolve on next cron run), alert on 8 (deployment problem).
 

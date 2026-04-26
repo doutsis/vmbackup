@@ -2070,6 +2070,60 @@ SQL_EOF
     return $rc
 }
 
+# Mark chain as deleted ONLY IF a row already exists (UPDATE-only variant)
+# Used for stub-period removal where we must NOT inject a phantom
+# 'active'-then-'deleted' row for VMs that never had a real chain.
+# Signature parity with sqlite_mark_chain_deleted; chain_location ($3)
+# is unused but kept for caller convenience.
+# Arguments:
+#   $1 - vm_name
+#   $2 - period_id
+#   $3 - chain_location (unused, kept for signature parity)
+#   $4 - reason (retention|prune|space_cleanup|skipped|excluded)
+#   $5 - target_status (deleted|purged, default: deleted)
+# Returns: 0 on success (including no-row no-op), 1 on failure
+sqlite_mark_chain_deleted_if_exists() {
+    [[ "${DRY_RUN:-false}" == true ]] && return 0
+    local vm_name="$1" period_id="$2"
+    local _chain_location="${3:-.}"   # accepted for parity, unused
+    local reason="${4:-retention}"
+    local target_status="${5:-deleted}"
+
+    [[ "$SQLITE_MODULE_AVAILABLE" -ne 1 ]] && return 1
+
+    case "$target_status" in
+        deleted|purged) ;;
+        *) target_status="deleted" ;;
+    esac
+
+    local esc_vm=$(_sql_escape "$vm_name")
+    local esc_period=$(_sql_escape "$period_id")
+    local esc_reason=$(_sql_escape "$reason")
+    local esc_status=$(_sql_escape "$target_status")
+    local now=$(date -u '+%Y-%m-%d %H:%M:%S')
+
+    local ts_col="deleted_at"
+    [[ "$target_status" == "purged" ]] && ts_col="purged_at"
+
+    sqlite3 "$SQLITE_DB_PATH" << SQL_EOF
+UPDATE chain_health SET
+    chain_status = '$esc_status', restorable_count = 0,
+    break_reason = '$esc_reason', ${ts_col} = '$now',
+    marked_by = '$esc_reason', updated_at = '$now'
+WHERE vm_name = '$esc_vm' AND period_id = '$esc_period'
+  AND chain_status NOT IN ('deleted', 'purged');
+SQL_EOF
+    local rc=$?
+    if [[ $rc -ne 0 ]]; then
+        log_error "$SQLITE_MODULE_NAME" "sqlite_mark_chain_deleted_if_exists" \
+            "Failed UPDATE: vm=$vm_name period=$period_id (exit=$rc)"
+    else
+        log_debug "$SQLITE_MODULE_NAME" "sqlite_mark_chain_deleted_if_exists" \
+            "UPDATE applied (or no-op): vm=$vm_name period=$period_id reason=$reason"
+    fi
+    return $rc
+}
+
 #################################################################################
 # Interactive Lifecycle Management (v1.7)
 #
@@ -2774,6 +2828,7 @@ export -f sqlite_update_chain_health
 export -f sqlite_archive_chain
 export -f sqlite_mark_chain_broken
 export -f sqlite_mark_chain_deleted
+export -f sqlite_mark_chain_deleted_if_exists
 export -f sqlite_mark_chain_for_deletion
 export -f sqlite_unmark_chain
 export -f sqlite_protect_chain

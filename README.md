@@ -20,8 +20,8 @@ vmbackup is that wrapper. It orchestrates virtnbdbackup across your entire fleet
 **Debian / Ubuntu:**
 
 ```bash
-wget https://github.com/doutsis/vmbackup/releases/download/v0.5.5/vmbackup_0.5.5_all.deb
-sudo dpkg -i vmbackup_0.5.5_all.deb
+wget https://github.com/doutsis/vmbackup/releases/download/v0.5.6/vmbackup_0.5.6_all.deb
+sudo dpkg -i vmbackup_0.5.6_all.deb
 ```
 
 **Any distro (Arch, Fedora, openSUSE, etc.):**
@@ -80,8 +80,8 @@ Also requires `bash >= 5.0`, `libvirt-daemon-system`, `qemu-utils`, `sqlite3` an
 Download the latest `.deb` from [Releases](https://github.com/doutsis/vmbackup/releases):
 
 ```bash
-wget https://github.com/doutsis/vmbackup/releases/download/v0.5.5/vmbackup_0.5.5_all.deb
-sudo dpkg -i vmbackup_0.5.5_all.deb
+wget https://github.com/doutsis/vmbackup/releases/download/v0.5.6/vmbackup_0.5.6_all.deb
+sudo dpkg -i vmbackup_0.5.6_all.deb
 ```
 
 ### From Source (any distro)
