@@ -5427,6 +5427,26 @@ cleanup_on_exit() {
     fi
   fi
 
+  # Slack notification on non-zero exit (parallel to the email path above).
+  if [[ $exit_code -ne 0 ]] && \
+     [[ -n "${SQLITE_CURRENT_SESSION_ID:-}" ]] && \
+     [[ "${_SLACK_SENT:-false}" != "true" ]] && \
+     [[ "$DRY_RUN" != true ]] && \
+     [[ -f "${SCRIPT_DIR}/modules/slack_notification_module.sh" ]]; then
+    # shellcheck source=/dev/null
+    source "${SCRIPT_DIR}/modules/slack_notification_module.sh"
+    if load_slack_config; then
+      local _slack_end_time
+      _slack_end_time=$(date '+%Y-%m-%d %H:%M:%S %Z')
+      if send_slack_notification "${session_start_time:-unknown}" "$_slack_end_time" "failed"; then
+        _SLACK_SENT=true
+        log_info "vmbackup.sh" "cleanup_on_exit" "Slack notification sent (cleanup path)"
+      else
+        log_warn "vmbackup.sh" "cleanup_on_exit" "Failed to send Slack notification from cleanup path"
+      fi
+    fi
+  fi
+
   log_info "vmbackup.sh" "cleanup_on_exit" "Cleaning up temporary files before exit (exit code: $exit_code)"
   
   # Remove stale lock files — only those whose owning process is no longer running.
@@ -5549,7 +5569,21 @@ handle_sigterm() {
       log_debug "vmbackup.sh" "handle_sigterm" "Email disabled or not configured for this instance"
     fi
   fi
-  
+
+  if [[ "$DRY_RUN" != true ]] && \
+     [[ "${_SLACK_SENT:-false}" != "true" ]] && \
+     [[ -f "${SCRIPT_DIR}/modules/slack_notification_module.sh" ]]; then
+    source "${SCRIPT_DIR}/modules/slack_notification_module.sh"
+    if load_slack_config; then
+      if send_slack_notification "${session_start_time:-unknown}" "$session_end_time" "failed"; then
+        log_info "vmbackup.sh" "handle_sigterm" "Slack notification sent"
+        _SLACK_SENT=true
+      else
+        log_warn "vmbackup.sh" "handle_sigterm" "Failed to send Slack notification"
+      fi
+    fi
+  fi
+
   exit 143
 }
 
@@ -5958,6 +5992,14 @@ _run_replicate_only() {
       _EMAIL_SENT=true
     else
       log_debug "vmbackup.sh" "main" "Email disabled or not configured"
+    fi
+  fi
+
+  if [[ -f "${SCRIPT_DIR}/modules/slack_notification_module.sh" ]]; then
+    source "${SCRIPT_DIR}/modules/slack_notification_module.sh"
+    if load_slack_config; then
+      send_slack_notification "$session_start_time" "$session_end_time" "$final_status" || true
+      _SLACK_SENT=true
     fi
   fi
 
@@ -6919,7 +6961,21 @@ main() {
   else
     log_debug "vmbackup.sh" "main" "Email report module not found - skipping email notification"
   fi
-  
+
+  if [[ "$DRY_RUN" == true ]]; then
+    log_info "vmbackup.sh" "main" "[DRY-RUN] Skipping Slack notification"
+  elif [[ -f "${SCRIPT_DIR}/modules/slack_notification_module.sh" ]]; then
+    source "${SCRIPT_DIR}/modules/slack_notification_module.sh"
+    if load_slack_config; then
+      if send_slack_notification "$session_start_time" "$session_end_time" "$overall_status"; then
+        log_info "vmbackup.sh" "main" "Slack notification sent"
+        _SLACK_SENT=true
+      else
+        log_warn "vmbackup.sh" "main" "Failed to send Slack notification"
+      fi
+    fi
+  fi
+
   if (( fail_count > 0 )); then
     log_error "vmbackup.sh" "main" "Session ended with failures - exit code 1"
     exit 1

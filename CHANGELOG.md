@@ -4,6 +4,12 @@ All notable changes to [vmbackup](https://github.com/doutsis/vmbackup) will be d
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Native Slack notifications** — New `modules/slack_notification_module.sh` and `config/template/slack.conf` add first-class Slack incoming-webhook delivery alongside the existing email path. Mirrors the email module's load/send shape (`load_slack_config` / `send_slack_notification`) and is invoked at the same four call sites (`cleanup_on_exit`, `handle_sigterm`, replicate-only end, normal session end) so failure-path notifications fire even when the run aborts before the normal end-of-main email send. Independent enable/conditional flags (`SLACK_ENABLED`, `SLACK_ON_SUCCESS`, `SLACK_ON_FAILURE`) let operators run Slack-only, email-only, or both. Session totals (VMs ok/failed/skipped/excluded, total bytes, duration) are pulled from the same `sessions` row the email module uses via `sqlite_query_session_summary`. Only runtime dependency is `curl`.
+
 ## [0.5.6] - 2026-04-26
 
 ### Changed
