@@ -5350,6 +5350,29 @@ _log_interrupted_chain() {
   fi
 }
 
+# Interpret a notifier return code from send_backup_report /
+# send_slack_notification: 0=sent, 1=transport failure, 2=intentionally
+# skipped (disabled, or *_ON_SUCCESS/_ON_FAILURE=no). Logs appropriately
+# and sets the named sent-guard variable so failure-path retries don't fire
+# after an intentional skip.
+# Args: $1 rc, $2 notifier label, $3 caller context, $4 guard var name
+_handle_notifier_rc() {
+  local rc="$1" label="$2" ctx="$3" guard_var="$4"
+  case "$rc" in
+    0)
+      printf -v "$guard_var" '%s' 'true'
+      log_info "vmbackup.sh" "$ctx" "$label sent"
+      ;;
+    2)
+      printf -v "$guard_var" '%s' 'true'
+      log_debug "vmbackup.sh" "$ctx" "$label skipped (disabled or per policy)"
+      ;;
+    *)
+      log_warn "vmbackup.sh" "$ctx" "Failed to send $label (rc=$rc)"
+      ;;
+  esac
+}
+
 # MEDIUM FIX #3: Cleanup handler for signal exits to remove temporary files
 cleanup_on_exit() {
   local exit_code=$?
@@ -5365,11 +5388,16 @@ cleanup_on_exit() {
     log_error "vmbackup.sh" "cleanup_on_exit" "  3. Next run will auto-cleanup stale locks and orphaned checkpoints"
   fi
   
-  # Finalize SQLite session if not already ended
-  # Normal exits finalize in main()/prune/replicate-only, but early errors,
-  # unhandled exits, or edge cases may skip those. This catch-all is safe
-  # because sqlite_session_end() has an idempotency guard (_SQLITE_SESSION_ENDED).
-  if sqlite_is_available 2>/dev/null && [[ -n "${SQLITE_CURRENT_SESSION_ID:-}" ]] && [[ "$DRY_RUN" != true ]]; then
+  # Finalize SQLite session if not already ended.
+  # main()/prune/replicate-only finalize on the normal exit path; this
+  # catch-all only fires for signal exits and early errors. Skip when the
+  # session was already finalized — otherwise the misleading "finalized as
+  # 'incomplete'" WARN is emitted even though sqlite_session_end()'s
+  # idempotency guard silently dropped the second call.
+  if sqlite_is_available 2>/dev/null && \
+     [[ -n "${SQLITE_CURRENT_SESSION_ID:-}" ]] && \
+     [[ "$DRY_RUN" != true ]] && \
+     [[ "${_SQLITE_SESSION_ENDED:-0}" != "1" ]]; then
     if [[ $exit_code -eq 130 ]] || [[ $exit_code -eq 143 ]]; then
       # Signal exit — count results from what we processed so far
       local int_total=0 int_success=0 int_failed=0 int_skipped=0 int_excluded=0
@@ -5414,14 +5442,10 @@ cleanup_on_exit() {
     # shellcheck source=/dev/null
     source "${SCRIPT_DIR}/modules/email_report_module.sh"
     if load_email_config; then
-      local _session_end_time
+      local _session_end_time _rc=0
       _session_end_time=$(date '+%Y-%m-%d %H:%M:%S %Z')
-      if send_backup_report "${session_start_time:-unknown}" "$_session_end_time" "failed"; then
-        _EMAIL_SENT=true
-        log_info "vmbackup.sh" "cleanup_on_exit" "Email report sent (cleanup path)"
-      else
-        log_warn "vmbackup.sh" "cleanup_on_exit" "Failed to send email report from cleanup path"
-      fi
+      send_backup_report "${session_start_time:-unknown}" "$_session_end_time" "failed" || _rc=$?
+      _handle_notifier_rc "$_rc" "email report (cleanup path)" "cleanup_on_exit" _EMAIL_SENT
     else
       log_debug "vmbackup.sh" "cleanup_on_exit" "Email disabled or not configured for this instance"
     fi
@@ -5436,14 +5460,10 @@ cleanup_on_exit() {
     # shellcheck source=/dev/null
     source "${SCRIPT_DIR}/modules/slack_notification_module.sh"
     if load_slack_config; then
-      local _slack_end_time
+      local _slack_end_time _rc=0
       _slack_end_time=$(date '+%Y-%m-%d %H:%M:%S %Z')
-      if send_slack_notification "${session_start_time:-unknown}" "$_slack_end_time" "failed"; then
-        _SLACK_SENT=true
-        log_info "vmbackup.sh" "cleanup_on_exit" "Slack notification sent (cleanup path)"
-      else
-        log_warn "vmbackup.sh" "cleanup_on_exit" "Failed to send Slack notification from cleanup path"
-      fi
+      send_slack_notification "${session_start_time:-unknown}" "$_slack_end_time" "failed" || _rc=$?
+      _handle_notifier_rc "$_rc" "Slack notification (cleanup path)" "cleanup_on_exit" _SLACK_SENT
     fi
   fi
 
@@ -5559,12 +5579,9 @@ handle_sigterm() {
     source "${SCRIPT_DIR}/modules/email_report_module.sh"
     if load_email_config; then
       log_info "vmbackup.sh" "handle_sigterm" "Sending email report before SIGTERM exit..."
-      if send_backup_report "${session_start_time:-unknown}" "$session_end_time" "failed"; then
-        log_info "vmbackup.sh" "handle_sigterm" "Email report sent successfully"
-        _EMAIL_SENT=true
-      else
-        log_warn "vmbackup.sh" "handle_sigterm" "Failed to send email report"
-      fi
+      local _rc=0
+      send_backup_report "${session_start_time:-unknown}" "$session_end_time" "failed" || _rc=$?
+      _handle_notifier_rc "$_rc" "email report" "handle_sigterm" _EMAIL_SENT
     else
       log_debug "vmbackup.sh" "handle_sigterm" "Email disabled or not configured for this instance"
     fi
@@ -5575,12 +5592,9 @@ handle_sigterm() {
      [[ -f "${SCRIPT_DIR}/modules/slack_notification_module.sh" ]]; then
     source "${SCRIPT_DIR}/modules/slack_notification_module.sh"
     if load_slack_config; then
-      if send_slack_notification "${session_start_time:-unknown}" "$session_end_time" "failed"; then
-        log_info "vmbackup.sh" "handle_sigterm" "Slack notification sent"
-        _SLACK_SENT=true
-      else
-        log_warn "vmbackup.sh" "handle_sigterm" "Failed to send Slack notification"
-      fi
+      local _rc=0
+      send_slack_notification "${session_start_time:-unknown}" "$session_end_time" "failed" || _rc=$?
+      _handle_notifier_rc "$_rc" "Slack notification" "handle_sigterm" _SLACK_SENT
     fi
   fi
 
@@ -5988,8 +6002,9 @@ _run_replicate_only() {
     source "${SCRIPT_DIR}/modules/email_report_module.sh"
     if load_email_config; then
       log_info "vmbackup.sh" "main" "Sending email report to $EMAIL_RECIPIENT"
-      send_backup_report "$session_start_time" "$session_end_time" "$final_status" || true
-      _EMAIL_SENT=true
+      local _rc=0
+      send_backup_report "$session_start_time" "$session_end_time" "$final_status" || _rc=$?
+      _handle_notifier_rc "$_rc" "email report" "main" _EMAIL_SENT
     else
       log_debug "vmbackup.sh" "main" "Email disabled or not configured"
     fi
@@ -5998,8 +6013,9 @@ _run_replicate_only() {
   if [[ -f "${SCRIPT_DIR}/modules/slack_notification_module.sh" ]]; then
     source "${SCRIPT_DIR}/modules/slack_notification_module.sh"
     if load_slack_config; then
-      send_slack_notification "$session_start_time" "$session_end_time" "$final_status" || true
-      _SLACK_SENT=true
+      local _rc=0
+      send_slack_notification "$session_start_time" "$session_end_time" "$final_status" || _rc=$?
+      _handle_notifier_rc "$_rc" "Slack notification" "main" _SLACK_SENT
     fi
   fi
 
@@ -6949,12 +6965,9 @@ main() {
     
     if load_email_config; then
       log_info "vmbackup.sh" "main" "Sending email report to $EMAIL_RECIPIENT"
-      if send_backup_report "$session_start_time" "$session_end_time" "$overall_status"; then
-        log_info "vmbackup.sh" "main" "Email report sent successfully"
-        _EMAIL_SENT=true
-      else
-        log_warn "vmbackup.sh" "main" "Failed to send email report (backup data preserved)"
-      fi
+      local _rc=0
+      send_backup_report "$session_start_time" "$session_end_time" "$overall_status" || _rc=$?
+      _handle_notifier_rc "$_rc" "email report" "main" _EMAIL_SENT
     else
       log_debug "vmbackup.sh" "main" "Email disabled or not configured for this instance"
     fi
@@ -6967,12 +6980,9 @@ main() {
   elif [[ -f "${SCRIPT_DIR}/modules/slack_notification_module.sh" ]]; then
     source "${SCRIPT_DIR}/modules/slack_notification_module.sh"
     if load_slack_config; then
-      if send_slack_notification "$session_start_time" "$session_end_time" "$overall_status"; then
-        log_info "vmbackup.sh" "main" "Slack notification sent"
-        _SLACK_SENT=true
-      else
-        log_warn "vmbackup.sh" "main" "Failed to send Slack notification"
-      fi
+      local _rc=0
+      send_slack_notification "$session_start_time" "$session_end_time" "$overall_status" || _rc=$?
+      _handle_notifier_rc "$_rc" "Slack notification" "main" _SLACK_SENT
     fi
   fi
 
