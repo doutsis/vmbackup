@@ -4,6 +4,12 @@ All notable changes to [vmbackup](https://github.com/doutsis/vmbackup) will be d
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`VIRTNBD_FALSE_SUCCESS` false-positive on Windows VMs with BitLocker** — The post-backup ERROR-line scan in `perform_backup()` used a case-insensitive substring match (`grep -qi "ERROR"`), which fired on the word "ERROR" appearing inside INFO/WARN payloads. On Windows VMs the QEMU guest agent surfaces BitLocker status text containing the word during normal operation, marking otherwise-successful backups as failed and triggering retries / spurious alert noise. The check is now anchored to the timestamped severity prefix (`^[YYYY-MM-DD HH:MM:SS] ERROR `) so only real `ERROR`-level records trigger the guard, with ANSI colour escapes stripped first so coloured output still matches. Same fix applied to the diagnostic snippet extraction.
+
 ## [0.5.6] - 2026-04-26
 
 ### Changed

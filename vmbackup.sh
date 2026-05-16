@@ -3587,13 +3587,18 @@ perform_backup() {
       pkill -P $monitor_pid 2>/dev/null || true
       kill $monitor_pid 2>/dev/null || true
       
-      # virtnbdbackup sometimes exits 0 despite logging ERROR lines (e.g.,
-      # "target directory already contains full or copy backup", bitmap
-      # conflicts, extent read failures). Scan the captured log for any
-      # ERROR line and treat it as a backup failure.
-      if [[ -f "$backup_log" ]] && grep -qi "ERROR" "$backup_log" 2>/dev/null; then
+      # virtnbdbackup sometimes exits 0 despite logging ERROR lines. Anchor
+      # the match to the timestamped severity prefix so the word "ERROR"
+      # appearing inside INFO/WARN payloads (e.g. Windows guest-agent
+      # BitLocker status) doesn't produce a false failure. Strip ANSI
+      # colour escapes first so coloured output still matches.
+      if [[ -f "$backup_log" ]] && \
+         sed -E 's/\x1b\[[0-9;]*m//g' "$backup_log" | \
+         grep -qE '^\[[0-9-]{10} [0-9:]{8}\] ERROR ' 2>/dev/null; then
           local error_lines
-          error_lines=$(grep -i "ERROR" "$backup_log" 2>/dev/null | tail -3 | tr '\n' ' ' | cut -c1-200)
+          error_lines=$(sed -E 's/\x1b\[[0-9;]*m//g' "$backup_log" | \
+              grep -E '^\[[0-9-]{10} [0-9:]{8}\] ERROR ' 2>/dev/null | \
+              tail -3 | tr '\n' ' ' | cut -c1-200)
           log_error "vmbackup.sh" "perform_backup" \
               "virtnbdbackup exited 0 but logged ERROR(s) for VM $vm_name: $error_lines"
           set_backup_error "VIRTNBD_FALSE_SUCCESS" \
