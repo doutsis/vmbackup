@@ -6,6 +6,7 @@ case "$1" in
     configure)
         # Create symlink in PATH
         ln -sf /opt/vmbackup/vmbackup.sh /usr/local/bin/vmbackup
+        ln -sf /opt/vmbackup/vmrestore.sh /usr/local/bin/vmrestore
 
         # =====================================================================
         # SECURITY HARDENING
@@ -34,6 +35,11 @@ case "$1" in
         mkdir -p /var/log/vmbackup
         chown root:backup /var/log/vmbackup
         chmod 750 /var/log/vmbackup
+
+        # vmrestore log directory (parallel to vmbackup's, same ownership)
+        mkdir -p /var/log/vmrestore
+        chown root:backup /var/log/vmrestore
+        chmod 750 /var/log/vmrestore
 
         # Create run directory for lock files
         mkdir -p /run/vmbackup
@@ -147,8 +153,15 @@ case "$1" in
             fi
         fi
 
+        # DUP-10: reap stale chain-manifest.json files left over from
+        # pre-decommission backups. Best-effort, never blocks the upgrade.
+        # No-op on fresh installs (BACKUP_PATH has no pre-DUP-10 artefacts).
+        if [ -x /opt/vmbackup/vmbackup.sh ]; then
+            /opt/vmbackup/vmbackup.sh --cleanup-stale-manifests >/dev/null 2>&1 || true
+        fi
+
         echo ""
-        echo "=== vmbackup $(cat /opt/vmbackup/vmbackup.sh | grep '^VMBACKUP_VERSION=' | sed 's/.*"\(.*\)"/\1/') installed ==="
+        echo "=== vmbackup $(grep '^[[:space:]]*readonly[[:space:]]\+VMBACKUP_VERSION=' /opt/vmbackup/lib/version.sh | head -1 | sed 's/.*"\(.*\)"/\1/') installed ==="
         echo ""
         echo "  Install path:  /opt/vmbackup/"
         echo "  Command:       vmbackup --version"

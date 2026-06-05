@@ -1,28 +1,36 @@
-# vmbackup — Automated KVM/libvirt Backup Manager
+# vmbackup and vmrestore — KVM/libvirt Backup and Restore Manager
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Version](https://img.shields.io/github/v/release/doutsis/vmbackup)](https://github.com/doutsis/vmbackup/releases)
 
-The backup half of the [vmbackup](https://github.com/doutsis/vmbackup) / [vmrestore](https://github.com/doutsis/vmrestore) ecosystem. Automated backup manager for KVM/libvirt virtual machines, built on [virtnbdbackup](https://github.com/abbbi/virtnbdbackup).
+Automated backup and restore for KVM/libvirt virtual machines, built on [virtnbdbackup](https://github.com/abbbi/virtnbdbackup) / [virtnbdrestore](https://github.com/abbbi/virtnbdbackup?tab=readme-ov-file#restore-examples). `vmbackup` automates virtnbdbackup — scheduling, rotation, retention, backup validation, replication and reporting. `vmrestore` automates virtnbdrestore — disaster recovery, clone restores and point-in-time recovery. Both are in this one package.
 
-vmbackup automates virtnbdbackup — scheduling, rotation, retention, backup validation, replication and reporting. It works on personal machines, homelabs and production KVM hosts alike. For restores, see [vmrestore](https://github.com/doutsis/vmrestore).
+## One package, two commands
 
-## Why vmbackup
+vmbackup and vmrestore are now one package, two commands. They install together, upgrade together, and never drift out of step. If you previously installed vmrestore separately, the new package replaces it cleanly with no configuration changes and no migration steps. Every existing flag, configuration file, systemd unit and runbook keeps working as before.
 
-virtnbdbackup handles the hard part but it operates on one VM at a time with no scheduling, no retention management and no replication. If you run more than a couple of VMs you end up writing your own wrapper scripts for rotation, cleanup, backup validation and email alerts.
+You get a few real wins from this:
 
-vmbackup is that wrapper. It orchestrates virtnbdbackup across your entire fleet and handles everything around it — backup validation, failure recovery, multi-destination replication and reporting.
+- **One install gives vmbackup *and* vmrestore.** No second download to remember, no version mismatch to chase.
+- **vmrestore now knows about your backups.** It reads the same catalogue vmbackup writes, so `vmrestore --list` shows chain health and last-backup time alongside what's available to restore — and it falls back to walking the disk if the catalogue isn't there, so disaster recovery on a fresh host still works exactly as it always has.
+- **Restore history is queryable.** Every restore is recorded; `vmbackup --status --restores` shows you what was restored, when, in which mode, and whether it succeeded.
+- **Backup and restore can't trip over each other.** They share a per-VM lock, so kicking off a restore while a backup is running (or vice versa) waits cleanly instead of corrupting either operation.
+
+See [CHANGELOG.md](CHANGELOG.md) for the full list of changes.
 
 ## Quick Start
 
-**Prerequisite:** vmbackup requires [virtnbdbackup](https://github.com/abbbi/virtnbdbackup) (≥ 2.28) — install it first: **[installation instructions](https://github.com/abbbi/virtnbdbackup?tab=readme-ov-file#installation)**
+**Prerequisite:** vmbackup requires [virtnbdbackup](https://github.com/abbbi/virtnbdbackup) — install it first: **[installation instructions](https://github.com/abbbi/virtnbdbackup?tab=readme-ov-file#installation)**
 
 **Debian / Ubuntu:**
 
+Download the latest `.deb` from [Releases](https://github.com/doutsis/vmbackup/releases) and install:
+
 ```bash
-wget https://github.com/doutsis/vmbackup/releases/download/v0.5.6/vmbackup_0.5.6_all.deb
-sudo dpkg -i vmbackup_0.5.6_all.deb
+sudo dpkg -i vmbackup_*_all.deb
 ```
+
+This installs both `vmbackup` (backup) and `vmrestore` (restore). If you have the old standalone `vmrestore` package installed, `apt` removes it automatically.
 
 **Any distro (Arch, Fedora, openSUSE, etc.):**
 
@@ -36,40 +44,82 @@ Then edit `/opt/vmbackup/config/default/vmbackup.conf` to set your backup path a
 
 ```bash
 sudo vmbackup --run                        # run a backup now
-sudo systemctl start vmbackup.timer      # enable the daily schedule
+sudo systemctl start vmbackup.timer        # enable the daily schedule
+
+sudo vmrestore --list                      # see what's available to restore
+sudo vmrestore --vm web --restore-path /var/lib/libvirt/images   # restore in place
 ```
 
-For the full step-by-step walkthrough — backup path setup, per-VM overrides, email, replication and more — see the [Quick Setup Guide](vmbackup.md#quick-setup-guide) in the detailed documentation.
+For the full step-by-step walkthrough — backup path setup, per-VM overrides, email, replication and more — see the [Quick Setup Guide](vmbackup.md#quick-setup-guide).
+
+## Why vmbackup + vmrestore
+
+`virtnbdbackup` and `virtnbdrestore` handle the hard part: getting consistent block-level data in and out of a running VM. They operate on one VM at a time and leave everything around them to you — scheduling, rotation, retention, replication, alerting, identity handling on restore, NVRAM and TPM, collision detection, integrity checks. If you run more than a couple of VMs you end up writing wrapper scripts.
+
+This is that wrapper, for both directions.
+
+- **vmbackup** runs `virtnbdbackup` across your entire fleet automatically — discovers every VM, manages full and incremental chains, rotates by period, enforces retention, replicates to local and cloud destinations, emails you a summary and keeps a queryable history of everything that's happened.
+- **vmrestore** runs `virtnbdrestore` — single-command disaster recovery, clone restores with new identity, point-in-time recovery to any checkpoint, single-disk surgical restores, and pre-flight safety checks at every step.
+
+Backups are only as good as your ability to restore them. Both halves are designed, built, tested and released together.
 
 ## Features
 
-- **Every VM, automatically** — discovers and backs up all VMs on the host. No manifest to maintain — new VMs are picked up on the next run
-- **Targeted backup** — back up one or more specific VMs on demand with `--vm`, without waiting for the full scheduled run
-- **Full + incremental, zero decisions** — first backup is a full; every backup after that is an incremental. Period boundaries (daily, weekly, monthly) trigger a fresh full automatically
-- **Self-healing** — failed incrementals convert to fulls, broken chains are archived and restarted, interrupted runs clean up after themselves. Scheduled backups should never need manual intervention
-- **Multi-destination replication** — rsync to any mounted filesystem, rclone to cloud. Failed replication can be re-run independently without repeating a backup
-- **TPM and BitLocker handled** — TPM state and BitLocker recovery keys are extracted and stored alongside each VM backup
-- **FSTRIM optimisation** — trims guest filesystems via the QEMU agent before backup so qcow2 images compress better and incrementals are smaller. Per-path logging, configurable minimum extent, per-VM exclusions, and automatic detection of missing Windows VirtIO `discard_granularity` overrides
-- **Status at a glance** — query backup history, failures, chain health, storage and retention policies from the command line with `--status`. Human-readable terminal tables by default, `--csv` for export
-- **Paired with vmrestore** — single-command disaster recovery, clones and point-in-time restores via [vmrestore](https://github.com/doutsis/vmrestore)
-- **Minimal dependencies** — pure Bash + SQLite with no additional runtimes, frameworks or services to install. If your host runs libvirt, vmbackup runs too
+### vmbackup
+
+- **Every VM, automatically** — discovers and backs up every VM on the host. No manifest to maintain — new VMs are picked up on the next run.
+- **Targeted backup** — back up one or more specific VMs on demand with `--vm`, without waiting for the scheduled run.
+- **Full + incremental, zero decisions** — first backup is a full, every backup after that is an incremental, period boundaries trigger a fresh full automatically.
+- **Self-healing** — failed incrementals convert to fulls, broken chains are archived and restarted, interrupted runs clean up after themselves. Scheduled backups should never need manual intervention.
+- **Multi-destination replication** — rsync to any mounted filesystem, rclone to cloud. Failed replication can be re-run independently without repeating a backup.
+- **TPM and BitLocker handled** — TPM state and BitLocker recovery keys are extracted and stored alongside each VM backup.
+- **FSTRIM optimisation** — trims guest filesystems via the QEMU agent before backup so qcow2 images compress better and incrementals are smaller.
+- **Status at a glance** — query backup sessions, VM history, failures, replication, chain health, storage, retention policies and restore history from the command line with `--status`. Human-readable tables by default, `--csv` for export.
+
+### vmrestore
+
+- **Disaster recovery** — rebuild a destroyed VM from any backup chain.
+- **Clone restores** — stand up an isolated copy with a new name, no identity conflicts.
+- **Point-in-time recovery** — roll back to any incremental checkpoint in the chain.
+- **Single-disk restore** — surgical recovery of one disk without touching the rest.
+- **Identity preserved correctly** — original UUID, MAC addresses, TPM state, NVRAM and BitLocker keys are restored to the right places. Clones get fresh identity, isolated NVRAM and no UEFI key collisions.
+- **NVRAM and disk stay in sync** — restores pair the per-checkpoint NVRAM with the matching disk state so the VM boots into the firmware view it had at that point in time.
+- **Catalogue-aware listing** — `vmrestore --list` reads chain health from the same database vmbackup populates; broken or incomplete chains are flagged before you commit to a restore.
+- **Pre-flight safety** — dry-run mode, collision detection, disk integrity checks, backup-path overlap guards, and detailed logging at every step.
+
+### Both
+
+- **One install, one version.** Same package, same configuration directory, same catalogue. Per-VM locks are shared so backup and restore never race.
+- **Lightweight** — pure Bash, SQLite and minimal dependencies. No extra runtimes, frameworks or services. If your host runs libvirt, vmbackup runs.
 
 ## How It Works
+
+### Backup lifecycle
 
 vmbackup wraps `virtnbdbackup` and manages the full backup lifecycle:
 
 1. **Discovery** — queries libvirt for every VM on the host and applies your include/exclude filters. New VMs are picked up automatically.
-2. **Backup** — runs full or incremental backups per VM based on what already exists on disk. Per-VM overrides let you set different policies or exclude individual VMs entirely.
-3. **Rotation** — organises backups into period-based directories. Daily, weekly and monthly policies archive the previous period and start a fresh full automatically. The accumulate policy runs incrementals indefinitely until a configurable limit is reached. Per-VM overrides apply here too.
+2. **Backup** — runs full or incremental backups per VM based on what already exists on disk. Per-VM overrides let you set different policies or exclude individual VMs.
+3. **Rotation** — organises backups into period-based directories. Daily, weekly and monthly policies archive the previous period and start a fresh full automatically. The accumulate policy runs incrementals indefinitely until a configurable limit is reached.
 4. **Retention** — removes expired archives based on configurable age and count limits per policy. Runs after every backup so storage stays predictable without manual cleanup.
-5. **Replication** — copies the backup tree to local and cloud destinations so backups exist in more than one place. Local targets use rsync; cloud targets use rclone. Both can run in parallel. If replication fails or is interrupted, it can be re-run independently without repeating the backup.
-6. **Reporting** — sends an email summary with per-VM status, duration, errors and replication results. Between backup windows, `--status` gives instant read-only access to the same data from the command line.
+5. **Replication** — copies the backup tree to local and cloud destinations so backups exist in more than one place. Local targets use rsync, cloud targets use rclone, both can run in parallel.
+6. **Reporting** — sends an email summary with per-VM status, duration, errors and replication results. Between runs, `--status` gives you instant read-only access to the same data.
+
+### Restore lifecycle
+
+vmrestore wraps `virtnbdrestore`:
+
+1. **Discovery** — `--list` walks the backup tree and, if available, consults the catalogue to surface chain health, last-backup timestamp and broken-chain warnings.
+2. **Pre-flight** — checks the restore path against every configured `BACKUP_PATH` (refuses overlap), validates the target chain is complete, and previews the action under `--dry-run`.
+3. **Restore** — reconstructs disk state across full and incremental chains via `virtnbdrestore`, pairs the disks with the matching per-checkpoint NVRAM, restores TPM state with the right ownership, and refreshes the libvirt storage pool.
+4. **Identity** — preserves original UUID and MAC for in-place restores; assigns fresh UUID and MAC for `--name` clones, with isolated NVRAM so UEFI keys don't collide.
+5. **Audit** — records the restore in the catalogue so `vmbackup --status --restores` can show you it happened.
 
 ## Installation
 
 ### Prerequisites
 
-vmbackup is a wrapper around [virtnbdbackup](https://github.com/abbbi/virtnbdbackup) — it **will not function without it**. Install virtnbdbackup (≥2.28) first:
+vmbackup is a wrapper around [virtnbdbackup](https://github.com/abbbi/virtnbdbackup) — it **will not function without it**. Install virtnbdbackup first:
 
 > **[virtnbdbackup installation instructions](https://github.com/abbbi/virtnbdbackup?tab=readme-ov-file#installation)**
 
@@ -80,9 +130,10 @@ Also requires `bash >= 5.0`, `libvirt-daemon-system`, `qemu-utils`, `sqlite3` an
 Download the latest `.deb` from [Releases](https://github.com/doutsis/vmbackup/releases):
 
 ```bash
-wget https://github.com/doutsis/vmbackup/releases/download/v0.5.6/vmbackup_0.5.6_all.deb
-sudo dpkg -i vmbackup_0.5.6_all.deb
+sudo dpkg -i vmbackup_*_all.deb
 ```
+
+If you have the old standalone `vmrestore` package installed, `apt` removes it automatically — no manual intervention required.
 
 ### From Source (any distro)
 
@@ -93,9 +144,9 @@ sudo make install
 ```
 
 Both methods install to `/opt/vmbackup/` and set up:
-- `vmbackup` command in PATH
+- `vmbackup` and `vmrestore` commands in PATH
 - `root:backup` ownership with restricted permissions
-- systemd service and timer units
+- systemd service and timer units (`vmbackup.service`, `vmbackup.timer`)
 - AppArmor profile for libvirt/QEMU integration
 
 ### Uninstall
@@ -129,64 +180,54 @@ All configuration lives in `/opt/vmbackup/config/`. Each config directory is a n
 | `exclude_patterns.conf` | Wildcard rules to exclude VMs by name (e.g. `test-*`) |
 | `fstrim_exclude.conf` | VM name patterns to exclude from pre-backup FSTRIM |
 
-The `default/` instance is used when vmbackup runs without `--config-instance`. The `template/` directory contains fully documented reference configs — copy it to create a new instance:
+`vmrestore` reads the same instance configuration — `--config-instance prod` works the same way it does for `vmbackup`, and pulls `BACKUP_PATH` from the same `vmbackup.conf`.
+
+The `default/` instance is used when no `--config-instance` is given. The `template/` directory contains fully documented reference configs — copy it to create a new instance:
 
 ```bash
 cp -r /opt/vmbackup/config/template /opt/vmbackup/config/prod
 vmbackup --run --config-instance prod
+vmrestore --list --config-instance prod
 ```
-
-This lets you run separate configurations (e.g. dev, staging, prod) from the same installation.
 
 ### VM discovery and exclusion
 
-vmbackup discovers and backs up every VM on the host automatically. You don't maintain a list of VMs to back up — if libvirt knows about it, vmbackup backs it up.
-
-To give a specific VM a different rotation policy or exclude it entirely, add an entry to `vm_overrides.conf`. This is the right place for permanent, per-VM decisions — a production database that needs daily rotation while everything else runs monthly, or a template VM that should never be backed up.
-
-To exclude VMs by naming convention, add wildcard rules to `exclude_patterns.conf`. Patterns like `test-*` or `*-clone-*` let you skip entire classes of VMs without listing each one individually. Useful when test or scratch VMs are created and destroyed frequently.
+vmbackup discovers and backs up every VM on the host automatically. To give a specific VM a different rotation policy or exclude it entirely, add an entry to `vm_overrides.conf`. To exclude VMs by naming convention, add wildcard rules to `exclude_patterns.conf`.
 
 ### Self-healing
 
-vmbackup validates backup state, data integrity and lock health at the start of every run. If an incremental backup fails, it converts to a full and retries. If the backup sequence is broken, it archives what's there and starts fresh. If a previous run was interrupted, stale locks and partial files are cleaned up automatically. Scheduled backups should never require manual intervention to get back on track.
+vmbackup validates backup state, data integrity and lock health at the start of every run. If an incremental backup fails it converts to a full and retries. If the backup sequence is broken, it archives what's there and starts fresh. If a previous run was interrupted, stale locks and partial files are cleaned up automatically.
 
 ### Usage
 
 Once configured, vmbackup runs unattended via the systemd timer. For manual runs and operational tasks:
 
 ```bash
-# Run a backup using the default config (config/default/)
-sudo vmbackup --run
+# Backup
+sudo vmbackup --run                                  # default instance
+sudo vmbackup --run --config-instance prod           # named instance
+sudo vmbackup --run --dry-run                        # preview only
+sudo vmbackup --run --vm web,db                      # specific VMs
+sudo vmbackup --replicate-only                       # re-run replication
+sudo vmbackup --prune list                           # on-demand cleanup
 
-# Run using a named config instance (config/prod/)
-sudo vmbackup --run --config-instance prod
+# Status (read-only, no locks, no session)
+sudo vmbackup --status                               # today's sessions
+sudo vmbackup --status --failures --days 7           # recent failures
+sudo vmbackup --status --chains                      # chain health
+sudo vmbackup --status --restores                    # restore history
+sudo vmbackup --status --storage --csv               # storage as CSV
 
-# Preview what a backup would do without writing anything
-sudo vmbackup --run --dry-run
-
-# Cancel replication on a running session (backups continue)
-sudo vmbackup --cancel-replication
-
-# Back up a specific VM (replication skipped)
-sudo vmbackup --run --vm web
-
-# Back up multiple VMs
-sudo vmbackup --run --vm web,db,mail
-
-# Re-run replication without repeating the backup
-sudo vmbackup --replicate-only
-
-# Clean up archived chains and old periods
-sudo vmbackup --prune list
-
-# Check backup status (no locks, no session — read-only)
-sudo vmbackup --status                        # today's sessions
-sudo vmbackup --status --failures --days 7     # failures last 7 days
-sudo vmbackup --status --storage               # storage per VM
-sudo vmbackup --status --chains --csv          # chain health as CSV
+# Restore
+sudo vmrestore --list                                # what's available
+sudo vmrestore --vm web --restore-path /var/lib/libvirt/images        # in-place
+sudo vmrestore --vm web --name web-clone --restore-path /scratch/     # clone
+sudo vmrestore --vm web --restore-point 7 --restore-path /scratch/    # point-in-time
+sudo vmrestore --vm web --disk vda --restore-path /scratch/           # single disk
+sudo vmrestore --vm web --restore-path /scratch/ --dry-run            # preview
 ```
 
-All commands accept `--config-instance` and `--dry-run`. See [vmbackup.md](vmbackup.md) for the full CLI reference.
+All commands accept `--config-instance` and `--dry-run`. See [vmbackup.md](vmbackup.md) and [vmrestore.md](vmrestore.md) for the full CLI reference.
 
 ## VM State Handling
 
@@ -203,27 +244,27 @@ Shut off VMs are only backed up when their disk has changed since the last backu
 
 ## Rotation & Retention
 
-Rotation policies control how backups are organised and when old data is removed:
-
 | Policy | Behaviour |
 |--------|-----------|
 | `daily` | Archives existing backups when the date changes and starts a fresh full. Keeps 7 daily folders by default. |
 | `weekly` | Archives existing backups at the start of a new ISO week. Keeps 4 weekly folders by default. |
 | `monthly` | Archives existing backups at the start of a new month. Keeps 3 monthly folders by default. This is the default policy. |
-| `accumulate` | Backups accumulate indefinitely with no scheduled archival. When the number of incremental backups hits the hard limit (default 365) they are automatically archived and a fresh full backup starts. |
-| `never` | VM is excluded from backup entirely. Use for templates, scratch VMs or anything you don't want backed up. |
+| `accumulate` | Backups accumulate indefinitely. When the number of incremental backups hits the hard limit (default 365) they are automatically archived and a fresh full starts. |
+| `never` | VM is excluded from backup entirely. |
 
-The default rotation policy is set in `vmbackup.conf` and applies to all VMs. Individual VMs can be assigned a different policy in `vm_overrides.conf`. Retention is enforced per policy.
+The default rotation policy is set in `vmbackup.conf` and applies to all VMs. Individual VMs can be assigned a different policy in `vm_overrides.conf`.
 
 ### Manual cleanup
 
-Automated retention runs after each backup, but sometimes you need to reclaim space on demand — remove archived chains, clean up old periods or wipe a decommissioned VM entirely. `--prune` handles this without running a backup session. All operations support `--dry-run` to preview, `--yes` to skip confirmation, and a keep-last guard that prevents removing the last period. See [vmbackup.md](vmbackup.md#on-demand-cleanup---prune) for the full target reference.
+`vmbackup --prune <target>` removes archived chains, cleans up old periods or wipes a decommissioned VM. All operations support `--dry-run` to preview, `--yes` to skip confirmation, and a keep-last guard. See [vmbackup.md](vmbackup.md#on-demand-cleanup---prune) for the full target reference.
 
 ## TPM & BitLocker Support
 
 For VMs with emulated TPM (Windows BitLocker, Linux Secure Boot), vmbackup backs up TPM state from `/var/lib/libvirt/swtpm/` alongside each VM backup. TPM state is deduplicated — unchanged state is symlinked to the previous copy rather than stored again.
 
-For Windows VMs with BitLocker, vmbackup uses the QEMU guest agent to extract recovery keys from the running guest automatically. The keys are stored alongside the TPM state so they're available if the TPM becomes unusable after restore — new UUID, hardware change or TPM corruption. If the guest agent isn't installed or the VM isn't running, extraction is skipped silently without blocking the backup.
+For Windows VMs with BitLocker, vmbackup uses the QEMU guest agent to extract recovery keys from the running guest automatically. The keys are stored alongside the TPM state so they're available if the TPM becomes unusable after restore.
+
+On the restore side, vmrestore restores TPM state with correct ownership and mode isolation, pairs the per-checkpoint NVRAM with the matching disk state, and reports TPM unlock outcome honestly in the summary.
 
 ## Security
 
@@ -246,17 +287,21 @@ If you also want non-root access to `virsh list` and other libvirt commands, add
 sudo usermod -aG backup,libvirt myuser
 ```
 
+### Privilege model
+
+`vmbackup` requires root for the whole run — it needs `virsh`, qemu sockets, write access to backup data, catalogue writes and per-VM locks.
+
+`vmrestore` is intentionally asymmetric. `--list`, `--dump` and disk extraction to a user-writable scratch path are supported as a regular user against a readable backup tree. Only the final `virsh define` and start step needs root, and that step fails with a clear libvirt error if invoked unprivileged. This supports disaster-recovery-on-a-recovery-host scenarios where you want to inspect or extract from a backup tree without privilege escalation.
+
 ### SGID and permissions
 
-Backup directories use the SGID bit (mode `2750`, shown as `drwxr-s---`). When SGID is set on a directory, every new file and subdirectory automatically inherits the `backup` group — no post-hoc `chown` is needed. Combined with `umask 027`, the result is files at `640` and directories at `2750` with `root:backup` ownership throughout.
-
-On first run, vmbackup detects that `BACKUP_PATH` lacks SGID and applies it automatically. From that point forward, SGID propagates to all subdirectories created by vmbackup, virtnbdbackup or any other child process.
+Backup directories use the SGID bit (mode `2750`). When SGID is set on a directory, every new file and subdirectory automatically inherits the `backup` group. Combined with `umask 027`, the result is files at `640` and directories at `2750` with `root:backup` ownership throughout.
 
 | Layer | Mechanism |
 |-------|-----------|
 | Script | `umask 027` — files `640`, dirs `750` |
 | Directories | SGID bit (`2750`) — group inheritance propagates to all new files and subdirectories |
-| systemd | `UMask=0027` — belt-and-suspenders with the in-script umask |
+| systemd | `UMask=0027` — belt-and-braces with the in-script umask |
 | Package | `install -m 750/640` — nothing is world-accessible |
 | AppArmor | Profile for libvirt/QEMU NBD socket access |
 
@@ -264,9 +309,11 @@ On first run, vmbackup detects that `BACKUP_PATH` lacks SGID and applies it auto
 
 TPM private keys and BitLocker recovery keys are isolated from the backup group. The `tpm-state/` directory has SGID stripped and contents are owned `root:root` with mode `600`. A user in the `backup` group can browse the backup tree and read VM configs and logs but cannot read TPM keys or BitLocker recovery keys.
 
-## SQLite Logging
+## SQLite Catalogue
 
-All backup activity is logged to a SQLite database at `$BACKUP_PATH/_state/vmbackup.db`. The database tracks sessions, per-VM results, replication runs, retention actions and backup health events. This enables queries like "last successful backup per VM" or "total bytes replicated this month" without parsing log files.
+All backup and restore activity is logged to a SQLite database at `$BACKUP_PATH/_state/vmbackup.db`. The database tracks sessions, per-VM results, replication runs, retention actions, backup health events and restore sessions. Both `vmbackup` and `vmrestore` read and write through the same catalogue, so the entire backup-and-restore history is queryable from one place — no parsing of log files required.
+
+`vmbackup --status` covers eight report modes: sessions, VM history, failures, replication, chains, storage, policies and restores.
 
 ## Replication
 
@@ -276,25 +323,17 @@ Replication runs after backup completes. Local and cloud replication operate ind
 
 **Cloud replication** uses rclone to sync to SharePoint, Backblaze B2, S3, or any rclone-supported backend. Currently ships with a SharePoint transport driver.
 
-Both systems use a pluggable transport architecture. New local transports can be added by implementing five functions (`init`, `sync`, `verify`, `cleanup`, `get_free_space`) and a metrics contract. New cloud transports are added by implementing the cloud transport function and metrics contracts. See the full transport interface in [vmbackup.md](vmbackup.md#transport-function-contract).
+Both systems use a pluggable transport architecture — new transports are added by implementing a small function contract. See [vmbackup.md](vmbackup.md#transport-function-contract).
 
-### Run replication on demand
-
-Replication normally runs at the end of each backup session, but `--replicate-only` lets you trigger it independently. Useful when pre-seeding a new destination before the first scheduled run, adding a destination to an existing setup, or re-running replication that was interrupted or cancelled during a backup. Scope can be narrowed to `local` or `cloud` only. No VMs are touched and no retention runs. See [vmbackup.md](vmbackup.md#standalone-replication---replicate-only) for the full reference.
-
-## Restoring
-
-vmbackup and [vmrestore](https://github.com/doutsis/vmrestore) are two halves of one system. vmbackup backs up — vmrestore restores. They share no code and have no runtime coupling, but vmrestore exclusively restores backups created by vmbackup.
-
-vmrestore provides single-command disaster recovery, clone restores and point-in-time recovery — with full identity management, TPM/BitLocker support and pre-flight safety checks.
-
-```bash
-sudo vmrestore --vm my-vm --restore-path /var/lib/libvirt/images
-```
+Replication normally runs at the end of each backup session, but `--replicate-only` lets you trigger it independently. Useful when pre-seeding a new destination, adding a destination to an existing setup, or re-running replication that was interrupted.
 
 ## Tested
 
-vmbackup and [vmrestore](https://github.com/doutsis/vmrestore) are tested end-to-end on a fleet of Linux and Windows VMs across multiple config instances. Tests are destructive — VMs are backed up, checkpointed, destroyed and restored from scratch — validating the full lifecycle from first backup to disaster recovery.
+vmbackup and vmrestore are tested end-to-end against a fleet of real Linux and Windows guests. The harness builds and installs the package, then drives the public CLI of both commands through a matrix of backup, restore and failure scenarios — the same paths a real operator would take.
+
+### Proof, not just exit codes
+
+The headline test isn't "did the command return zero" — it's "did the right bytes come back". Before each backup, the harness plants a unique witness file inside every guest. After restoring, it boots the restored clone and reads that file back through the QEMU guest agent. A point-in-time restore only passes if the guest contains exactly the content that existed at that point in the backup history — proving the restore is byte-correct, bootable and identity-correct, not merely present on disk.
 
 ### Test Fleet
 
@@ -311,29 +350,26 @@ vmbackup and [vmrestore](https://github.com/doutsis/vmrestore) are tested end-to
 | Windows base | prod | 1× VirtIO | Yes | UEFI |
 | Windows multi-disk | prod | 2× VirtIO + 1× SATA | Yes | UEFI |
 
-The `default` and `prod` instances back up to isolated paths with separate VM filters, validating that multi-instance deployments stay fully isolated.
+Two instances are used, default and prod. They back up to isolated paths with separate VM filters, validating that multi-instance deployments stay fully isolated.
 
-### Testing Phases
+### Scenarios
 
-1. **CLI and argument validation** — all vmbackup and vmrestore flags, error paths, privilege enforcement and conflict guards
-2. **Record identities** — UUID, MAC addresses, TPM presence and disk layout for every VM
-3. **Build backup chains with checkfiles** — unique marker files are written inside each guest (Linux and Windows) via the QEMU agent between backup rounds. Multiple vmbackup rounds across both instances create active and archived chains, each capturing different checkfile content. This gives every restore point a verifiable fingerprint — after restore, the checkfile content proves which point in time was actually recovered
-4. **Backup verification** — `vmrestore --verify` confirms integrity across both instances
-5. **Prune** — archived period cleanup on live backup data
-6. **Clone restore** — restore as clones with new identity, verify disk integrity, boot via QEMU agent, confirm checkfile content matches the source backup, then destroy
-7. **Point-in-time restore** — restore to specific checkpoints across both active and archived chains. Each restored VM is booted and the checkfile inside the guest is read back to confirm it contains exactly the content that existed at that point in the backup history — not the latest, not a neighbour, but the precise checkpoint requested. This is the strongest proof that incremental chains and archive navigation produce correct results
-8. **Single-disk restore** — replace one disk on a multi-disk VM, verify `.pre-restore` backup, disk integrity and vmbackup auto-heal after chain invalidation
-9. **Destroy everything** — delete all original VMs including definitions, disks and NVRAM
-10. **DR restore** — restore all VMs from backup to a clean path, verify UUID/MAC match originals, all disks intact, TPM state preserved, checkfiles survived the full backup → destroy → restore cycle, BitLocker not triggered
-11. **Multi-instance backup and restore** — backup and restore across config instances (`--config-instance prod`), verifying that each instance resolves to its own backup path, lists only its own VMs, and restores produce correct identities. Covers `VMBACKUP_INSTANCE` env var equivalence and cross-instance clone and DR
-12. **Windows TPM/BitLocker** — clone and DR with TPM state isolation per UUID, NVRAM separation, archived chain recovery, and BitLocker unlock without recovery prompt
-13. **Auto-recovery** — corrupt `.cpt` chain marker, verify vmbackup archives the broken chain and starts fresh
+The harness covers thirteen scenarios across four categories:
 
-Every restore verifies disk integrity (`qemu-img check`), identity against pre-test baselines, and successful boot via automated QEMU guest agent polling.
+- **Smoke** — online-state checks and the guest-agent quiesce path.
+- **Read-only** — verify, status, list and prune against live data.
+- **Clone-restore** — full restore, restore-latest from a chain, point-in-time restore to a chain midpoint, offline-mode restore, Windows TPM round-trip, multi-disk restore, and NVRAM/disk coherency under source-VM drift — each proven with the witness file.
+- **Negative** — corrupt TPM surfaced honestly (disk recovered, manual-unlock notice shown) and a missing-dependency gate.
+
+Every restore verifies disk integrity (`qemu-img check`), identity against pre-test baselines, and successful boot via automated guest-agent polling.
 
 ## Documentation
 
-Full technical documentation is included in [vmbackup.md](vmbackup.md) (installed to `/opt/vmbackup/vmbackup.md`). It covers architecture, configuration reference, rotation policies, backup lifecycle, archive management, replication transport interface, SQLite schema, failure detection and security model in detail.
+- [vmbackup.md](vmbackup.md) — backup architecture, configuration reference, rotation, retention, replication, SQLite schema, security model.
+- [vmrestore.md](vmrestore.md) — restore architecture, CLI reference, identity handling, TPM/BitLocker, NVRAM/disk coherency model.
+- [CHANGELOG.md](CHANGELOG.md) — release-by-release history.
+
+Both are installed to `/opt/vmbackup/` alongside the binaries.
 
 ## Known Issues
 
@@ -341,15 +377,21 @@ Full technical documentation is included in [vmbackup.md](vmbackup.md) (installe
 
 QEMU's default `discard_granularity` for VirtIO block devices causes Windows to issue millions of tiny 512-byte TRIM operations instead of coalescing them. A 20 GB disk can take 10+ minutes to trim — versus 1–2 seconds with the fix applied.
 
-Linux guests are unaffected (the kernel coalesces TRIMs regardless). SATA guests also work fine.
+Linux guests are unaffected. SATA guests also work fine.
 
 **Fix:** Add a `discard_granularity` override (32 MiB recommended) to each VirtIO disk in the VM's libvirt XML. vmbackup detects missing overrides automatically at backup time and logs the exact XML to add.
 
-Full details, performance benchmarks and step-by-step XML instructions: [VirtIO discard_granularity & Windows TRIM Performance](vmbackup.md#virtio-discard_granularity--windows-trim-performance)
+Full details, performance benchmarks and step-by-step XML instructions: [VirtIO discard_granularity & Windows TRIM Performance](vmbackup.md#virtio-discard_granularity--windows-trim-performance).
+
+### Empty `.chain-*` marker directories for offline VMs
+
+VMs that stay powered off and unchanged are correctly skipped each night, but the backup still leaves behind an empty hidden `.chain-<timestamp>/` directory under the VM's backup path on every run. Over time these accumulate (one per skipped VM per night). They contain nothing, take negligible space, and do **not** affect your backups — the real data stays in place and remains fully restorable.
+
+This only affects VMs that are powered off and unchanged between runs; actively-backed-up VMs are unaffected. It will be addressed in a future release.
 
 ## Issues
 
-Found a bug or have a feature request? [Open an issue](https://github.com/doutsis/vmbackup/issues).
+Found a bug or have an idea? Please [open an issue](https://github.com/doutsis/vmbackup/issues). Full disclosure: I have no idea how to use GitHub, so if someone opens *anything* — good luck to us all.
 
 ## License
 

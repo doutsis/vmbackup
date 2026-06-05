@@ -245,18 +245,9 @@ get_chain_health_summary() {
     
     # Query chain_health directly with pipe separator (not column format)
     if [[ "${SQLITE_MODULE_AVAILABLE:-0}" -eq 1 ]] && [[ -n "${SQLITE_DB_PATH:-}" ]]; then
+        # Phase 4 commit 4a: typed read via lib/sqlite_ro.sh.
         local db_output
-        db_output=$(sqlite3 -separator '|' "$SQLITE_DB_PATH" "
-            SELECT vm_name,
-                   COUNT(*) as total_chains,
-                   SUM(CASE WHEN chain_status='active' THEN 1 ELSE 0 END) as active,
-                   SUM(CASE WHEN chain_status='archived' THEN 1 ELSE 0 END) as archived,
-                   SUM(CASE WHEN chain_status='broken' THEN 1 ELSE 0 END) as broken,
-                   SUM(restorable_count) as restore_points
-            FROM chain_health
-            WHERE chain_status NOT IN ('deleted','purged')
-            GROUP BY vm_name
-            ORDER BY vm_name;" 2>/dev/null)
+        db_output=$(sqlite_query_chain_health_email)
         
         if [[ -n "$db_output" ]]; then
             while IFS='|' read -r vm total_chains active archived broken restore_points; do

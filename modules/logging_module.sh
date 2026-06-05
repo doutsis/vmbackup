@@ -47,6 +47,13 @@ STATE_BACKUP_KEEP_DAYS="${STATE_BACKUP_KEEP_DAYS:-90}"
 # Logs are captured in state backups before deletion
 LOG_KEEP_DAYS="${LOG_KEEP_DAYS:-30}"
 
+# Central log size cap in bytes (vmbackup.log, vmprune.log)
+# When exceeded, file is rotated to <name>.<epoch> and a fresh empty file is created
+# Rotated files age out via LOG_KEEP_DAYS
+# Set to 0 to disable size-based rotation
+# Default: 52428800 (50 MiB)
+LOG_MAX_BYTES="${LOG_MAX_BYTES:-52428800}"
+
 #################################################################################
 # CHAIN LIFECYCLE LOGGING
 #################################################################################
@@ -66,7 +73,7 @@ LOG_KEEP_DAYS="${LOG_KEEP_DAYS:-30}"
 #       $12 - covers_from (ISO8601)
 #       $13 - covers_to (ISO8601)
 log_chain_lifecycle() {
-    [[ "${DRY_RUN:-false}" == true ]] && return 0
+    is_dry_run && return 0
     local event_type="$1"
     local vm_name="$2"
     local chain_id="$3"
@@ -117,7 +124,7 @@ log_chain_lifecycle() {
 #       $12 - archive_location (optional)
 #       $13 - retention_remaining
 log_period_lifecycle() {
-    [[ "${DRY_RUN:-false}" == true ]] && return 0
+    is_dry_run && return 0
     local event_type="$1"
     local vm_name="$2"
     local period_id="$3"
@@ -161,7 +168,7 @@ log_period_lifecycle() {
 #       $9  - error_message (optional)
 #       $10 - file_size_override (optional, integer bytes — use when source is already deleted)
 log_file_operation() {
-    [[ "${DRY_RUN:-false}" == true ]] && return 0
+    is_dry_run && return 0
     local operation="$1"
     local vm_name="$2"
     local source_path="$3"
@@ -226,7 +233,7 @@ log_file_operation() {
 #       $13 - success (true|false)
 #       $14 - action_source (optional: prune|retention|orphan_retention)
 log_retention_action() {
-    [[ "${DRY_RUN:-false}" == true ]] && return 0
+    is_dry_run && return 0
     local action="$1"
     local vm_name="$2"
     local target_type="$3"
@@ -273,7 +280,7 @@ log_retention_action() {
 #       $8  - triggered_by
 #       $9  - detail (optional)
 log_config_event() {
-    [[ "${DRY_RUN:-false}" == true ]] && return 0
+    is_dry_run && return 0
     local event_type="$1"
     local config_source="${2:-}"
     local vm_name="${3:-}"
@@ -303,8 +310,32 @@ log_config_event() {
 # Called after state backup to ensure logs are archived before deletion
 cleanup_old_logs() {
     local keep_days="${LOG_KEEP_DAYS:-30}"
+    local max_bytes="${LOG_MAX_BYTES:-52428800}"
     local deleted_count=0
     local deleted_bytes=0
+    
+    # Size-based pre-rotation of central logs (OPS-01)
+    # Rename oversized central logs to <name>.<epoch>; the running session keeps writing
+    # to the renamed inode, the next session opens a fresh file. Rotated files age out
+    # below via the existing -mtime rule.
+    if ((max_bytes > 0)); then
+        local central_log
+        for central_log in "${STATE_DIR}/logs/vmbackup.log" "${STATE_DIR}/logs/vmprune.log"; do
+            [[ -f "$central_log" ]] || continue
+            local cur_size
+            cur_size=$(stat -c%s "$central_log" 2>/dev/null || echo 0)
+            if ((cur_size > max_bytes)); then
+                local rotated="${central_log}.$(date +%s)"
+                if mv "$central_log" "$rotated" 2>/dev/null; then
+                    touch "$central_log" 2>/dev/null
+                    chown root:backup "$central_log" 2>/dev/null || true
+                    chmod 0640 "$central_log" 2>/dev/null || true
+                    log_info "logging_module.sh" "cleanup_old_logs" \
+                        "Rotated $(basename "$central_log") ($(numfmt --to=iec-i --suffix=B "$cur_size" 2>/dev/null || echo "${cur_size}B")) -> $(basename "$rotated")"
+                fi
+            fi
+        done
+    fi
     
     # Per-VM backup logs (backup_<vm>_<epoch>.log)
     while IFS= read -r -d '' file; do
@@ -314,6 +345,15 @@ cleanup_old_logs() {
         ((deleted_count++))
         rm -f "$file"
     done < <(find "${STATE_DIR}/logs" -name "backup_*.log" -mtime +"$keep_days" -print0 2>/dev/null)
+    
+    # Rotated central logs (vmbackup.log.<epoch>, vmprune.log.<epoch>)
+    while IFS= read -r -d '' file; do
+        local size
+        size=$(stat -c%s "$file" 2>/dev/null || echo 0)
+        ((deleted_bytes += size))
+        ((deleted_count++))
+        rm -f "$file"
+    done < <(find "${STATE_DIR}/logs" \( -name "vmbackup.log.*" -o -name "vmprune.log.*" \) -mtime +"$keep_days" -print0 2>/dev/null)
     
     # Replication logs (cloud and local)
     while IFS= read -r -d '' file; do

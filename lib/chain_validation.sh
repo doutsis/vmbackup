@@ -18,9 +18,8 @@ h#!/usr/bin/env bash
 # Version: 1.0.0 (2026-02-06)
 #===============================================================================
 
-# Module guard
-[[ -n "${CHAIN_VALIDATION_LOADED:-}" ]] && return 0
-declare -g CHAIN_VALIDATION_LOADED=true
+# UNI-321: idempotency guard — re-source is a no-op once validate_chain_integrity is defined.
+declare -F validate_chain_integrity >/dev/null 2>&1 && return 0
 
 #===============================================================================
 # GLOBAL RESULTS (set by validate_chain_integrity)
@@ -100,15 +99,18 @@ validate_chain_integrity() {
         return 1
     fi
     
-    # Find .cpt file
+    # Find .cpt file. One .cpt per chain is the design invariant; sort
+    # ensures the pick is deterministic if that invariant is ever violated
+    # (109-bugs audit item 1).
     local cpt_file
-    cpt_file=$(find "$chain_dir" -maxdepth 1 -name "*.cpt" 2>/dev/null | head -1)
+    cpt_file=$(find "$chain_dir" -maxdepth 1 -name "*.cpt" 2>/dev/null | sort | head -1)
     
     if [[ -z "$cpt_file" || ! -f "$cpt_file" ]]; then
         _cv_warn "No .cpt file found in $chain_dir"
         
         # Check for copy-mode backup (no checkpoints)
-        if find "$chain_dir" -maxdepth 1 -name "*.copy.data" 2>/dev/null | grep -q .; then
+        # -print -quit avoids SIGPIPE on find under `set -o pipefail`
+        if find "$chain_dir" -maxdepth 1 -name "*.copy.data" -print -quit 2>/dev/null | grep -q .; then
             _cv_info "Copy-mode backup detected (no checkpoint chain)"
             CHAIN_VALID="true"
             CHAIN_TOTAL_CHECKPOINTS=1
@@ -158,13 +160,15 @@ validate_chain_integrity() {
         return 1
     fi
     
-    # Detect disk names from .full.data files
+    # Detect disk names from .full.data files. Sort for deterministic
+    # iteration order across runs (validation outcome is order-agnostic
+    # but log output benefits from determinism — 109-bugs audit item 2).
     local disk_names=()
     while IFS= read -r data_file; do
         local disk_name
         disk_name=$(basename "$data_file" | sed 's/\.full\.data$//')
         disk_names+=("$disk_name")
-    done < <(find "$chain_dir" -maxdepth 1 -name "*.full.data" 2>/dev/null)
+    done < <(find "$chain_dir" -maxdepth 1 -name "*.full.data" 2>/dev/null | sort)
     
     if [[ ${#disk_names[@]} -eq 0 ]]; then
         _cv_error "No .full.data files found - chain has no base backup"

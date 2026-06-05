@@ -40,6 +40,9 @@ declare -g CLOUD_TRANSPORT_DEST_SPACE_KNOWN=0
 #=============================================================================
 # LOAD SHARED LIBRARY
 #=============================================================================
+# [PATH-KEEPER: foundational self-discovery, pre-lib-load] (UNI-323)
+# This realpath call locates the cloud_transport's own directory before any
+# lib/ helpers are sourced — pu_safe_realpath is unavailable at this point.
 _CLOUD_TRANSPORT_DIR="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
 source "${_CLOUD_TRANSPORT_DIR}/../lib/transfer_utils.sh" || {
     echo "FATAL: Cannot load lib/transfer_utils.sh" >&2
@@ -550,10 +553,21 @@ _cloud_verify_upload() {
     
     local verify_duration=$(($(date '+%s') - verify_start))
     
-    if echo "$verify_output" | grep -q "0 differences"; then
+    # Trust rclone's exit code as the canonical PASS/FAIL signal.
+    # rclone check exits 0 when source and dest match, non-zero on any
+    # difference. The previous `grep -q "0 differences"` discriminator
+    # was a substring match (matched inside "10 differences", etc.) and
+    # was also fragile against rclone output-format variation.
+    if (( verify_result == 0 )); then
         cloud_log_info "[VERIFY] ✓ Passed in $(tu_format_elapsed "$verify_duration")"
     else
-        cloud_log_warn "[VERIFY] Found differences after $(tu_format_elapsed "$verify_duration")"
+        cloud_log_warn "[VERIFY] rclone check exit=$verify_result after $(tu_format_elapsed "$verify_duration")"
+        # Surface the relevant rclone summary/diff lines so the operator
+        # can tell whether this is a small benign race or a real fault.
+        local diag_line
+        while IFS= read -r diag_line; do
+            [[ -n "$diag_line" ]] && cloud_log_warn "[VERIFY]   $diag_line"
+        done < <(printf '%s\n' "$verify_output" | grep -E 'differences found|errors while checking|sizes differ|hashes differ|files missing|not in|ERROR' | head -20)
     fi
 }
 

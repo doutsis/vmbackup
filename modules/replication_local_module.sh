@@ -207,7 +207,7 @@ _log_local_replication_config() {
     local config_file="$2"
     
     # Skip DB writes in dry-run mode (matches sqlite session policy)
-    [[ "${DRY_RUN:-false}" == true ]] && return 0
+    is_dry_run && return 0
     
     # Bail if sqlite not available
     if ! type sqlite_log_config_event &>/dev/null; then
@@ -713,7 +713,7 @@ replicate_batch() {
             REPLICATION_DEST_BWLIMIT["$dest_name"]="${TRANSPORT_BWLIMIT_FINAL:-}"
             
             # Verify if not dry run
-            if [[ "$REPLICATION_DRY_RUN" != "true" ]] && [[ "$verify_mode" != "none" ]]; then
+            if [[ "$REPLICATION_DRY_RUN" != "true" ]] && [[ "$verify_mode" != "none" ]]; then  # [DRY-RUN-KEEPER: REPLICATION_DRY_RUN sub-flag, see 109-phase7-spec.md §1.3.6]
                 if transport_verify "$backup_root" "$dest_path" "$verify_mode"; then
                     log_info "replication_local_module.sh" "replicate_batch" "Destination $dest_name: SUCCESS (${sync_duration}s)"
                     ((REPLICATION_TOTAL_SUCCESS++))

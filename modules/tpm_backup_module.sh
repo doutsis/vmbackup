@@ -18,6 +18,24 @@
 # and setting pipefail here would affect all subsequent parent pipelines.
 # Individual pipelines that need pipefail should use subshells: (set -o pipefail; cmd | cmd)
 
+# UNI-006 (Phase 6 commit 2): the read-side helpers (get_vm_uuid,
+# has_tpm_device, get_tpm_info, log_tpm, validate_tpm_backup,
+# get_tpm_backup_size) now live in lib/tpm_io.sh. This module is the ONE
+# intentional caller of source_lib_or_die from a module (spec §2.1.1).
+if declare -F source_lib_or_die >/dev/null 2>&1; then
+    source_lib_or_die tpm_io.sh
+else
+    # Standalone fallback: try the canonical install path, then dev tree.
+    for _candidate in /opt/vmbackup/lib/tpm_io.sh \
+                      "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/tpm_io.sh"; do
+        if [[ -r "$_candidate" ]]; then
+            # shellcheck source=/dev/null
+            source "$_candidate" && break
+        fi
+    done
+    unset _candidate
+fi
+
 # Configuration - can be overridden by caller
 : "${TPM_BACKUP_ENABLED:=yes}"
 : "${TPM_BACKUP_METHOD:=full}"      # Options: full, incremental, consistent
@@ -27,49 +45,8 @@
 : "${BITLOCKER_EXEC_TIMEOUT:=30}"    # Timeout for guest-exec commands (seconds)
 
 ##############################################################################
-# Utility Functions
+# Utility Functions — UNI-006: now in lib/tpm_io.sh, sourced above.
 ##############################################################################
-
-# Get VM UUID from libvirt
-get_vm_uuid() {
-    local vm_name="$1"
-    
-    virsh dominfo "$vm_name" 2>/dev/null | grep "^UUID" | awk '{print $2}'
-}
-
-# Check if VM has TPM device
-has_tpm_device() {
-    local vm_name="$1"
-    
-    virsh dumpxml "$vm_name" 2>/dev/null | grep -q '<tpm' && return 0
-    return 1
-}
-
-# Get TPM model and backend type
-get_tpm_info() {
-    local vm_name="$1"
-    
-    virsh dumpxml "$vm_name" 2>/dev/null | grep -A 5 '<tpm'
-}
-
-# Log message (compatible with vmbackup.sh logging)
-# Bridges to main log_* functions when available, falls back to stderr
-log_tpm() {
-    local level="$1"
-    local message="$2"
-    local timestamp=$(date '+%Y-%m-%d %H:%M:%S %Z')
-    
-    # Bridge to main logging system if available
-    case "$level" in
-        DEBUG) declare -f log_debug >/dev/null 2>&1 && log_debug "tpm_backup_module.sh" "${FUNCNAME[1]:-tpm}" "$message" && return ;;
-        INFO)  declare -f log_info  >/dev/null 2>&1 && log_info  "tpm_backup_module.sh" "${FUNCNAME[1]:-tpm}" "$message" && return ;;
-        WARN)  declare -f log_warn  >/dev/null 2>&1 && log_warn  "tpm_backup_module.sh" "${FUNCNAME[1]:-tpm}" "$message" && return ;;
-        ERROR) declare -f log_error >/dev/null 2>&1 && log_error "tpm_backup_module.sh" "${FUNCNAME[1]:-tpm}" "$message" && return ;;
-    esac
-    
-    # Fallback: stderr-only (standalone mode)
-    echo "[$timestamp] [$level] TPM: $message" >&2
-}
 
 ##############################################################################
 # Full TPM Backup Method
@@ -458,35 +435,9 @@ extract_bitlocker_keys() {
 }
 
 ##############################################################################
-# Validation Functions
+# Validation Functions — UNI-006: validate_tpm_backup + get_tpm_backup_size
+# now live in lib/tpm_io.sh, sourced at the top of this module.
 ##############################################################################
-
-validate_tpm_backup() {
-    local tpm_backup_dir="$1"
-    
-    [[ ! -d "$tpm_backup_dir" ]] && return 1
-    
-    # Check for TPM state files
-    if ls "$tpm_backup_dir"/tpm2* >/dev/null 2>&1; then
-        # Check that files are non-empty
-        local empty_count=0
-        for file in "$tpm_backup_dir"/tpm2*; do
-            [[ ! -s "$file" ]] && ((empty_count++))
-        done
-        
-        [[ $empty_count -eq 0 ]] && return 0
-    fi
-    
-    return 1
-}
-
-get_tpm_backup_size() {
-    local tpm_backup_dir="$1"
-    
-    [[ ! -d "$tpm_backup_dir" ]] && echo "0" && return 1
-    
-    du -sh "$tpm_backup_dir" 2>/dev/null | awk '{print $1}'
-}
 
 ##############################################################################
 # Main Backup Function
@@ -549,72 +500,10 @@ backup_vm_tpm() {
 # Restoration Functions (for vmrestore.sh integration)
 ##############################################################################
 
-restore_vm_tpm() {
-    local vm_name="$1"
-    local tpm_backup_dir="$2"
-    
-    [[ -z "$vm_name" || -z "$tpm_backup_dir" ]] && return 1
-    [[ ! -d "$tpm_backup_dir" ]] && {
-        log_tpm "WARN" "$vm_name: No TPM backup directory provided"
-        return 0  # Non-fatal
-    }
-    
-    # Get current VM UUID
-    local vm_uuid
-    vm_uuid=$(get_vm_uuid "$vm_name") || {
-        log_tpm "ERROR" "$vm_name: Could not retrieve VM UUID"
-        return 1
-    }
-    
-    # CRITICAL: validate UUID is non-empty to prevent rm -rf on wrong path
-    if [[ -z "$vm_uuid" ]]; then
-        log_tpm "ERROR" "$vm_name: VM UUID is empty - aborting TPM restore to prevent data loss"
-        return 1
-    fi
-    
-    local swtpm_dir="$SWTPM_STATE_DIR/$vm_uuid"
-    
-    # Backup current TPM state before restoring
-    local backup_dir="$swtpm_dir.backup-before-restore"
-    if [[ -d "$swtpm_dir" ]]; then
-        log_tpm "INFO" "$vm_name: Backing up current TPM state to $backup_dir"
-        sudo mkdir -p "$backup_dir"
-        sudo cp -r "$swtpm_dir"/* "$backup_dir/" 2>/dev/null || true
-    fi
-    
-    log_tpm "INFO" "$vm_name: Clearing current TPM state"
-    sudo rm -rf "$swtpm_dir"/* || {
-        log_tpm "ERROR" "$vm_name: Failed to clear TPM state directory"
-        return 1
-    }
-    
-    log_tpm "INFO" "$vm_name: Restoring TPM state from backup"
-    if sudo cp -r "$tpm_backup_dir"/* "$swtpm_dir/" 2>/dev/null; then
-        # Fix ownership — detect correct TPM user (tss on Debian, swtpm on Arch)
-        local tpm_user="tss"
-        if ! getent passwd tss >/dev/null 2>&1; then
-            if getent passwd swtpm >/dev/null 2>&1; then
-                tpm_user="swtpm"
-            else
-                log_tpm "WARN" "$vm_name: Neither tss nor swtpm user found — skipping chown"
-                tpm_user=""
-            fi
-        fi
-        if [[ -n "$tpm_user" ]]; then
-            sudo chown -R "${tpm_user}:${tpm_user}" "$swtpm_dir" 2>/dev/null || {
-                log_tpm "WARN" "$vm_name: Could not set TPM ownership to ${tpm_user}:${tpm_user}"
-            }
-        fi
-        
-        log_tpm "INFO" "$vm_name: TPM state restored successfully"
-        return 0
-    else
-        log_tpm "ERROR" "$vm_name: Failed to restore TPM state from backup"
-        log_tpm "INFO" "$vm_name: Attempting to restore from pre-restore backup at $backup_dir"
-        sudo cp -r "$backup_dir"/* "$swtpm_dir/" 2>/dev/null || true
-        return 1
-    fi
-}
+# INT-08 (2026-05-23): restore_vm_tpm() removed — dead code per Phase 5
+# audit. vmrestore.sh has its own restore_tpm() implementation that is the
+# sole production path. Zero callers across the codebase (excluding archive/
+# and copilot/). Original body preserved in git history.
 
 ##############################################################################
 # Reporting Functions
@@ -647,15 +536,13 @@ report_tpm_backup_status() {
     fi
 }
 
-# Export functions for use by parent scripts
+# Export functions for use by parent scripts.
+# UNI-006: log_tpm / get_vm_uuid / has_tpm_device / validate_tpm_backup are
+# exported by lib/tpm_io.sh; not re-exported here.
+# INT-08 (2026-05-23): restore_vm_tpm export removed with the dead function.
 export -f backup_vm_tpm
-export -f restore_vm_tpm
-export -f validate_tpm_backup
 export -f report_tpm_backup_status
 export -f extract_bitlocker_keys
 export -f _guest_exec_capture
-export -f log_tpm
-export -f get_vm_uuid
-export -f has_tpm_device
 
 # End of TPM Backup Module

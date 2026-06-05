@@ -66,7 +66,7 @@
 >
 > Backups are only as good as your restores. All backups are worthless if you cannot recover from them. **vmrestore** might be your answer.
 
-vmbackup and vmrestore are two halves of one system. vmbackup backs up — [vmrestore](https://github.com/doutsis/vmrestore) restores. They share no code, no modules, and have no runtime coupling, but vmrestore exclusively restores backups created by vmbackup. It is standalone in implementation but purpose-built for vmbackup's output.
+vmbackup and vmrestore are two halves of one system, and as of 0.6.0 they ship together as a single package containing two binaries. vmbackup backs up — [vmrestore](vmrestore.md) restores. Both carry the same version, draw on one shared `lib/` of cross-tool helpers, and read from a single SQLite catalogue, so the two halves can no longer drift apart by accident. vmrestore still operates standalone for disaster recovery — it restores directly from the backup files even when the catalogue is unavailable.
 
 **vmbackup** is a production-grade but production untested backup manager for libvirt/KVM virtual machines. It wraps `virtnbdbackup` (v2.28+) to provide:
 
@@ -81,10 +81,12 @@ vmbackup and vmrestore are two halves of one system. vmbackup backs up — [vmre
 - Per-instance configuration for different environments
 - Rotation policies (daily, weekly, monthly, accumulate, never)
 - Accurate session tracking with separate counts for backed-up, excluded, skipped, and failed VMs
+- Unified packaging with vmrestore — one install, one version, a shared SQLite catalogue
+- Restore-session tracking in that catalogue, queryable with `vmbackup --status --restores`
 
 vmbackup executes in a fixed sequence: load the configuration instance, verify dependencies, acquire the session lock and open a SQLite session. It then discovers all VMs via `virsh list` and applies exclude filters.
 
-Each VM is processed in turn — policy and period boundary checks, five-phase state validation (directory, checkpoints, chain continuity, manifest, disk alignment), backup type decision (full, auto, or copy), optional FSTRIM via the QEMU agent, then `virtnbdbackup` execution with TPM backup if applicable. Every outcome is logged to SQLite.
+Each VM is processed in turn — policy and period boundary checks, five-phase state validation (VM state, checkpoint-chain continuity, directory analysis, state classification, and a validation summary), backup type decision (full, auto, or copy), optional FSTRIM via the QEMU agent, then `virtnbdbackup` execution with TPM backup if applicable. Every outcome is logged to SQLite.
 
 After all VMs are processed, retention cleanup removes expired archives, replication syncs to local and cloud destinations, and a session summary is written. An email report is sent if configured.
 
@@ -108,9 +110,10 @@ Exactly one mode is required per invocation. Modes are mutually exclusive.
 | `--run` | Start a backup session. Backs up all VMs (or those specified by `--vm`), then runs replication and retention. |
 | `--prune <target>` | Remove backup data without running a backup. See [On-Demand Cleanup](#on-demand-cleanup---prune) for targets. |
 | `--replicate-only [scope]` | Run replication without backing up. Scope: `local`, `cloud`, or `both` (default). Cannot combine with `--vm`. |
-| `--status [report]` | Query backup history, failures, chain health, storage and policies. Read-only — no locks, no session. See [Status Reports](#status-reports---status). |
+| `--status [report]` | Query backup history, restore history, failures, chain health, storage and policies. Read-only — no locks, no session. See [Status Reports](#status-reports---status). |
 | `--cancel-replication` | Signal a running session to stop its replication phase. Backups in progress are not affected. Cannot combine with any other flag. |
 | `--config-prune-removed` | Comment out configuration variables that have been removed from the codebase in the running release. Idempotent and reversible (lines are commented, not deleted). Operates on `default/` and all custom instances; skips `template/`. Use with `--dry-run` to preview. |
+| `--cleanup-stale-manifests` | Remove leftover per-VM `chain-manifest.json` files. The chain-manifest subsystem was retired in 0.6.0 — the SQLite catalogue is now the single source of truth for chain state. Run automatically by the package on upgrade; idempotent and safe to re-run manually. |
 
 ### Options
 
@@ -202,6 +205,7 @@ sudo vmbackup --status --chains                  # Chain health overview
 sudo vmbackup --status --chains --vm web         # Chain detail for one VM
 sudo vmbackup --status --storage                 # Storage per VM
 sudo vmbackup --status --policies                # Rotation policy summary
+sudo vmbackup --status --restores --days 30      # Restore history (from vmrestore)
 sudo vmbackup --status --failures --csv          # CSV export
 sudo vmbackup --status --all-instances --days 7  # Sessions across all instances
 ```
@@ -219,9 +223,11 @@ vmbackup is a wrapper around [virtnbdbackup](https://github.com/abbbi/virtnbdbac
 Download the latest `.deb` from [Releases](https://github.com/doutsis/vmbackup/releases):
 
 ```bash
-wget https://github.com/doutsis/vmbackup/releases/download/v0.5.6/vmbackup_0.5.6_all.deb
-sudo dpkg -i vmbackup_0.5.6_all.deb
+# Download the latest vmbackup_<version>_all.deb from the Releases page, then:
+sudo dpkg -i vmbackup_*_all.deb
 ```
+
+The single `.deb` installs **both** `vmbackup` and `vmrestore`. When upgrading from a standalone `vmrestore` install, the old package is removed automatically — the package declares `Provides`/`Replaces`/`Conflicts: vmrestore`.
 
 ### From Source
 
@@ -244,7 +250,7 @@ sudo make install
 ```
 
 Both methods install to `/opt/vmbackup/` and set up:
-- `vmbackup` command in PATH (symlink to `/usr/local/bin/vmbackup`)
+- `vmbackup` **and** `vmrestore` commands in PATH (symlinks in `/usr/local/bin/` to `vmbackup.sh` and `vmrestore.sh`)
 - AppArmor snippet for virtnbdbackup socket access
 - systemd service and timer units (enabled but **not started** — see below)
 - `root:backup` ownership with `750`/`640` permissions
@@ -260,12 +266,25 @@ Both methods install to `/opt/vmbackup/` and set up:
 
 ### Manual Installation
 
+> The packaged install (`.deb`) and `make install` both create the `backup` group, apply `root:backup` ownership, and bootstrap the runtime directories. The manual steps below reproduce that model explicitly — omitting the group/ownership/runtime-directory steps will leave the tree inconsistent with the [Security & Permissions](#security--permissions) model (group-based read access will not work, and `/var/log/vmbackup` / `/run/vmbackup` will be missing).
+
 ```bash
 # Clone the repository
 git clone https://github.com/doutsis/vmbackup.git /opt/vmbackup
 
-# Create symlink
+# Create symlinks for both commands
 sudo ln -sf /opt/vmbackup/vmbackup.sh /usr/local/bin/vmbackup
+sudo ln -sf /opt/vmbackup/vmrestore.sh /usr/local/bin/vmrestore
+
+# Create the backup group and apply the root:backup ownership model
+sudo groupadd --system backup 2>/dev/null || true
+sudo chown -R root:backup /opt/vmbackup
+sudo chmod 750 /opt/vmbackup
+
+# Bootstrap the runtime log/run directories (root:backup, 750)
+sudo mkdir -p /var/log/vmbackup /var/log/vmrestore /run/vmbackup
+sudo chown root:backup /var/log/vmbackup /var/log/vmrestore /run/vmbackup
+sudo chmod 750 /var/log/vmbackup /var/log/vmrestore /run/vmbackup
 
 # Install AppArmor snippet (Debian/Ubuntu only)
 sudo cp /opt/vmbackup/apparmor/libvirt-qemu.local \
@@ -286,6 +305,8 @@ cp -r /opt/vmbackup/config/template /opt/vmbackup/config/default
 nano /opt/vmbackup/config/default/vmbackup.conf
 ```
 
+> **Dependencies are not installed by these steps.** The manual path (like `make install`) installs vmbackup files only — provision the prerequisites from the [Dependencies](#dependencies) table separately.
+
 ### Dependencies
 
 | Tool | Package | Required | Notes |
@@ -303,13 +324,15 @@ nano /opt/vmbackup/config/default/vmbackup.conf
 | `rsync` | `rsync` | For replication | Local replication sync |
 | `rclone` | `rclone` | For cloud replication | Cloud replication |
 
-All required packages except `virtnbdbackup` are installed automatically by the `.deb` package or `make install`. `virtnbdbackup` can be installed from your distro's package manager or directly from the [virtnbdbackup project](https://github.com/abbbi/virtnbdbackup?tab=readme-ov-file#installation).
+When installed via the **`.deb` package**, all required packages except `virtnbdbackup` are pulled in automatically as Debian dependencies. **`make install` installs the vmbackup files only** — it does not run a package manager, so on the source-install path you must provision the prerequisites yourself (see the table above). `virtnbdbackup` is always installed separately, from your distro's package manager or directly from the [virtnbdbackup project](https://github.com/abbbi/virtnbdbackup?tab=readme-ov-file#installation).
 
 Development and testing has been done on Debian 13 with virtnbdbackup 2.28 from Debian's repository.
 
 ### User & Group Setup
 
-vmbackup runs as **root** via systemd. No special user account is needed for backup operations. However, non-root users who need to interact with backups or VMs should be added to the appropriate groups:
+vmbackup runs as **root** via systemd and enforces an EUID check at startup — it will refuse to run unprivileged because every step (libvirt checkpoint manipulation, virtnbdbackup NBD sockets, TPM state read, BACKUP_PATH writes under restrictive umask) needs root. This is asymmetric with [vmrestore](vmrestore.md#privilege-model), which deliberately allows non-root invocation for read-only listings, metadata dumps, and disk extraction into user-writable paths — a deliberate concession to disaster-recovery workflows that may run on a recovery laptop without sudo configured.
+
+No special user account is needed for backup operations. However, non-root users who need to interact with backups or VMs should be added to the appropriate groups:
 
 | Group | Purpose | Who needs it | Command |
 |-------|---------|-------------|----------|
@@ -450,12 +473,14 @@ The steps below configure the `default` instance. vmbackup supports multiple **c
 sudo nano /opt/vmbackup/config/default/vmbackup.conf
 ```
 
-**Minimum required settings:**
+**Minimum settings to review for a real deployment:**
 
 | Setting | What to set | Example |
 |---------|-------------|---------|
 | `BACKUP_PATH` | Directory where backups are stored (must exist — see below) | `/mnt/backup/vms/` |
 | `LOG_LEVEL` | Verbosity: `ERROR`, `WARN`, `INFO`, `DEBUG` | `INFO` |
+
+> Both settings have runtime defaults in `vmbackup.sh` (`BACKUP_PATH` falls back to `/mnt/backup/vms/`, `LOG_LEVEL` to `INFO`), and the shipped `config/default/vmbackup.conf` already carries explicit values — so vmbackup will not fail merely because you didn't touch them. They are listed here because a production install should set `BACKUP_PATH` **deliberately** rather than rely on the fallback, not because the runtime contract strictly requires them.
 
 #### BACKUP_PATH Setup
 
@@ -733,6 +758,9 @@ All config files are self-documenting — `config/template/` contains every sett
 | `REPLICATION_ORDER` | `simultaneous` | `simultaneous` / `local_first` / `cloud_first` |
 | `STATE_BACKUP_KEEP_DAYS` | `90` | Days to keep daily `_state/` snapshots |
 | `LOG_KEEP_DAYS` | `30` | Days to keep log files (0=disable) |
+| `LOG_MAX_BYTES` | `52428800` (50 MiB) | Size cap for the central `vmbackup.log` / `vmprune.log` before rotation. Oversized file is rolled to `<name>.<epoch>` and aged out via `LOG_KEEP_DAYS`. See [Log Retention & Cleanup](#log-retention--cleanup). |
+
+> **Settings documented in specialist sections.** A few real, code-backed knobs live with their feature rather than in this table: `BITLOCKER_KEY_EXTRACTION` and `BITLOCKER_EXEC_TIMEOUT` (see [TPM Module Integration](#tpm-module-integration)), and the full log-rotation behaviour around `LOG_MAX_BYTES` (see [Log Retention & Cleanup](#log-retention--cleanup)). They are valid in `vmbackup.conf` even though they are detailed elsewhere.
 
 **I/O priority profiles** (tested estimates for typical VM workloads):
 
@@ -748,7 +776,7 @@ All config files are self-documenting — `config/template/` contains every sett
 - **LZ4 level 0** is broken in virtnbdbackup ≤2.28 — vmbackup detects this and bumps to 1. Fast mode (1–2) and HC mode (3–16) produce virtually identical compression ratios for VM disk data (~1.30× vs ~1.31×), but HC is ~15× slower.
 - **Orphan retention** — when a VM's rotation policy changes (e.g. weekly→monthly), old period directories become "orphaned" and invisible to count-based retention. The four `RETENTION_ORPHAN_*` settings provide age-based cleanup. Start with `DRY_RUN=true` to preview what would be removed.
 - **FSTRIM on Windows** is significantly slower without the VirtIO `discard_granularity` XML fix — see [Known Issues](#known-issues). VMs without a QEMU guest agent are skipped automatically; the exclude file is for VMs that *have* an agent but should still be excluded (e.g., database servers where TRIM causes latency spikes, legacy guests with buggy drivers).
-- **Each config instance should use a unique `BACKUP_PATH`**. The directory structure is `$BACKUP_PATH/<vm_name>/<YYYYMM>/`.
+- **Each config instance should use a unique `BACKUP_PATH`**. The directory structure is `$BACKUP_PATH/<vm_name>/<period>/`, where `<period>` depends on the rotation policy (`YYYYMMDD` daily, `YYYY-Www` weekly, `YYYYMM` monthly; `accumulate` has no period subdirectory). See [Period ID Generation](#period-id-generation).
 
 #### vm_overrides.conf — Per-VM Policies
 
@@ -764,11 +792,11 @@ See the [rotation policy options](#rotation-policies) above for available values
 
 #### exclude_patterns.conf — Pattern-Based Exclusions
 
-Exclude VMs by name using glob patterns. Format: `EXCLUDE_PATTERN+=("pattern")`.
+Exclude VMs by name using glob patterns. Format: `EXCLUDE_PATTERNS+=("pattern")`.
 
 ```bash
-EXCLUDE_PATTERN+=("test-*")       # Exclude test VMs
-EXCLUDE_PATTERN+=("*-template")   # Exclude templates
+EXCLUDE_PATTERNS+=("test-*")       # Exclude test VMs
+EXCLUDE_PATTERNS+=("*-template")   # Exclude templates
 ```
 
 #### fstrim_exclude.conf — FSTRIM Exclusions
@@ -779,7 +807,7 @@ One glob pattern per line. `#` comments and blank lines ignored. VMs matching an
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `EMAIL_ENABLED` | `yes` | Master switch |
+| `EMAIL_ENABLED` | `no` | Master switch (disabled by default; set to `yes` to enable) |
 | `EMAIL_RECIPIENT` | *(required)* | Destination address |
 | `EMAIL_SENDER` | *(required)* | From address |
 | `EMAIL_HOSTNAME` | system hostname | Override hostname in subject |
@@ -1273,7 +1301,11 @@ This section provides exhaustive documentation of how backup chains are created,
 .archives/chain-YYYY-MM-DD[.N]/
 ```
 - Date is when the archive was **created** (not when chain started)
-- `.N` suffix for multiple archives on same day (collision handling)
+- `.N` suffix disambiguates multiple archives created on the same day across **separate** invocations (collision handling)
+
+#### In-Session Re-Entry Guard (0.6.0)
+
+Within a single `vmbackup` invocation, the same VM can never be archived twice. Before 0.6.0 a code path that re-entered the archival routine for an already-archived VM in the same run produced a spurious collision-suffixed directory (`.archives/chain-<date>.1`) holding a duplicate of the chain just moved. A per-VM in-session guard now short-circuits the second attempt, so a `.N` suffix only ever results from genuinely separate invocations landing on the same calendar day — never from a single run archiving one VM twice.
 
 ### Files Moved During Archive
 
@@ -1385,7 +1417,7 @@ When a VM's rotation policy changes (e.g., weekly → monthly), old-format perio
 
 **Decision flow:** `get_orphaned_periods()` finds dirs not matching current policy format → `calculate_orphan_age()` queries DB for last successful backup age → age ≥ max_age → delete; min_age ≤ age < max_age → aging (kept); age < min_age → protected.
 
-> **Policy change note:** When a VM's rotation policy changes (e.g., daily → weekly), old-format period directories become orphans automatically. Tier 2 protects them for `MIN_AGE` days, then deletes them after `MAX_AGE` days. The `accumulate` policy uses chain depth limits instead of period-based retention, so it does not generate orphans. See [todo-vmbackup.md](todo-vmbackup.md) for detailed scenarios.
+> **Policy change note:** When a VM's rotation policy changes (e.g., daily → weekly), old-format period directories become orphans automatically. Tier 2 protects them for `MIN_AGE` days, then deletes them after `MAX_AGE` days. The `accumulate` policy uses chain depth limits instead of period-based retention, so it does not generate orphans.
 
 #### Period Removal Pipeline
 
@@ -1459,8 +1491,10 @@ Chain rows persist as tombstones after deletion, recording that the data *existe
 |-------|---------|------------|
 | `active` | Chain is live, backups appending | N/A |
 | `archived` | Chain archived (period rolled, policy change, error recovery) | No — archival is a move |
+| `marked` | Soft-marked in DB for pending removal (review/grace window before deletion) | Yes — until the period is removed |
 | `broken` | Chain integrity compromised (signal, checkpoint corruption) | No — needs new full |
 | `deleted` | Period removed by retention or manual action | No — files gone from disk |
+| `purged` | Removed via explicit `--prune` operation | No — files gone from disk |
 
 ```sql
 -- After _remove_period(), chain_health row becomes:
@@ -1473,6 +1507,8 @@ UPDATE chain_health SET
 WHERE vm_name = 'web-server' AND period_id = '202607';
 -- Row is NEVER deleted — it serves as a permanent tombstone
 ```
+
+**`archive_size_bytes` population (0.6.0):** the chain's archived byte count is now written to `chain_health.archive_size_bytes` at the moment of the archive transition, by both the active-path and the retention-path archive callers. Previously the retention-path caller left the column at `0` until a manual reconciliation ran, so storage reports under-counted archived data for chains rolled by retention. Both callers are now symmetric.
 
 ### On-Demand Cleanup (`--prune`)
 
@@ -1599,10 +1635,11 @@ See [Usage](#usage) for CLI syntax and combination rules.
 | Chain detail | `--status --chains --vm web` | Per-chain breakdown for one VM (period, status, policy) |
 | Storage | `--status --storage` | Storage per VM (policy, backup count, avg full/incr, total, current chain) |
 | Policies | `--status --policies` | Rotation policy summary (per-VM policy, retention limits, orphans) |
+| Restores | `--status --restores` | Restore sessions logged by `vmrestore` (VM, mode, status, exit code, dry-run, duration, target path) |
 
 #### Options
 
-`--days N` sets the time window in days (default: 1 = today). Applies to sessions, VM history, failures and replication reports. Storage, chains and policies report across all history regardless of `--days`.
+`--days N` sets the time window in days (default: 1 = today). Applies to sessions, VM history, failures, replication and restore reports. Storage, chains and policies report across all history regardless of `--days`.
 
 `--csv` switches output to CSV with both raw and human-readable columns. Byte values get an adjacent `_hr` column (e.g. `bytes_written,bytes_written_hr`). Duration values get a `_hr` column (e.g. `duration_sec,duration_sec_hr`). The policies CSV includes instance-level context columns (`instance_default_policy`, `instance_retention_limit`, `orphan_max_age_days`, `orphan_min_age_days`). The sessions CSV appends three row-count columns (`vm_rows`, `repl_rows`, `retention_rows`) used for client-side classification.
 
@@ -1650,6 +1687,9 @@ sudo vmbackup --status --storage
 
 # Rotation policy summary with retention status
 sudo vmbackup --status --policies
+
+# Restore history — what was restored, when, and whether it worked
+sudo vmbackup --status --restores --days 30
 
 # Export failures as CSV for a spreadsheet
 sudo vmbackup --status --failures --days 30 --csv
@@ -1806,7 +1846,6 @@ No modules or library files call `set_backup_permissions()`. All file/directory 
 | `$BACKUP_PATH/` | `root:backup` | `2750` | Backup data root (SGID) |
 | `$BACKUP_PATH/<vm>/` | `root:backup` | `2750` | Per-VM backup dirs (SGID inherited) |
 | `$BACKUP_PATH/<vm>/config/` | `root:backup` | `2750` | VM libvirt XML snapshots |
-| `$BACKUP_PATH/<vm>/chain-manifest.json` | `root:backup` | `640` | Backup chain metadata |
 | `$BACKUP_PATH/<vm>/.chain-*/` | `root:backup` | `2750` | Archived chain dirs |
 | `$BACKUP_PATH/<vm>/tpm-state/` | `root:root` | `750` | TPM state root (SGID stripped) |
 | `$BACKUP_PATH/<vm>/tpm-state/tpm2/` | `root:root` | `600` | TPM private keys |
@@ -1968,6 +2007,7 @@ vmbackup.sh uses **SQLite as the sole logging backend**. This provides:
 - **Chain health tracking** for restoration validation
 - **Complete exit path coverage** - all backup outcomes logged
 - **Event tables** for chain, period, file, retention, and config events
+- **Restore-session tracking** — `vmrestore` records every restore to the same catalogue (schema v2.2, `restore_sessions` table); query via `--status --restores`
 
 ### Database Location
 
@@ -1976,6 +2016,8 @@ ${BACKUP_PATH}/_state/vmbackup.db
 ```
 
 Each backup instance maintains its own SQLite database.
+
+**Misplaced-database guard (0.6.0):** vmbackup refuses to create the catalogue anywhere other than `_state/` — specifically it will not initialise a database inside an `.archives/` directory or under a period directory. A misconfigured or relocated `BACKUP_PATH` that pointed at a sub-tree could previously spawn a *second* catalogue that diverged silently from the canonical one, so chain state and status reports disagreed depending on where the tool was run. The guard fails loudly rather than creating a divergent database, keeping the single-source-of-truth invariant intact.
 
 ### Timestamp Convention
 
@@ -1989,7 +2031,7 @@ All timestamps stored in the database use **UTC** (`YYYY-MM-DD HH:MM:SS`). Log o
 | Log timestamps (`log_msg`) | `date '+%Y-%m-%d %H:%M:%S %Z'` (local + TZ) | `2026-02-16 19:30:00 AEDT` |
 | Rotation `period_id` | `date '+%Y%m%d'` etc. (local, intentional) | `20260216` |
 
-Pre-1.6 databases may contain local-time timestamps. Run `migrate_v1.6.sh` (one-shot, idempotent) to convert them to UTC. See `DATETIME_BUGS.md` and `DATETIME_FIX_PLAN.md` for the full audit.
+Databases are migrated automatically to the current schema (v2.2) on first write; very old (pre-1.6) databases written in local time are converted to UTC as part of that migration. Downgrade is not supported.
 
 ### Module Loading
 
@@ -2005,7 +2047,9 @@ source "$SCRIPT_DIR/lib/sqlite_module.sh"
 sqlite_init_database
 ```
 
-The schema and all table definitions live in `lib/sqlite_module.sh`. Use `sqlite3 vmbackup.db ".schema"` to inspect the current schema, or `sqlite_get_schema_version` to check the version.
+The schema and all table definitions live in `lib/sqlite_module.sh` (currently schema v2.2, which added the `restore_sessions` table for vmrestore logging). Use `sqlite3 vmbackup.db ".schema"` to inspect the current schema, or `sqlite_get_schema_version` to check the version.
+
+**`restore_point_id` shape change (0.6.0):** with the per-VM chain-manifest subsystem retired, the `restore_point_id` for newly written rows changes shape from `<vm>:<period>:chain-YYYY-MM-DD-HHMMSS:N` to `<vm>:<period>:chain-YYYY-MM-DD:N`, aligning the identifier with the on-disk archive directory naming. This is operator-visible only in `--status` output; no code parses the identifier, and existing rows are left unchanged.
 
 ---
 
@@ -2061,6 +2105,22 @@ LIMIT 20;"
 ```
 
 **Wrapper function:** `sqlite_query_vm_history "web-server" 20`
+
+#### Report 2a: Restore History
+
+Recent restores logged by `vmrestore` — the same data surfaced by `vmbackup --status --restores`.
+
+```bash
+sqlite3 -header -column "$DB" "
+SELECT start_time, vm_name, restore_mode, status,
+       exit_code, dry_run, duration_sec, target_path
+FROM restore_sessions
+WHERE start_time >= datetime('now', '-30 days')
+ORDER BY start_time DESC
+LIMIT 20;"
+```
+
+**Wrapper function:** `sqlite_query_recent_restores 30`
 
 #### Report 3: Monthly Summary (per VM)
 
@@ -2275,7 +2335,7 @@ When running in `--replicate-only` mode, the session summary uses a simplified f
 
 ### Overview
 
-The email report module (`email_report_module.sh`) generates plaintext reports and sends them via `msmtp`. It reads **exclusively from the SQLite database** using session-scoped queries.
+The email report module (`email_report_module.sh`) generates plaintext reports and sends them via `msmtp`. It sources backup, replication and chain data **primarily from the SQLite database** using session-scoped queries, supplemented by direct filesystem reads for storage figures (`df`/`du`) and the session-filtered log attachment.
 
 **Data sources:**
 
@@ -2413,13 +2473,14 @@ All paths below are relative to `$BACKUP_PATH/` (instance-specific backup direct
 
 ### Log Files
 
-vmbackup creates extensive logs across several directories. Per-VM and replication logs are automatically cleaned up by `cleanup_old_logs()` after `LOG_KEEP_DAYS` (default 30). The main `vmbackup.log` is a single appending file that is not rotated.
+vmbackup creates extensive logs across several directories. Per-VM and replication logs are automatically cleaned up by `cleanup_old_logs()` after `LOG_KEEP_DAYS` (default 30). The central `vmbackup.log` and `vmprune.log` files are rotated when they exceed `LOG_MAX_BYTES` (default 50 MiB) — the oversized file is renamed to `<name>.<epoch>` and a fresh empty file is created. Rotated files then age out via the same `LOG_KEEP_DAYS` rule.
 
 #### Main Session Log
 
 | File | Location | Purpose | Accumulation |
 |------|----------|---------|--------------|
-| `vmbackup.log` | `_state/logs/` | Main session log (appended each run) | Grows indefinitely |
+| `vmbackup.log` | `_state/logs/` | Main session log (appended each run) | Rotated at `LOG_MAX_BYTES`; rotated files aged out via `LOG_KEEP_DAYS` |
+| `vmbackup.log.<epoch>` | `_state/logs/` | Previously-rotated session log | Deleted after `LOG_KEEP_DAYS` |
 
 #### Per-VM Backup Logs
 
@@ -2483,21 +2544,24 @@ Log files are automatically cleaned up after being captured in state backups:
 |---------|---------|--------|
 | `STATE_BACKUP_KEEP_DAYS` | 90 | Days to keep state-*.tar.gz archives |
 | `LOG_KEEP_DAYS` | 30 | Days to keep live log files |
+| `LOG_MAX_BYTES` | 52428800 (50 MiB) | Size cap for central `vmbackup.log` / `vmprune.log` before rotation |
 
 **Cleanup behavior (`cleanup_old_logs()`):**
-1. Daily state backup created (captures all current logs)
-2. Old state archives deleted (> `STATE_BACKUP_KEEP_DAYS`)
-3. Old log files deleted (> `LOG_KEEP_DAYS`)
+1. Invoked once per calendar day at session start (gated by `${STATE_DIR}/.last_rotation` sentinel)
+2. Size-based pre-rotation: if `vmbackup.log` or `vmprune.log` exceeds `LOG_MAX_BYTES`, the file is renamed to `<name>.<epoch>` and a fresh empty file is created (root:backup, mode 0640)
+3. Daily state backup created (captures all current logs)
+4. Old state archives deleted (> `STATE_BACKUP_KEEP_DAYS`)
+5. Old log files deleted (> `LOG_KEEP_DAYS`) — includes per-VM logs, replication logs, email debug logs, and rotated `vmbackup.log.<epoch>` / `vmprune.log.<epoch>` files
 
 | Directory | Contents | Rotation |
 |-----------|----------|----------|
-| `_state/logs/` | vmbackup.log + per-VM logs | `LOG_KEEP_DAYS` (per-VM only) |
+| `_state/logs/` | vmbackup.log + vmprune.log + per-VM logs | `LOG_MAX_BYTES` (central, size-based) + `LOG_KEEP_DAYS` (per-VM + rotated central) |
 | `_state/replication_logs/cloud/` | Cloud endpoint logs | `LOG_KEEP_DAYS` |
 | `_state/replication_logs/local/` | Local transport logs | `LOG_KEEP_DAYS` |
 | `_state/email/` | Email debug files | `LOG_KEEP_DAYS` |
 | `_state/backups/` | State backup archives | `STATE_BACKUP_KEEP_DAYS` |
 
-> **Note:** The main `vmbackup.log` file is not rotated (single appending file). Per-VM logs (`backup_<vm>_<epoch>.log`) are cleaned up after `LOG_KEEP_DAYS`.
+> **Note:** Central `vmbackup.log` and `vmprune.log` are held open by the running session via append-redirect. When rotation triggers, the running session continues writing to the renamed `.epoch` file; the next session opens the fresh empty file. This is race-free by construction (no `copytruncate` window).
 
 ---
 
@@ -2749,7 +2813,6 @@ After a month of daily incremental backups, the chain contains a full backup plu
 
 ```
 /mnt/backup/vms/prod-webserver/
-├── chain-manifest.json
 └── 202602/                          ← ACTIVE (monthly: YYYYMM)
     ├── vda.full.data                # 11.4 GiB (checkpoint 0)
     ├── vda.inc.virtnbdbackup.1-27.data  # ~6.5 GiB total

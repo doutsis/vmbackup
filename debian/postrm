@@ -10,10 +10,11 @@ case "$1" in
         systemctl stop vmbackup.service 2>/dev/null || true
         systemctl daemon-reload 2>/dev/null || true
 
-        # Remove symlink
+        # Remove symlinks
         rm -f /usr/local/bin/vmbackup
+        rm -f /usr/local/bin/vmrestore
         echo "vmbackup removed. Config files in /opt/vmbackup/config/ preserved."
-        echo "To fully clean up: rm -rf /opt/vmbackup /var/log/vmbackup"
+        echo "To fully clean up: rm -rf /opt/vmbackup /var/log/vmbackup /var/log/vmrestore"
         ;;
     purge)
         # Stop and disable systemd units
@@ -36,7 +37,9 @@ case "$1" in
 
         # Full cleanup
         rm -f /usr/local/bin/vmbackup
+        rm -f /usr/local/bin/vmrestore
         rm -rf /var/log/vmbackup
+        rm -rf /var/log/vmrestore
         rm -rf /run/vmbackup
         # Note: /opt/vmbackup/ is removed by dpkg for packaged files,
         # but user-created config instances will remain

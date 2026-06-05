@@ -30,3 +30,9 @@ build/
 *.tar.xz
 *.dsc
 test_052_*.log
+
+# Phase 3 test scratch dir
+tests/tmp/
+
+# Repo-local SQLite catalogue from source-tree dev runs
+/_state/

@@ -238,7 +238,7 @@ _log_cloud_replication_config() {
     local config_file="${CLOUD_REPLICATION_CONF:-}"
     
     # Skip DB writes in dry-run mode (matches sqlite session policy)
-    [[ "${DRY_RUN:-false}" == true ]] && return 0
+    is_dry_run && return 0
     
     # Bail if sqlite not available
     if ! type sqlite_log_config_event &>/dev/null; then
@@ -550,7 +550,7 @@ cloud_replication_process_destination() {
     fi
     
     # Check if dry-run mode
-    if [[ "${CLOUD_REPLICATION_DRY_RUN:-no}" == "yes" ]]; then
+    if [[ "${CLOUD_REPLICATION_DRY_RUN:-no}" == "yes" ]]; then  # [DRY-RUN-KEEPER: yes/no convention (B), see 109-phase7-spec.md §1.3.2]
         cloud_replication_dry_run "$dest_num" "$source_path"
         return $?
     fi
@@ -1435,7 +1435,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
             echo "╚════════════════════════════════════════════════════════════╝"
             echo ""
             echo "Source path: $SOURCE_PATH"
-            echo "Dry run:     $( [[ $DRY_RUN -eq 1 ]] && echo "YES" || echo "NO" )"
+            echo "Dry run:     $( [[ $DRY_RUN -eq 1 ]] && echo "YES" || echo "NO" )"  # [DRY-RUN-KEEPER: standalone CLI sub-handler, integer flag (C), see 109-phase7-spec.md §1.3.2]
             echo ""
             
             if [[ ! -d "$SOURCE_PATH" ]]; then
@@ -1451,7 +1451,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
             echo "  Size:  $total_size"
             echo ""
             
-            if [[ $DRY_RUN -eq 1 ]]; then
+            if [[ $DRY_RUN -eq 1 ]]; then  # [DRY-RUN-KEEPER: standalone CLI sub-handler, integer flag (C), see 109-phase7-spec.md §1.3.2]
                 echo "DRY RUN MODE - Testing connectivity only"
                 echo ""
                 

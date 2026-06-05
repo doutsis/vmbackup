@@ -389,14 +389,17 @@ transport_verify() {
             return 0
             ;;
         size)
-            return $(_local_verify_size "$source_path" "$dest_path")
+            _local_verify_size "$source_path" "$dest_path"
+            return $?
             ;;
         checksum)
-            return $(_local_verify_checksum "$source_path" "$dest_path")
+            _local_verify_checksum "$source_path" "$dest_path"
+            return $?
             ;;
         *)
             _local_log_warn "verify" "Unknown verify mode: $verify_mode, defaulting to size"
-            return $(_local_verify_size "$source_path" "$dest_path")
+            _local_verify_size "$source_path" "$dest_path"
+            return $?
             ;;
     esac
 }

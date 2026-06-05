@@ -9,8 +9,14 @@
 # All messages always written to log file. Only messages at or above
 # the configured level are shown on stderr.
 
-# Map log levels to numeric values for comparison
-declare -A _LOG_LEVELS=([ERROR]=3 [WARN]=2 [INFO]=1 [DEBUG]=0)
+# UNI-321: idempotency guard — re-source is a no-op once log_msg is defined.
+declare -F log_msg >/dev/null 2>&1 && return 0
+
+# Map log levels to numeric values for comparison.
+# UNI-321: -g so the array stays global when this lib is sourced via the
+# source_lib_or_die helper (`source` inside a function scopes `declare`
+# vars to that function unless -g is used; functions stay global either way).
+declare -gA _LOG_LEVELS=([ERROR]=3 [WARN]=2 [INFO]=1 [DEBUG]=0)
 
 # Get numeric value for configured log level (default: INFO)
 _get_log_level_value() {
@@ -29,8 +35,13 @@ log_msg() {
   local timestamp=$(date '+%Y-%m-%d %H:%M:%S %Z')
   local log_line="[$timestamp] [$level] [$process] [$function] $message"
 
-  # Always write to log file
-  echo "$log_line" >> "$LOG_FILE"
+  # UNI-001 lift exposed a latent bug: previous inline vmrestore _log()
+  # guarded with [[ -n "$LOG_FILE" ]] before writing; this lib unconditionally
+  # appended and errored when callers logged before init_logging set LOG_FILE.
+  # Match the old vmrestore semantics: skip file write when LOG_FILE unset.
+  if [[ -n "${LOG_FILE:-}" ]]; then
+    echo "$log_line" >> "$LOG_FILE"
+  fi
 
   # Only display on screen if message level >= configured level
   local msg_level="${_LOG_LEVELS[$level]:-1}"

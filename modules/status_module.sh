@@ -877,14 +877,34 @@ _status_policies() {
     fi
 }
 
+# Phase 8 (UNI-902b): present recent restore_sessions rows.
+# Mirrors _status_failures pattern: query helper, empty check, byte/duration
+# formatting via _format_status_output. duration_sec is column 8 (1-based).
+# No byte columns (restore byte counts are not yet populated).
+_status_restores() {
+    local vm_name="$1" days="$2" csv="$3"
+    local output_mode="pipe"
+    [[ "$csv" == "true" ]] && output_mode="csv"
+
+    local data
+    data=$(sqlite_query_recent_restores "$days" "$vm_name" "$output_mode")
+    _status_check_empty "$data" || return 0
+
+    if [[ "$csv" == "true" ]]; then
+        echo "$data" | _format_csv_output "" "8"
+    else
+        echo "$data" | _format_status_output "" "8"
+    fi
+}
+
 #################################################################################
 # ENTRY POINT
 #################################################################################
 
 # Main entry point for --status reporting
 # Arguments:
-#   $1 - sub_mode: default|vm|failures|replication|chains|storage|policies
-#   $2 - vm_name (for vm and chains modes)
+#   $1 - sub_mode: default|vm|failures|replication|chains|storage|policies|restores
+#   $2 - vm_name (for vm, chains, restores modes)
 #   $3 - days (default 1)
 #   $4 - csv flag: true or false
 run_status_report() {
@@ -900,6 +920,7 @@ run_status_report() {
         chains)       _status_chains "$vm_name" "$csv" ;;
         storage)      _status_storage "$csv" ;;
         policies)     _status_policies "$csv" ;;
+        restores)     _status_restores "$vm_name" "$days" "$csv" ;;
         *)
             echo "Error: Unknown status report mode: $sub_mode" >&2
             return 1

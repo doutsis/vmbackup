@@ -4,6 +4,58 @@ All notable changes to [vmbackup](https://github.com/doutsis/vmbackup) will be d
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.6.0] - 2026-06-05
+
+**Unification release.** `vmbackup` and `vmrestore` now ship from one source tree as one Debian package containing two binaries. Both binaries always carry the same version, share a single `lib/` of cross-tool helpers, and read from a single SQLite catalogue. Existing flags, invocations, systemd units, and operator scripts continue to work unchanged. The old standalone `vmrestore` package is replaced cleanly on upgrade.
+
+### Added
+
+- **Unified package** — `vmbackup` and `vmrestore` ship from a single source tree, build via one `Makefile`, and install from one `.deb`. The package declares `Provides: vmrestore`, `Replaces: vmrestore (<< 0.6.0)`, and `Conflicts: vmrestore (<< 0.6.0)`, so `apt` removes the old standalone `vmrestore` package automatically on upgrade. The `vmrestore` binary continues to live at `/usr/local/bin/vmrestore` (symlink to `/opt/vmbackup/vmrestore.sh`).
+- **Shared `lib/` consumed by both binaries** — 16 libraries now provide one canonical implementation of behaviour that was previously duplicated or divergent across the two tools: logging, exit codes, versioning, per-VM locking, signal traps, config-instance resolution, period handling, the backup-tree walker, the read-only SQLite reader, path and VM-name helpers, TPM artefact reading, and the `virtnbdbackup` / `virtnbdrestore` and `virsh` wrappers. Where a behaviour exists in both binaries it now comes from exactly one place, so they can no longer disagree by accident.
+- **`vmrestore` is catalogue-aware** — `vmrestore --list` reads the same SQLite catalogue that drives `vmbackup --status --chains` and appends a per-VM `Chains: <N> active, <N> broken, last backup <ISO>` line. Falls back to walker-only output when the catalogue is unavailable, preserving the standalone DR contract.
+- **`vmrestore` writes restore-session rows to the catalogue** — schema bumped to v2.2 with a new `restore_sessions` table. Every invocation records start, end, VM, restore type, and final outcome. A new `vmbackup --status --restores` subcommand reads the table, so backup and restore history live in one place. Catalogue failures degrade to a single `WARN` and never block the restore; `--dry-run` writes no row.
+- **`vmrestore` gains per-VM locking and signal handlers** — restoring a VM now takes the same lock a backup of that VM takes, so backup and restore can no longer race each other. SIGINT and SIGTERM clean up staging directories and partial disk files.
+- **`vmrestore --restore-path` overlap guard** — refuses any path that equals or sits inside a configured `vmbackup` `BACKUP_PATH` (checked across all config instances), preventing accidental restores into the live backup tree.
+- **Broken-chain detector for `vmrestore`** — incomplete chains (truncated by an interrupted backup, or partially archived) are no longer offered as the default `latest` restore target. The reason for skipping is logged so the operator can override with `--include-incomplete` (forensic use only).
+- **In-session re-entry guard for chain archival** — `vmbackup` refuses to archive the same VM twice within one invocation, eliminating collision-suffixed `.archives/chain-<date>.1` directories.
+- **Misplaced-database guard** — `vmbackup` refuses to create the SQLite catalogue inside `.archives/` or under a period directory, closing a class of bugs where a misconfigured backup path could spawn a second catalogue that silently diverged from the canonical one.
+- **`vmbackup --cleanup-stale-manifests`** — one-shot subcommand that removes leftover per-VM `chain-manifest.json` files from the backup tree. Invoked automatically by `debian/postinst` on package upgrade and safe to re-run manually.
+
+### Changed
+
+- **`chain_health.archive_size_bytes` populated at archive transition** — the retention-path archive caller now writes the archive size immediately, matching the active-path caller. Previously the column stayed at 0 until manual reconciliation.
+- **TPM-restore reporting is now truthful** — when disks restore successfully but TPM/BitLocker unlock fails, `vmrestore` no longer reports overall success. The summary line carries a `TPM ✓` / `TPM ✗ (manual unlock required)` token (omitted on VMs without TPM).
+- **SharePoint replication verify logs actionable diagnostics on mismatch** — when the post-upload `rclone check` reports a difference, the cloud transport now logs the `rclone check` exit code, elapsed time, and the specific differing/missing files, replacing the previous opaque `Found differences` message. Transient SharePoint verify warnings are now diagnosable instead of mysterious.
+
+### Fixed
+
+- **False-positive backup failures from substring `ERROR` matches in the `virtnbdbackup` log** — the post-run guard used a case-insensitive substring match for `ERROR`, which mis-flagged successful runs whenever the log mentioned `internal error`, `ERROR — trim not supported`, or carried ANSI colour codes. False positives recorded the chain as failed and promoted the next monthly backup from incremental to full, inflating destination write volume. Now anchored to `virtnbdbackup`'s own log-line format and ANSI-stripped. Originally reported and proposed by **@hostarts** with co-author **@houssamchergui**.
+- **Email notifier "intentionally skipped" return value logged as a delivery failure** — all four `send_backup_report` call sites collapsed the notifier's three return values (delivered / transport failure / intentionally skipped) into pass-or-fail, so operators who set `EMAIL_ON_SUCCESS=no` saw a misleading "Failed to send email report" WARN on every successful run. A new `_handle_notifier_rc` dispatcher distinguishes the three cases and is wired into all four call sites. Originally proposed by **@hostarts** (email-only scope adopted).
+- **`get_last_backup_timestamp()` blind to archived chains** — the probe's `find -maxdepth` was too shallow to see archived data after the chain-archive layout change, so offline-unchanged VMs were treated as having no prior backup and re-ran a full backup nightly. Probe depth corrected; the offline-skip path now fires as intended.
+- **False "incomplete backup" WARN on clean shutdown** — `cleanup_on_exit` emitted a misleading WARN on every clean exit because its duplicate-call gate was an in-memory flag the success path could not clear before the trap fired. The gate now uses the `sqlite_session_end()` return code itself. Independently reported by **@hostarts** in PR #4.
+- **TPM artefact validation accepted empty bundles** — `validate_tpm_backup()` was `-s`-testing the `tpm2/` directory instead of its files, so an empty TPM bundle passed validation. Replaced with a per-file size check and a minimum-size floor on `tpm2-00.permall`.
+- **`xmllint` listed as required but never invoked** — phantom dependency removed.
+- **Dead `restore_vm_tpm()` body removed** — had different semantics from `vmrestore`'s `restore_tpm()` and would have corrupted a recovery if ever called. Already marked `# DEAD CODE`; now physically gone.
+- **Undefined VM-name sanitisation helper in prune paths** — `vmbackup`'s prune code paths called a helper that had never been defined, so the call was a silent no-op. Replaced by the canonical helper in `lib/vm_name_utils.sh`.
+- **NVRAM/disk coherency on restore (`BdsDxe: No mapping` boot failure)** — `vmrestore` paired restored disks with the *live* host NVRAM instead of the NVRAM captured at the backed-up checkpoint, so restoring an older period over a VM that had since rebooted left UEFI variables (SecureBoot keys, `BootOrder`, MOK) out of step with the disks and the guest failed to boot. It now pairs each restore with the matching checkpoint's NVRAM — clones and in-place alike — backing up the live NVRAM to `<path>.before-restore.<timestamp>` first.
+- **`chain_check_complete` false-positive on chains containing CD-ROM devices** — the completeness check treated every `<disk>` in the libvirt checkpoint XML as a data disk, but that XML carries no `device=` attribute, so CD-ROMs (which `virtnbdbackup` correctly skips) were indistinguishable from genuinely missing disks — flagging healthy chains `⚠ INCOMPLETE` in `--list-restore-points` and refusing them without `--include-incomplete`. The check now consults the per-checkpoint domain XML snapshot, which preserves `device='cdrom'`, and skips those phantom targets. Chains without that snapshot keep prior behaviour.
+- **Stale `chain_id` recorded on SIGTERM / SIGINT** — interrupted backups wrote a `chain_health` row whose `chain_id` was derived from an in-memory index that had never been committed to disk, so the interrupted-chain entry could not be correlated with anything retention or restore could see. The id is now derived from the on-disk chain layout, so the row matches the chain that actually exists.
+- **`vmrestore` skipped valid restore points on large backup trees (SIGPIPE under `pipefail`)** — the chain-presence probe used `find … | grep -q .`; with `set -o pipefail` now globally enabled, `grep -q` closed the pipe on the first match and the resulting SIGPIPE made `find` exit non-zero, so `has_backup_data()` wrongly returned false. Rewritten to `find … -print -quit`. The same pipefail-vulnerable idiom was audited and fixed everywhere it occurred (across `vmbackup.sh`, `lib/chain_validation.sh`, and an integration test).
+- **`_state/logs/` rotation never ran; central logs grew unbounded** — the rotation routine was gated behind a directory that no code path ever created, so it had been dead since the early-2026 modular refactor: per-VM, replication, and email logs accumulated indefinitely, and `vmbackup.log` / `vmprune.log` grew append-only forever. Rotation now runs at most once per calendar day from the pre-backup hook, and the central logs are size-capped by a new `LOG_MAX_BYTES` knob (default 50 MiB) — an oversized file is rolled to `<name>.<epoch>` and aged out under the existing `LOG_KEEP_DAYS` rule. Deployed installs inherit the default with no config change; the first post-upgrade session clears the accumulated backlog.
+
+### Removed
+
+- **Standalone `vmrestore` Debian package** — `vmrestore` now ships from the `vmbackup` package via `Provides: vmrestore`. Upgrade is automatic via `apt`; previously published `vmrestore_0.5.x_all.deb` artefacts remain reachable on prior GitHub releases.
+- **Per-VM chain-manifest subsystem** — the `chain-manifest.json` index and the 678-line module that maintained it have been removed. Its rebuild logic predated the current on-disk layout and matched no files, so every retention or prune pass wiped the manifest to empty and the post-backup write repopulated it from that empty state. The remaining callers now derive chain identity, restore-point counts, and archive transitions from the on-disk layout and the SQLite catalogue, which is now the single source of truth for chain state. Leftover manifest files are reaped automatically on upgrade by the new `--cleanup-stale-manifests` subcommand.
+  - **Behavioural change:** `restore_point_id` shape for new rows changes from `<vm>:<period>:chain-YYYYMMDD-HHMMSS:N` to `<vm>:<period>:chain-YYYY-MM-DD:N`, aligning with the archive directory naming. Operator-visible in `vmbackup --status` only; no code parses the id.
+
+### Notes on the unification
+
+- The CLI surface of both binaries is unchanged. Every flag, invocation, systemd unit, alias, monitoring rule, and operator runbook from `0.5.6` (vmbackup) and `0.5.4` (vmrestore) continues to work.
+- Configuration files are unchanged. Existing `/opt/vmbackup/config/` instances continue to load.
+- The database schema is migrated automatically from any v1.x or v2.x version to v2.2; downgrade is not supported (loud failure, not silent corruption).
+- `vmrestore` still works in true disaster-recovery situations where the catalogue is missing or unreadable. It checks for the catalogue first; if it's not available, it logs a single `WARN` and falls back to reading the backup files directly from disk.
+
 ## [0.5.6] - 2026-04-26
 
 ### Changed
@@ -109,7 +161,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Version
 - **`--prune` without target silently no-ops** — Running `--prune` with no target argument exited 0 without doing anything. Now prints an error with valid targets and exits 1.
 - **`--prune` with unknown target silently no-ops** — Running `--prune banana` was silently ignored. Now prints an error with the valid target list and exits 1.
 - **`--prune period/chain/all` without `--vm` gives confusing error** — These targets require a VM name but the error was a generic path-not-found deep in the execution. Now validates early with a clear message: `--prune <target> requires --vm NAME`.
-- **`--vm` without `--prune` silently ignored** — Passing `--vm dev-win11` to a normal backup run had no effect and no feedback. Now prints a warning: `--vm has no effect without --prune (ignored)`.
+- **`--vm` without `--prune` silently ignored** — Passing `--vm my-vm` to a normal backup run had no effect and no feedback. Now prints a warning: `--vm has no effect without --prune (ignored)`.
 - **Accumulate-policy `period_id` mismatch** — `get_period_id("accumulate")` returned an empty string, causing `chain_health` rows to be keyed on `period_id=""`. The archive path derivation in `archive_existing_checkpoint_chain()` used `basename(dirname(archive))` which produced the VM name instead of `""`, so `sqlite_archive_chain()` matched zero rows and the archive went unrecorded. Fixed: `get_period_id("accumulate")` now returns `"accumulate"`, and the archive path derivation uses `get_period_id()` directly with a `basename` fallback.
 - **virtnbdbackup false-success detection** — `perform_backup()` trusted the exit code alone. virtnbdbackup sometimes exits 0 despite logging ERROR lines (e.g., target directory conflicts, bitmap issues, extent read failures). Added post-completion log scan: any ERROR in the captured output now triggers `VIRTNBD_FALSE_SUCCESS` failure and aborts the backup.
 - **Email duration wrong during DST fall-back** — `session_start_time` and `session_end_time` were formatted without a timezone suffix (`%Z`), making `date -d` epoch conversion ambiguous during DST transitions. Added `%Z` to all three capture sites (main, SIGTERM handler, session end) so the email module's duration calculation is unambiguous.
@@ -158,3 +210,113 @@ Initial public release.
 - Configuration instances for multi-environment deployments.
 - Dry-run mode (`--dry-run`) for safe previewing.
 - Security model: root:backup ownership, 750/640 permissions, SGID inheritance.
+
+---
+
+## Pre-unification vmrestore history
+
+# Changelog
+
+All notable changes to [vmrestore](https://github.com/doutsis/vmrestore) will be documented in this file.
+
+Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions follow [Semantic Versioning](https://semver.org/).
+
+## [0.5.4] - 2026-04-26
+
+### Changed
+
+- **Structured exit codes** — categorised non-zero exits (config / storage / VM / tool / CLI / dependency) let monitoring distinguish *why* a run failed without parsing logs. Symmetric with vmbackup.
+
+## [0.5.3] - 2026-04-12
+
+### Fixed
+
+- **`--help` showed wrong version** — `usage()` hardcoded `v0.5.1` while `--version` showed `0.5.2`. Version string now uses `$VERSION` variable.
+
+### Removed
+
+- **`--host-config` removed** — Host config backup was removed in vmbackup v0.5.3. The `--host-config` flag, `restore_host_config()` function, and `__HOST_CONFIG__` display in `--list` output have been stripped entirely. The `--host-target` flag is also removed.
+
+### Added
+
+- **`--config-instance` flag** — Select a named vmbackup config instance (e.g., `--config-instance prod`). Falls back to `VMBACKUP_INSTANCE` environment variable, then `default`. Exits with an error if the specified instance does not exist.
+
+## [0.5.2] - 2026-03-29
+
+### Changed
+
+- **Per-checkpoint disk column in `--list-restore-points`** — Each restore point row now shows a `Disk(s)` column listing the disks backed up at that specific checkpoint. Replaces the previous top-level `Disks:` summary that showed the union across all checkpoints — which was misleading when disks were added or removed mid-chain.
+
+- **`--list` disk tag reflects latest checkpoint** — The `[vda, vdb, ...]` disk tag in `--list` output now shows the disk set from the latest checkpoint only, matching the VM's current configuration. Previously showed the union across all checkpoints, which could include disks no longer attached to the VM.
+
+### Fixed
+
+- **Point-in-time restore lost disks when VM configuration changed mid-chain** — `virtnbdrestore` always read the latest `vmconfig`, silently dropping disks that existed at the target checkpoint but not at the latest (e.g. a 3-disk VM at checkpoint 0 becomes 2 disks at checkpoint 3 — restoring to checkpoint 0 would only restore 2 disks). vmrestore now detects disk configuration changes and creates a lightweight staging directory (symlinks to `.data` files + the correct checkpoint's `vmconfig`) so `virtnbdrestore` sees only the right configuration. `predict_output_files()` also used the latest config, so clone staging would silently discard restored disks that weren't predicted — a data loss scenario. It now accepts a config override when PIT staging detects a change. Works across all restore modes: DR, clone, disk restore, and dry-run. Applies to both active and archived chains.
+
+- **`--disk` fell through to full-VM restore on single-disk VMs** — When `--disk` was used on a VM with only one disk, vmrestore counted the available disks and, finding only one, silently switched to full-VM restore mode — undefining the VM from libvirt and attempting a DR reconstruct. Single-disk VMs now follow the same disk-restore code path as multi-disk VMs: in-place disk replacement with `.pre-restore` backup, no VM definition changes, no UUID/MAC changes. `--disk` without `--restore-point` now also fails with a clear error when the requested disk doesn't exist at the latest checkpoint, showing which checkpoint it was last seen at (previously fell through to `virtnbdrestore` with an opaque error).
+
+## [0.5.1] - 2026-03-22
+
+### Added
+
+- **Multi-disk `--disk` support** — `--disk vda,vdb,sda` restores multiple disks in one pass. `--disk all` restores every disk. Each disk gets its own `.pre-restore` backup. Refuses if any `.pre-restore` file already exists.
+- **`.pre-restore` overwrite protection** — if a `.pre-restore` backup file already exists for a disk, vmrestore refuses to proceed rather than silently overwriting. Prevents accidental loss of the safety net.
+- **`--list-restore-points` shows all periods** — previously only showed the current (latest) retention policy period. Now iterates all period directories (newest first), each with its own section header, restore points, and archived chains.
+- **`--list-restore-points` shows archived chain restore points** — archived chains are expanded inline showing their restore points, so users can see exactly what's available for `--restore-point` without manually inspecting `.archives/` directories.
+- **`--list-restore-points` accepts full paths** — `--list-restore-points /path/to/.archives/chain-2026-03-04` now works like `--vm` does (splits into basename + dirname). Previously only accepted a VM name.
+- **`--version` / `-V` flag** — prints version and exits.
+
+### Changed
+
+- **`--list` redesign** — VM name and size on own line (no column overflow for long names). Restore points summed across all periods (not just one). Type detected from the most recently modified period. Proper pluralisation ("1 point", "8 archives"). Multi-disk VMs show `[sda, vda, vdb]` disk tags. Archive count hidden when zero.
+- **`Restore Point` column replaces `Checkpoint`** — the `--list-restore-points` output now shows a `Restore Point` column header with just the number (matching `--restore-point N`), date, and type. Internal checkpoint names (`virtnbdbackup.N`) removed — users don't interact with them.
+
+### Fixed
+
+- **Empty period skip** — `--list` and restore operations now skip empty period directories (created by rotation before the first backup runs). Previously, an empty newest period caused `--list` to show "unknown" type and restores to fail with "No backup data files".
+- **Restore point numeric sort fix** — chains with 10+ restore points now display in correct numeric order. Previously used lexicographic glob ordering (0, 1, 10, 11, ..., 2) instead of (0, 1, 2, ..., 10, 11).
+
+## [0.5] - 2026-03-14
+
+### Added
+
+- **`--disk` single-disk restore mode** — restore or replace a single disk from a multi-disk backup without touching the VM definition or other disks. Supports in-place replacement (`--disk vda`) and staging extract (`--disk vda --restore-path /tmp/extract`).
+- **`.pre-restore` safety backup** — before in-place disk replacement, the original disk image is renamed to `.pre-restore` so the previous state is recoverable.
+- **`--no-pre-restore` flag** — skip the `.pre-restore` safety backup when disk space is tight.
+
+## [0.4] - 2026-03-10
+
+### Added
+
+- **Multi-disk VM support** — `enumerate_disks()` discovers all disks in a backup. Restore handles VMs with multiple virtual disks (vda, vdb, sda, etc.).
+- **Pre-disk-restore baseline** — foundation for the `--disk` mode added in v0.5.
+- **Test suite** — tests 1–12 covering DR, clone, point-in-time, verify, host-config, dry-run.
+- **Packaging** — Makefile and debian/ packaging for `.deb` builds.
+
+### Fixed
+
+- **Bug fixes** — storage pool refresh fix, logging improvements, pre-flight safety check refinements.
+
+## [0.3] - 2026-03-06
+
+### Added
+
+- **Disk collision protection** — predicts output file paths before restore and checks for conflicts. If target disk images already exist, restore is blocked with a clear error.
+- **Staging directory** — clone restores write to a temporary staging directory, then move disks to the final location, preventing partial overwrites on failure.
+- **Skip-config** — `--skip-config` skips VM definition and TPM restore (disk-only extract).
+- **Post-restore integrity** — `qemu-img check` runs automatically after restore completes.
+- **NVRAM isolation** — clone gets its own UEFI firmware state file.
+
+## [0.2] - 2026-03-02
+
+### Added
+
+- **Clone mode (`--name`)** — creates an independent copy with new UUID, new MACs, and a new name. One flag transforms a DR restore into a clone.
+- **TPM/BitLocker restore** — swtpm state directory is recreated at the correct UUID path for both DR and clone restores.
+- **New-identity define** — strips UUID and MACs from domain XML, renames, defines as a new VM.
+
+## [0.1] - 2026-02-20
+
+### Added
+
+- **Initial release** — wraps virtnbdrestore for single-command disaster recovery. Automatic backup type detection, period resolution, point-in-time restore via `--restore-point` and `--period`.

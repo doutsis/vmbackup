@@ -14,7 +14,6 @@
 # Dependencies:
 #   - rotation_module.sh      (policies, period IDs, paths)
 #   - logging_module.sh       (CSV logging schema v3.0)
-#   - chain_manifest_module.sh (JSON manifest management)
 #   - retention_module.sh     (per-VM retention enforcement)
 #   - config/default/         (configuration files)
 #
@@ -38,7 +37,7 @@ INTEGRATION_SCRIPT_DIR="${INTEGRATION_SCRIPT_DIR:-$(dirname "$(readlink -f "${BA
 
 load_vmbackup_modules() {
     local module module_path
-    local modules=(rotation_module.sh logging_module.sh chain_manifest_module.sh retention_module.sh)
+    local modules=(rotation_module.sh logging_module.sh retention_module.sh)
     
     for module in "${modules[@]}"; do
         module_path="${INTEGRATION_SCRIPT_DIR}/${module}"
@@ -172,8 +171,16 @@ pre_backup_hook() {
     # Create state backup at start of session
     declare -f backup_state_files >/dev/null 2>&1 && backup_state_files
     
-    # Initialize chain manifest
-    declare -f init_chain_manifest >/dev/null 2>&1 && init_chain_manifest "$vm_name"
+    # Daily log rotation (OPS-01): runs at most once per calendar day, independent
+    # of state-backup gating. Gated by ${STATE_DIR}/.last_rotation sentinel.
+    if declare -f cleanup_old_logs >/dev/null 2>&1; then
+        local rotation_sentinel="${STATE_DIR}/.last_rotation"
+        local today_stamp
+        today_stamp=$(date +%Y-%m-%d)
+        if [[ ! -f "$rotation_sentinel" ]] || [[ "$(cat "$rotation_sentinel" 2>/dev/null)" != "$today_stamp" ]]; then
+            cleanup_old_logs && echo "$today_stamp" > "$rotation_sentinel"
+        fi
+    fi
     
     # Handle accumulate policy - check chain depth limit
     if [[ "$policy" == "accumulate" ]]; then
@@ -247,30 +254,24 @@ post_backup_hook() {
     backup_dir=$(get_vm_backup_dir "$vm_name")
     
     if [[ "$backup_status" == "success" ]]; then
-        # Generate restore point ID
+        # Generate restore point ID (DUP-10: disk-derived, not manifest-derived)
         local chain_id
-        chain_id=$(get_active_chain "$vm_name")
-        
+        chain_id=$(get_active_chain_id_from_disk "$vm_name")
         if [[ -z "$chain_id" ]]; then
-            chain_id=$(generate_chain_id)
+            # First backup in this chain — derive from "now" using same shape
+            chain_id="chain-$(date +%Y-%m-%d)"
             log_debug "vmbackup_integration.sh" "post_backup_hook" \
-                "Generated new chain_id='$chain_id' for '$vm_name'"
-        else
-            log_debug "vmbackup_integration.sh" "post_backup_hook" \
-                "Using existing chain_id='$chain_id' for '$vm_name'"
+                "Initial chain_id='$chain_id' for '$vm_name' (no prior chain on disk)"
         fi
-        
+
+        # Unified count: same value used for restore_point_id and chain_health.
+        # Closes the L283 divergence the workaround comment documented.
         local checkpoint
-        checkpoint=$(count_period_restore_points "$vm_name" "$period_id")
-        
+        checkpoint=$(get_restore_point_count "$backup_dir")
+
         local restore_point_id
         restore_point_id=$(generate_restore_point_id "$vm_name" "$period_id" "$chain_id" "$checkpoint")
-        
-        # Add to manifest
-        if declare -f add_restore_point >/dev/null 2>&1; then
-            add_restore_point "$vm_name" "$restore_point_id" "$period_id" "$chain_id" \
-                "$checkpoint" "$backup_type" "" "$backup_size_bytes" ""
-        fi
+        # DUP-10: add_restore_point call removed (writer to dead file).
         
         # Log chain lifecycle for new chains
         if [[ "$checkpoint" -eq 0 ]] && declare -f log_chain_lifecycle >/dev/null 2>&1; then
@@ -280,24 +281,20 @@ post_backup_hook() {
         fi
         
         # G2/G7: Update chain health in SQLite (success)
-        # Use disk-based restore point count (not manifest-based $checkpoint) because
-        # rebuilt manifests only track checkpoints created after the rebuild, missing
-        # pre-existing ones. get_restore_point_count() counts actual .data files.
+        # DUP-10: $checkpoint is already the disk-based count (see chain_id derivation above).
         if declare -f sqlite_update_chain_health >/dev/null 2>&1; then
-            local disk_restore_points
-            disk_restore_points=$(get_restore_point_count "$backup_dir")
             sqlite_update_chain_health "$vm_name" "$period_id" "$backup_dir" \
-                "active" "${disk_restore_points:-$((checkpoint + 1))}" "" "" "$policy"
+                "active" "$checkpoint" "" "" "$policy"
         fi
         
     elif [[ "$backup_status" == "failed" ]]; then
-        # G1: Handle failure - log to chain health with error
+        # G1: Handle failure - log to chain health with error (DUP-10: disk-derived)
         local chain_id
-        chain_id=$(get_active_chain "$vm_name")
-        
+        chain_id=$(get_active_chain_id_from_disk "$vm_name")
+
         if [[ -n "$chain_id" ]] && declare -f sqlite_update_chain_health >/dev/null 2>&1; then
             local checkpoint
-            checkpoint=$(count_period_restore_points "$vm_name" "$period_id")
+            checkpoint=$(get_restore_point_count "$backup_dir")
             sqlite_update_chain_health "$vm_name" "$period_id" "$backup_dir" \
                 "active" "$checkpoint" "backup_failed" "$error_message" "$policy"
         fi

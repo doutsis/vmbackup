@@ -9,21 +9,39 @@
 #   make clean                Remove build artifacts
 #   make version              Show current version
 #
-# The version is read from VMBACKUP_VERSION in vmbackup.sh - bump it there.
+# The version is read from VMBACKUP_VERSION in lib/version.sh — bump it there.
+# (UNI-008 moved the constant out of vmbackup.sh into the shared lib.)
 ################################################################################
 
 PKG_NAME    := vmbackup
-VERSION     := $(shell grep '^VMBACKUP_VERSION=' vmbackup.sh | head -1 | sed 's/.*"\(.*\)"/\1/')
+# UNI-008: Version source moved from vmbackup.sh to lib/version.sh
+VERSION     := $(shell grep '^[[:space:]]*readonly[[:space:]]\+VMBACKUP_VERSION=' lib/version.sh | head -1 | sed 's/.*"\(.*\)"/\1/')
 ARCH        := all
 INSTALL_DIR := /opt/vmbackup
 BUILD_DIR   := build
 PKG_DIR     := $(BUILD_DIR)/$(PKG_NAME)_$(VERSION)_$(ARCH)
 DEB_FILE    := $(PKG_DIR).deb
 
-.PHONY: package clean deploy version install uninstall
+.PHONY: package clean deploy version install uninstall test lint lint-baseline
 
 version:
 	@echo "$(PKG_NAME) $(VERSION)"
+
+# Run all tests under tests/. Each test is a self-contained bash script that
+# exits 0 on pass, non-zero on fail. Naming convention: {ticket}-{phase}-{description}.sh
+# (e.g. tests/109-phase3-period-vectors.sh). See tests/README.md for details.
+test:
+	@set -e; \
+	if [ ! -d tests ] || [ -z "$$(ls tests/*.sh 2>/dev/null)" ]; then \
+		echo "no tests in tests/"; exit 0; \
+	fi; \
+	pass=0; fail=0; failed=""; \
+	for t in tests/*.sh; do \
+		printf '== %s ==\n' "$$t"; \
+		if bash "$$t"; then pass=$$((pass+1)); else fail=$$((fail+1)); failed="$$failed $$t"; fi; \
+	done; \
+	echo; echo "tests: $$pass passed, $$fail failed"; \
+	if [ $$fail -gt 0 ]; then echo "failed:$$failed"; exit 1; fi
 
 package: clean
 	@echo "=== Building $(PKG_NAME) $(VERSION) ==="
@@ -39,6 +57,7 @@ package: clean
 
 	# --- Main scripts (750: root + backup group, no world) ---
 	install -m 750 vmbackup.sh             $(PKG_DIR)$(INSTALL_DIR)/
+	install -m 750 vmrestore.sh            $(PKG_DIR)$(INSTALL_DIR)/
 
 	# --- Modules (640: root rw, backup group read, no world) ---
 	install -m 640 modules/*.sh            $(PKG_DIR)$(INSTALL_DIR)/modules/
@@ -64,11 +83,28 @@ package: clean
 
 	# --- Documentation ---
 	install -m 644 vmbackup.md $(PKG_DIR)$(INSTALL_DIR)/
+	install -m 644 vmrestore.md $(PKG_DIR)$(INSTALL_DIR)/
 
-	# --- systemd units ---
-	mkdir -p $(PKG_DIR)/lib/systemd/system
-	install -m 644 systemd/vmbackup.service $(PKG_DIR)/lib/systemd/system/
-	install -m 644 systemd/vmbackup.timer   $(PKG_DIR)/lib/systemd/system/
+	# --- systemd units (under /usr/lib per modern Debian; /lib is symlink) ---
+	install -d -m 755 $(PKG_DIR)/usr/lib/systemd/system
+	install -m 644 systemd/vmbackup.service $(PKG_DIR)/usr/lib/systemd/system/
+	install -m 644 systemd/vmbackup.timer   $(PKG_DIR)/usr/lib/systemd/system/
+
+	# --- /usr/share/doc/vmbackup: copyright + Debian changelog ---
+	install -d -m 755 $(PKG_DIR)/usr/share/doc/$(PKG_NAME)
+	install -m 644 debian/copyright $(PKG_DIR)/usr/share/doc/$(PKG_NAME)/copyright
+	# Generate proper Debian-format changelog from upstream CHANGELOG.md
+	printf '%s (%s) unstable; urgency=medium\n\n  * See /opt/vmbackup/CHANGELOG.md or upstream\n    https://github.com/doutsis/vmbackup/blob/main/CHANGELOG.md\n    for the full release history.\n\n -- James Doutsis <james@doutsis.com>  %s\n' \
+	  '$(PKG_NAME)' '$(VERSION)' "$$(date -R)" \
+	  | gzip -9n > $(PKG_DIR)/usr/share/doc/$(PKG_NAME)/changelog.Debian.gz
+	chmod 644 $(PKG_DIR)/usr/share/doc/$(PKG_NAME)/changelog.Debian.gz
+
+	# --- lintian overrides ---
+	install -d -m 755 $(PKG_DIR)/usr/share/lintian/overrides
+	install -m 644 debian/lintian-overrides $(PKG_DIR)/usr/share/lintian/overrides/$(PKG_NAME)
+
+	# --- Normalise directory permissions to 0755 (umask=002 leaks 0775) ---
+	find $(PKG_DIR) -type d ! -path '$(PKG_DIR)/DEBIAN' ! -path '$(PKG_DIR)/DEBIAN/*' -exec chmod 755 {} +
 
 	# --- DEBIAN metadata ---
 	sed 's/__VERSION__/$(VERSION)/' debian/control > $(PKG_DIR)/DEBIAN/control
@@ -108,12 +144,14 @@ install:
 
 	# --- Install files with correct permissions ---
 	install -m 750 vmbackup.sh             $(INSTALL_DIR)/
+	install -m 750 vmrestore.sh            $(INSTALL_DIR)/
 	install -m 640 modules/*.sh            $(INSTALL_DIR)/modules/
 	install -m 640 lib/*.sh                $(INSTALL_DIR)/lib/
 	install -m 750 transports/*.sh         $(INSTALL_DIR)/transports/
 	install -m 750 cloud_transports/*.sh   $(INSTALL_DIR)/cloud_transports/
 	install -m 640 config/template/*       $(INSTALL_DIR)/config/template/
 	install -m 644 vmbackup.md             $(INSTALL_DIR)/
+	install -m 644 vmrestore.md            $(INSTALL_DIR)/
 
 	# --- Default config: copy template if no existing config ---
 	@if [ ! -d "$(INSTALL_DIR)/config/default" ]; then \
@@ -134,6 +172,7 @@ install:
 
 	# --- PATH symlink ---
 	ln -sf $(INSTALL_DIR)/vmbackup.sh /usr/local/bin/vmbackup
+	ln -sf $(INSTALL_DIR)/vmrestore.sh /usr/local/bin/vmrestore
 
 	# --- Ensure backup group exists ---
 	@if ! getent group backup >/dev/null 2>&1; then \
@@ -186,11 +225,13 @@ uninstall:
 
 	# --- Remove installed files ---
 	rm -f /usr/local/bin/vmbackup
+	rm -f /usr/local/bin/vmrestore
 	rm -f /lib/systemd/system/vmbackup.service
 	rm -f /lib/systemd/system/vmbackup.timer
 	rm -f /etc/apparmor.d/local/abstractions/libvirt-qemu
 	rm -rf $(INSTALL_DIR)
 	rm -rf /var/log/vmbackup
+	rm -rf /var/log/vmrestore
 
 	systemctl daemon-reload 2>/dev/null || true
 
@@ -198,3 +239,55 @@ uninstall:
 	@echo "=== $(PKG_NAME) uninstalled ==="
 	@echo "Backup data was not touched."
 	@echo ""
+
+# ── Lint gate (added 2026-05-06 by Phase 3.5; see copilot/109-phase3.5-spec.md) ──
+#
+# `make lint` runs shellcheck across every tracked *.sh file, diffs against
+# tests/lint-baseline.txt, and fails ONLY on additions. Removals (improvements)
+# are silently allowed; pick them up at the next `make lint-baseline`.
+#
+# `make lint-baseline` regenerates tests/lint-baseline.txt from scratch. Use
+# after fixing a real bug surfaced by the gate, or rarely, to absorb a
+# warning that has been judged acceptable noise.
+#
+# The find-pipeline below is the canonical source of truth — keep it in
+# sync with copilot/109-phase3.5-spec.md §2 if either ever changes.
+
+lint-baseline:
+	@find . -name '*.sh' \
+	     -not -path './.git/*' \
+	     -not -path './tests/tmp/*' \
+	     -not -path './tests/fixtures/*' \
+	     -not -path './vmbackup-manager/*' \
+	     -not -path './build/*' \
+	     -not -path './archive/*' \
+	  | LC_ALL=C sort \
+	  | xargs shellcheck -f gcc 2>&1 \
+	  | LC_ALL=C sort -u \
+	  > tests/lint-baseline.txt
+	@echo "Regenerated tests/lint-baseline.txt ($$(wc -l < tests/lint-baseline.txt) lines)."
+
+lint:
+	@actual=$$(mktemp); \
+	find . -name '*.sh' \
+	     -not -path './.git/*' \
+	     -not -path './tests/tmp/*' \
+	     -not -path './tests/fixtures/*' \
+	     -not -path './vmbackup-manager/*' \
+	     -not -path './build/*' \
+	     -not -path './archive/*' \
+	  | LC_ALL=C sort \
+	  | xargs shellcheck -f gcc 2>&1 \
+	  | LC_ALL=C sort -u \
+	  > "$$actual"; \
+	added=$$(comm -13 tests/lint-baseline.txt "$$actual"); \
+	rm -f "$$actual"; \
+	if [ -n "$$added" ]; then \
+	  echo "make lint: NEW shellcheck findings not in tests/lint-baseline.txt:"; \
+	  echo "$$added"; \
+	  echo ""; \
+	  echo "Either fix the underlying issue, or (rarely) accept it by"; \
+	  echo "running 'make lint-baseline' and committing the new baseline."; \
+	  exit 1; \
+	fi; \
+	echo "make lint: OK (no new findings)."

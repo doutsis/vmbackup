@@ -5,6 +5,9 @@
 # Requires: $LOCK_DIR set before sourcing
 # Uses: log_warn, log_debug (from lib/logging.sh)
 
+# UNI-321: idempotency guard — re-source is a no-op once create_lock is defined.
+declare -F create_lock >/dev/null 2>&1 && return 0
+
 # Create lock file - ATOMIC creation to prevent race condition
 create_lock() {
   local vm_name=${1:?Error: vm_name required}

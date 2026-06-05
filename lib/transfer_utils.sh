@@ -33,11 +33,8 @@
 TU_LIB_NAME="transfer_utils"
 TU_LIB_VERSION="1.0"
 
-# Ensure library is only loaded once
-if [[ -n "$_TRANSFER_UTILS_LOADED" ]]; then
-    return 0
-fi
-_TRANSFER_UTILS_LOADED=1
+# UNI-321: idempotency guard — re-source is a no-op once tu_format_bytes is defined.
+declare -F tu_format_bytes >/dev/null 2>&1 && return 0
 
 #=============================================================================
 # BYTE FORMATTING

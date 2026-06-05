@@ -15,7 +15,6 @@
 # Dependencies:
 #   - rotation_module.sh: get_vm_rotation_policy(), get_retention_limit()
 #   - logging_module.sh: log_retention_action()
-#   - chain_manifest_module.sh: archive_chain_in_manifest()
 #
 # Usage:
 #   source retention_module.sh
@@ -56,12 +55,9 @@ _is_period_protected() {
     # If DB unavailable, allow deletion (backward compatible)
     [[ ! -f "$db_path" ]] && return 1
 
+    # Phase 4 commit 4a: typed read via lib/sqlite_ro.sh.
     local protected_count
-    protected_count=$(sqlite3 "$db_path" \
-        "SELECT COUNT(*) FROM chain_health
-         WHERE vm_name='$(echo "$vm_name" | sed "s/'/''/g")'
-         AND period_id='$(echo "$period_id" | sed "s/'/''/g")'
-         AND purge_eligible = 0;" 2>/dev/null)
+    protected_count=$(sqlite_get_protected_chain_count "$db_path" "$vm_name" "$period_id")
 
     if [[ "${protected_count:-0}" -gt 0 ]]; then
         log_info "retention_module.sh" "_is_period_protected" \
@@ -81,25 +77,14 @@ _is_period_replicated() {
     # If no DB or no replication configured, consider replicated (don't block)
     [[ ! -f "$db_path" ]] && return 0
 
-    # Check if any replication is configured (presence of successful runs)
+    # Phase 4 commit 4a: typed reads via lib/sqlite_ro.sh.
     local has_replication
-    has_replication=$(sqlite3 "$db_path" \
-        "SELECT COUNT(*) FROM replication_runs WHERE status='success';" 2>/dev/null)
+    has_replication=$(sqlite_get_successful_replication_count "$db_path")
     [[ "${has_replication:-0}" -eq 0 ]] && return 0
 
     # Check if this VM+period has been replicated at least once
     local replicated
-    replicated=$(sqlite3 "$db_path" \
-        "SELECT COUNT(*) FROM replication_vms rv
-         JOIN replication_runs rr ON rv.run_id = rr.id
-         WHERE rv.vm_name = '$(echo "$vm_name" | sed "s/'/''/g")'
-         AND rr.status = 'success'
-         AND rr.session_id IN (
-             SELECT session_id FROM vm_backups
-             WHERE vm_name = '$(echo "$vm_name" | sed "s/'/''/g")'
-             AND backup_path LIKE '%/${period_id}%'
-             AND status = 'success'
-         );" 2>/dev/null)
+    replicated=$(sqlite_get_vm_period_replication_count "$db_path" "$vm_name" "$period_id")
 
     if [[ "${replicated:-0}" -gt 0 ]]; then
         return 0
@@ -110,146 +95,60 @@ _is_period_replicated() {
 #################################################################################
 # PERIOD DISCOVERY
 #################################################################################
-
-# Get all period directories for a VM (sorted oldest first)
-# Args: $1 - vm_name
-# Returns: Newline-separated list of period IDs
-get_vm_periods() {
-    local vm_name="$1"
-    local safe_name=$(sanitize_vm_name "$vm_name")
-    local vm_dir="${BACKUP_PATH}${safe_name}"
-    local policy=$(get_vm_rotation_policy "$vm_name")
-    
-    [[ ! -d "$vm_dir" ]] && return 0
-    
-    case "$policy" in
-        daily)
-            # YYYYMMDD directories
-            find "$vm_dir" -maxdepth 1 -type d -regextype posix-extended \
-                -regex '.*/[0-9]{8}$' 2>/dev/null | xargs -r -n1 basename | sort
-            ;;
-        weekly)
-            # YYYY-Www directories
-            find "$vm_dir" -maxdepth 1 -type d -regextype posix-extended \
-                -regex '.*/[0-9]{4}-W[0-9]{2}$' 2>/dev/null | xargs -r -n1 basename | sort
-            ;;
-        monthly)
-            # YYYYMM directories
-            find "$vm_dir" -maxdepth 1 -type d -regextype posix-extended \
-                -regex '.*/[0-9]{6}$' 2>/dev/null | xargs -r -n1 basename | sort
-            ;;
-        accumulate)
-            # Flat structure - return "flat" if backups exist
-            compgen -G "$vm_dir"/*.qcow2 >/dev/null 2>&1 && echo "flat"
-            ;;
-    esac
-}
+#
+# UNI-007 (Phase 3): get_vm_periods, get_all_vm_periods, detect_period_policy,
+# and calculate_any_period_age were lifted from this module to lib/period.sh
+# in commit 1 of Phase 3 (hard cutover, no shim wrappers — D3). All callers
+# in this file were migrated to the new (vm_dir, ...)/( vm_dir, policy)
+# signatures. The lib is sourced at startup from both vmbackup.sh and (in
+# commit 2) vmrestore.sh.
+#
+# - get_vm_periods(vm_dir)              — cross-format FS enumeration
+# - get_vm_periods_for_policy(vm_dir,p) — policy-driven filter
+# - detect_period_policy(period_id)     — pure string parse
+# - calculate_any_period_age(period_id) — UTC age in days; lifted from
+#                                          rotation_module.sh::calculate_period_age
+#                                          (the production path) verbatim. The
+#                                          old shim-with-fallback in this file
+#                                          was removed; equivalence proven by
+#                                          tests/109-phase3-period-vectors.sh.
+#
 
 # Count periods for a VM
 # Args: $1 - vm_name
 # Returns: period count
+# UNI-007 (Phase 3): now consumes lib/period.sh::get_vm_periods_for_policy.
+# Caller still passes vm_name; we resolve vm_dir + policy here. count_vm_periods
+# retains its (vm_name) signature but gains a get_vm_rotation_policy dependency
+# (vmbackup-only, defined in modules/rotation_module.sh — same load order, safe).
 count_vm_periods() {
-    get_vm_periods "$1" | grep -c . || true
-}
-
-#################################################################################
-# CROSS-POLICY PERIOD DISCOVERY
-#################################################################################
-
-# Get ALL period directories for a VM regardless of current policy
-# Matches daily (YYYYMMDD), weekly (YYYY-Www), and monthly (YYYYMM) formats
-# Args: $1 - vm_name
-# Returns: Newline-separated list of ALL period IDs (sorted oldest first)
-get_all_vm_periods() {
     local vm_name="$1"
-    local safe_name=$(sanitize_vm_name "$vm_name")
-    local vm_dir="${BACKUP_PATH}${safe_name}"
-    
-    [[ ! -d "$vm_dir" ]] && return 0
-    
-    # Match all known period formats with a single find command
-    find "$vm_dir" -maxdepth 1 -type d \( \
-        -regextype posix-extended \
-        -regex '.*/[0-9]{8}$' -o \
-        -regex '.*/[0-9]{4}-W[0-9]{2}$' -o \
-        -regex '.*/[0-9]{6}$' \
-    \) 2>/dev/null | xargs -r -n1 basename | sort
-}
-
-# Detect the rotation policy that created a period based on its format
-# Args: $1 - period_id (e.g., "20260215", "2026-W07", "202602")
-# Returns: policy name (daily|weekly|monthly|unknown)
-detect_period_policy() {
-    local period_id="$1"
-    
-    if [[ "$period_id" =~ ^[0-9]{4}-W[0-9]{2}$ ]]; then
-        echo "weekly"
-    elif [[ "$period_id" =~ ^[0-9]{8}$ ]]; then
-        echo "daily"
-    elif [[ "$period_id" =~ ^[0-9]{6}$ ]]; then
-        echo "monthly"
-    else
-        echo "unknown"
-    fi
+    local safe_name vm_dir policy
+    safe_name=$(sanitize_vm_name "$vm_name")
+    vm_dir="${BACKUP_PATH}${safe_name}"
+    policy=$(get_vm_rotation_policy "$vm_name")
+    get_vm_periods_for_policy "$vm_dir" "$policy" | grep -c . || true
 }
 
 # Get orphaned periods - directories from a different policy than current
 # Args: $1 - vm_name
 # Returns: Newline-separated list of orphaned period IDs
+# UNI-007 (Phase 3): consumes lib/period.sh helpers. Resolves vm_dir + policy
+# locally and passes them in (per Phase 3 spec §2.2 caller responsibilities).
 get_orphaned_periods() {
     local vm_name="$1"
-    local all_periods=$(get_all_vm_periods "$vm_name")
-    local current_periods=$(get_vm_periods "$vm_name")
+    local safe_name vm_dir policy
+    safe_name=$(sanitize_vm_name "$vm_name")
+    vm_dir="${BACKUP_PATH}${safe_name}"
+    policy=$(get_vm_rotation_policy "$vm_name")
+    local all_periods=$(get_vm_periods "$vm_dir")
+    local current_periods=$(get_vm_periods_for_policy "$vm_dir" "$policy")
     
     [[ -z "$all_periods" ]] && return 0
     
     # Return periods in all but not in current (orphans)
     # Use comm to find entries only in all_periods
     comm -23 <(echo "$all_periods" | sort) <(echo "$current_periods" | sort) 2>/dev/null
-}
-
-# Calculate age of any period format in days (from period start date)
-# NOTE: For orphan retention, use calculate_orphan_age() instead - this
-#       calculates from period START which is wrong for retention decisions.
-# Args: $1 - period_id (any format)
-# Returns: age in days (0 if cannot determine)
-calculate_any_period_age() {
-    local period_id="$1"
-    local policy=$(detect_period_policy "$period_id")
-    
-    [[ "$policy" == "unknown" ]] && { echo "0"; return 1; }
-    
-    # Use existing calculate_period_age if available
-    if declare -f calculate_period_age >/dev/null 2>&1; then
-        calculate_period_age "$period_id" "$policy"
-        return $?
-    fi
-    
-    # Fallback implementation (DST-safe: use -u for consistent UTC epoch)
-    local period_date now_epoch period_epoch
-    now_epoch=$(date -u +%s)
-    
-    case "$policy" in
-        daily)
-            # YYYYMMDD -> parse directly
-            period_date="${period_id:0:4}-${period_id:4:2}-${period_id:6:2}"
-            ;;
-        weekly)
-            # YYYY-Www -> convert to first day of week
-            local year="${period_id:0:4}"
-            local week="${period_id:6:2}"
-            # Get date of Monday in that ISO week
-            period_date=$(date -u -d "$year-01-04 +$((week - 1)) weeks - $(date -u -d "$year-01-04" +%u) days + 1 day" +%Y-%m-%d 2>/dev/null)
-            [[ -z "$period_date" ]] && { echo "0"; return 1; }
-            ;;
-        monthly)
-            # YYYYMM -> first day of month
-            period_date="${period_id:0:4}-${period_id:4:2}-01"
-            ;;
-    esac
-    
-    period_epoch=$(date -u -d "$period_date" +%s 2>/dev/null) || { echo "0"; return 1; }
-    echo $(( (now_epoch - period_epoch) / 86400 ))
 }
 
 # Calculate orphan age based on last SUCCESSFUL backup (from database)
@@ -274,12 +173,9 @@ calculate_orphan_age() {
     # NOTE: Period IDs use LOCAL date; DB timestamps (created_at) use UTC.
     # Match on backup_path (contains actual directory name), not on created_at.
     # See DATETIME_BUGS.md H2.
+    # Phase 4 commit 4a: typed read via lib/sqlite_ro.sh.
     local last_success
-    last_success=$(sqlite3 "$db_path" \
-        "SELECT MAX(created_at) FROM vm_backups 
-         WHERE vm_name='$vm_name' 
-         AND backup_path LIKE '%/${period_id}%'
-         AND status='success';" 2>/dev/null)
+    last_success=$(sqlite_get_last_successful_backup_at "$db_path" "$vm_name" "$period_id")
     
     # No successful backup found - return very high age (eligible for deletion)
     if [[ -z "$last_success" || "$last_success" == "" ]]; then
@@ -340,7 +236,17 @@ run_retention_for_vm() {
     }
     
     local retention_limit=$(get_retention_limit "$policy")
-    local periods=$(get_vm_periods "$vm_name")
+    # UNI-007 (Phase 3): consumes lib/period.sh::get_vm_periods_for_policy.
+    # vm_dir + policy already resolved at function top.
+    # Sort chronologically (period IDs sort lexically == chronologically for
+    # daily YYYYMMDD, weekly YYYY-Www, monthly YYYYMM) so the subsequent
+    # `head -n "$to_remove"` selects the OLDEST periods. The lib function
+    # honours an "UNSORTED — caller sorts" contract (R2); without this
+    # sort, `find` returns entries in ext4 htree hash order and `head`
+    # picks a non-deterministic period — including, in production, the
+    # current week — which deletes the active chain and forces a FULL
+    # backup every night until count drops back within retention_limit.
+    local periods=$(get_vm_periods_for_policy "$vm_dir" "$policy" | sort)
     local period_count
     period_count=$(echo "$periods" | grep -c . || true)
     
@@ -496,7 +402,7 @@ _remove_orphan_period() {
     local max_age="${RETENTION_ORPHAN_MAX_AGE_DAYS:-90}"
     
     # Dry run mode
-    if [[ "$dry_run" == "true" ]]; then
+    if [[ "$dry_run" == "true" ]]; then  # [DRY-RUN-KEEPER: local-param polarity preserved, see 109-phase7-spec.md §1.3.3]
         log_info "retention_module.sh" "_remove_orphan_period" \
             "[DRY RUN] Would remove orphan: $period_dir (policy=$original_policy, ${freed_bytes} bytes, ${age_days} days old)"
         
@@ -688,7 +594,7 @@ _remove_period() {
     fi
     
     # Dry run mode (after all checks — report reflects what would actually happen)
-    if [[ "$dry_run" == "true" ]]; then
+    if [[ "$dry_run" == "true" ]]; then  # [DRY-RUN-KEEPER: local-param polarity preserved, see 109-phase7-spec.md §1.3.3]
         log_info "retention_module.sh" "_remove_period" \
             "[DRY RUN] Would remove: $period_dir (${freed_bytes} bytes, ${age_days} days old)"
         log_retention_action "delete" "$vm_name" "period" "$period_dir" "$period_id" \
@@ -801,7 +707,9 @@ _remove_empty_period_dirs() {
     [[ -d "$vm_dir" ]] || return 0
 
     local periods
-    periods=$(get_all_vm_periods "$vm_name")
+    # UNI-007 (Phase 3): consumes lib/period.sh::get_vm_periods. vm_dir already
+    # resolved at function top.
+    periods=$(get_vm_periods "$vm_dir")
     [[ -z "$periods" ]] && return 0
 
     local period_id period_dir data_count freed_bytes policy
@@ -825,7 +733,7 @@ _remove_empty_period_dirs() {
 
         policy=$(detect_period_policy "$period_id" 2>/dev/null || echo "")
 
-        if [[ "${DRY_RUN:-false}" == "true" ]]; then
+        if is_dry_run; then
             log_info "retention_module.sh" "_remove_empty_period_dirs" \
                 "[DRY-RUN] Would remove stub: $period_dir (${freed_bytes}B, trigger=$trigger)"
             log_retention_action "remove_stub" "$vm_name" "period" \
@@ -932,7 +840,7 @@ _remove_archive_chain() {
     freed_bytes=$(du -sb "$chain_dir" 2>/dev/null | cut -f1 || echo 0)
     local policy=$(get_vm_rotation_policy "$vm_name")
     
-    if [[ "$dry_run" == "true" ]]; then
+    if [[ "$dry_run" == "true" ]]; then  # [DRY-RUN-KEEPER: local-param polarity preserved, see 109-phase7-spec.md §1.3.3]
         log_info "retention_module.sh" "_remove_archive_chain" \
             "[DRY RUN] Would remove archive chain: $chain_dir (${freed_bytes} bytes)"
         echo "$freed_bytes"
@@ -1016,15 +924,12 @@ _remove_archives_in_period() {
         fi
     done
     
-    if [[ "$dry_run" != "true" && $chain_count -gt 0 ]]; then
+    if [[ "$dry_run" != "true" && $chain_count -gt 0 ]]; then  # [DRY-RUN-KEEPER: local-param inverted polarity preserved, see 109-phase7-spec.md §1.3.3]
         # Remove the empty .archives directory if all chains removed
         if [[ $fail_count -eq 0 ]]; then
             rmdir "$archives_dir" 2>/dev/null
         fi
-        # Rebuild manifest once after all chains removed (not per-chain)
-        if declare -f rebuild_chain_manifest >/dev/null 2>&1; then
-            rebuild_chain_manifest "$vm_name"
-        fi
+        # DUP-10: rebuild_chain_manifest call removed (writer to dead file).
     fi
     
     log_info "retention_module.sh" "_remove_archives_in_period" \
@@ -1074,7 +979,7 @@ _remove_vm_all() {
         
         if _remove_period "$vm_name" "$period_id" "$dry_run" "true" "$caller" "$trigger"; then
             # Verify deletion actually happened (protection may skip with rc=0)
-            if [[ ! -d "$period_dir" ]] || [[ "$dry_run" == "true" ]]; then
+            if [[ ! -d "$period_dir" ]] || [[ "$dry_run" == "true" ]]; then  # [DRY-RUN-KEEPER: local-param polarity preserved, see 109-phase7-spec.md §1.3.3]
                 total_freed=$(( total_freed + ${period_bytes:-0} ))
             fi
             (( period_count++ ))
@@ -1084,11 +989,11 @@ _remove_vm_all() {
     done
     
     # Remove the VM directory itself (should be empty now)
-    if [[ "$dry_run" != "true" && $fail_count -eq 0 ]]; then
+    if [[ "$dry_run" != "true" && $fail_count -eq 0 ]]; then  # [DRY-RUN-KEEPER: local-param inverted polarity preserved, see 109-phase7-spec.md §1.3.3]
         if [[ -d "$vm_dir" ]]; then
             # Only remove if empty (safety)
             local remaining
-            remaining=$(find "$vm_dir" -mindepth 1 -maxdepth 1 -not -name 'chain-manifest.json' 2>/dev/null | wc -l)
+            remaining=$(find "$vm_dir" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l)
             if [[ "$remaining" -eq 0 ]]; then
                 rm -rf "$vm_dir"
                 log_info "retention_module.sh" "_remove_vm_all" \
@@ -1162,27 +1067,29 @@ archive_active_chains() {
         return 0
     fi
     
-    # Get active chain from manifest
+    # DUP-10: derive active chain id from disk (mtime of earliest .full.data
+    # in the OLD period — not current period — because this function is invoked
+    # at period boundary against the closing period).
     local active_chain
-    active_chain=$(get_active_chain "$vm_name")
-    
+    local earliest_mtime
+    earliest_mtime=$(find "$period_dir" -maxdepth 1 -type f \
+      \( -name "*.full.data" -o -name "*.copy.data" -o -name "*.inc.virtnbdbackup.*.data" \) \
+      -printf '%T@\n' 2>/dev/null | sort -n | head -1)
+    if [[ -n "$earliest_mtime" ]]; then
+      active_chain="chain-$(date -d "@${earliest_mtime%.*}" +%Y-%m-%d)"
+    fi
+
     if [[ -z "$active_chain" ]]; then
         log_debug "retention_module.sh" "archive_active_chains" \
             "No active chain to archive for: $vm_name"
         return 0
     fi
-    
-    # Check if there are restore points in the old period
-    # NOTE: We check for restore points, not the chain's original period_id,
-    # because policy changes can cause a chain to span multiple periods
-    # (e.g., chain created under monthly policy now running under daily)
+
+    # Count restore points directly from disk (DUP-10: was count_period_restore_points)
     local restore_point_count
-    if declare -f count_period_restore_points >/dev/null 2>&1; then
-        restore_point_count=$(count_period_restore_points "$vm_name" "$old_period_id")
-    else
-        # Fallback: check period directory exists with checkpoint files
-        restore_point_count=$(find "$period_dir" -maxdepth 1 -name "*.data" -type f 2>/dev/null | wc -l)
-    fi
+    restore_point_count=$(find "$period_dir" -maxdepth 1 -type f \
+      \( -name "*.full.data" -o -name "*.copy.data" -o -name "*.inc.virtnbdbackup.*.data" \) \
+      2>/dev/null | wc -l)
     
     if [[ "$restore_point_count" -eq 0 ]]; then
         log_debug "retention_module.sh" "archive_active_chains" \
@@ -1242,16 +1149,17 @@ archive_active_chains() {
             "checkpoint_xml" "Chain archive" "archive_active_chains" "true"
     done < <(find "$period_dir" -maxdepth 1 -type f -name "*.checkpoint-*.xml" -print0 2>/dev/null)
     
-    # Update manifest
-    local archive_subdir
-    archive_subdir=$(basename "$archive_dir")
-    archive_chain_in_manifest "$vm_name" "$active_chain" "$archive_subdir"
+    # DUP-10: archive_chain_in_manifest call removed (writer to dead file).
+    # active_chain retained for use by sqlite_archive_chain / log_chain_lifecycle below.
     
     # Update SQLite chain_health to mark as archived
+    # INT-20 (2026-05-23): pass archive_path="" (preserves existing
+    # chain_location semantics in sqlite_archive_chain) + total_bytes so
+    # `archive_size_bytes` is persisted instead of defaulting to 0.
     if declare -f sqlite_archive_chain >/dev/null 2>&1; then
-        sqlite_archive_chain "$vm_name" "$old_period_id" "$archive_dir"
+        sqlite_archive_chain "$vm_name" "$old_period_id" "$archive_dir" "" "$total_bytes"
         log_debug "retention_module.sh" "archive_active_chains" \
-            "Marked chain as archived in SQLite: $vm_name/$old_period_id"
+            "Marked chain as archived in SQLite: $vm_name/$old_period_id (size=${total_bytes}B)"
     fi
     
     # Log chain lifecycle
@@ -1290,32 +1198,23 @@ reconcile_vm_chain_state() {
     local fixed_phantom=0 fixed_orphan=0
 
     # --- Pass 1: DB rows with no matching filesystem directory → phantom records
+    # Phase 4 commit 4a: typed read via lib/sqlite_ro.sh.
     local db_periods
-    db_periods=$(sqlite3 "$db_path" \
-        "SELECT period_id FROM chain_health
-         WHERE vm_name='$(echo "$vm_name" | sed "s/'/''/g")'
-         AND chain_status IN ('active', 'archived', 'broken', 'marked');" 2>/dev/null)
+    db_periods=$(sqlite_get_tracked_periods "$db_path" "$vm_name")
 
     local period_id
     while IFS= read -r period_id; do
         [[ -z "$period_id" ]] && continue
         local period_dir="${vm_dir}/${period_id}"
         if [[ ! -d "$period_dir" ]]; then
-            if [[ "$dry_run" == "true" ]]; then
+            if [[ "$dry_run" == "true" ]]; then  # [DRY-RUN-KEEPER: local-param polarity preserved, see 109-phase7-spec.md §1.3.3]
                 log_info "retention_module.sh" "reconcile_vm_chain_state" \
                     "[DRY RUN] Would mark phantom record as deleted: $vm_name/$period_id"
             else
                 log_warn "retention_module.sh" "reconcile_vm_chain_state" \
                     "Phantom record: $vm_name/$period_id (DB says active, filesystem missing) → marking deleted"
-                local now=$(date -u '+%Y-%m-%d %H:%M:%S')
-                sqlite3 "$db_path" \
-                    "UPDATE chain_health SET
-                        chain_status='deleted', restorable_count=0,
-                        break_reason='reconcile_phantom', deleted_at='$now',
-                        marked_by='reconcile', updated_at='$now'
-                     WHERE vm_name='$(echo "$vm_name" | sed "s/'/''/g")'
-                     AND period_id='$(echo "$period_id" | sed "s/'/''/g")'
-                     AND chain_status IN ('active', 'archived', 'broken', 'marked');" 2>/dev/null
+                # Phase 4 commit 4b: typed write via lib/sqlite_module.sh.
+                sqlite_mark_phantom_chain "$vm_name" "$period_id" 2>/dev/null
             fi
             ((fixed_phantom++))
         fi
@@ -1323,30 +1222,25 @@ reconcile_vm_chain_state() {
 
     # --- Pass 2: Filesystem directories with no DB row → create minimal record
     local fs_periods
-    fs_periods=$(get_all_vm_periods "$vm_name")
+    # UNI-007 (Phase 3): consumes lib/period.sh::get_vm_periods. vm_dir already
+    # resolved at function top.
+    fs_periods=$(get_vm_periods "$vm_dir")
 
     while IFS= read -r period_id; do
         [[ -z "$period_id" ]] && continue
+        # Phase 4 commit 4a: typed read via lib/sqlite_ro.sh.
         local exists
-        exists=$(sqlite3 "$db_path" \
-            "SELECT COUNT(*) FROM chain_health
-             WHERE vm_name='$(echo "$vm_name" | sed "s/'/''/g")'
-             AND period_id='$(echo "$period_id" | sed "s/'/''/g")';" 2>/dev/null)
+        exists=$(sqlite_chain_period_exists_count "$db_path" "$vm_name" "$period_id")
         if [[ "${exists:-0}" -eq 0 ]]; then
             local detected_policy=$(detect_period_policy "$period_id")
-            if [[ "$dry_run" == "true" ]]; then
+            if [[ "$dry_run" == "true" ]]; then  # [DRY-RUN-KEEPER: local-param polarity preserved, see 109-phase7-spec.md §1.3.3]
                 log_info "retention_module.sh" "reconcile_vm_chain_state" \
                     "[DRY RUN] Would create DB record for untracked period: $vm_name/$period_id (policy=$detected_policy)"
             else
                 log_info "retention_module.sh" "reconcile_vm_chain_state" \
                     "Untracked period: $vm_name/$period_id → creating DB record (policy=$detected_policy)"
-                local now=$(date -u '+%Y-%m-%d %H:%M:%S')
-                sqlite3 "$db_path" \
-                    "INSERT OR IGNORE INTO chain_health
-                        (vm_name, period_id, chain_location, chain_status, rotation_policy, created_at, updated_at)
-                     VALUES
-                        ('$(echo "$vm_name" | sed "s/'/''/g")', '$(echo "$period_id" | sed "s/'/''/g")',
-                         '.', 'active', '$detected_policy', '$now', '$now');" 2>/dev/null
+                # Phase 4 commit 4b: typed write via lib/sqlite_module.sh.
+                sqlite_register_untracked_period "$vm_name" "$period_id" "$detected_policy" 2>/dev/null
             fi
             ((fixed_orphan++))
         fi
