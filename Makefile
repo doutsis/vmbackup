@@ -258,7 +258,9 @@ uninstall:
 # sync with copilot/109-phase3.5-spec.md §2 if either ever changes.
 
 lint-baseline:
-	@test -d tests || { echo "lint-baseline: tests/ not shipped in this tree (development-repo target) — skipping"; exit 0; }
+ifeq (,$(wildcard tests))
+	@echo "lint-baseline: tests/ not shipped in this tree (development-repo target) — skipping"
+else
 	@find . -name '*.sh' \
 	     -not -path './.git/*' \
 	     -not -path './tests/tmp/*' \
@@ -272,9 +274,12 @@ lint-baseline:
 	  | LC_ALL=C sort -u \
 	  > tests/lint-baseline.txt
 	@echo "Regenerated tests/lint-baseline.txt ($$(wc -l < tests/lint-baseline.txt) lines)."
+endif
 
 lint:
-	@test -f tests/lint-baseline.txt || { echo "lint: tests/ not shipped in this tree (development-repo target) — skipping"; exit 0; }
+ifeq (,$(wildcard tests/lint-baseline.txt))
+	@echo "lint: tests/ not shipped in this tree (development-repo target) — skipping"
+else
 	@actual=$$(mktemp); \
 	find . -name '*.sh' \
 	     -not -path './.git/*' \
@@ -299,3 +304,4 @@ lint:
 	  exit 1; \
 	fi; \
 	echo "make lint: OK (no new findings)."
+endif
