@@ -445,6 +445,7 @@ sudo vmrestore --vm my-vm --restore-path /var/lib/libvirt/images
 - Defines the VM in libvirt with its original name and MAC addresses. Because `virtnbdrestore -D` always assigns a *fresh* UUID, vmrestore then re-injects the **original UUID** from the backup config (a quick undefine/redefine), so the VM's identity — and the TPM/BitLocker binding tied to that UUID — is preserved
 - Restores the chain-endpoint NVRAM to its original path, saving any existing NVRAM as `.before-restore.<timestamp>` first
 - Restores TPM state to the original UUID path (BitLocker unlocks automatically); any pre-existing TPM state is moved aside to `.pre-restore-<timestamp>`
+- Before reporting success, verifies the result: every expected disk image must exist and pass an integrity check — a missing or failing disk stops the restore instead of counting as a success. (The expected disk set is derived from the backup's configuration; in the rare DR case where that configuration is unusable, vmrestore warns in the log that its disk safety checks are being skipped and proceeds unverified)
 
 #### When `--force` Is Required
 
@@ -484,6 +485,7 @@ sudo vmrestore --vm my-vm --name test-clone --restore-path /var/lib/libvirt/imag
 - Defines the VM in libvirt with a **new name, new UUID, and new MAC addresses** — libvirt assigns the UUID and MACs automatically when the modified XML is defined
 - Copies NVRAM to a new file (`test-clone_VARS.fd`) so the clone and original don't share firmware state
 - Restores TPM state under the new UUID path (BitLocker unlocks automatically because the TPM is re-mapped)
+- Before reporting success, verifies the result: every expected disk image must exist and pass an integrity check — a missing or failing disk stops the restore instead of counting as a success. (Clones get this unconditionally: a clone whose expected disk set cannot be derived from the backup is refused before anything is written)
 
 **No `--force` needed.** Clone mode uses a staging directory during the restore, so it never touches existing files. The final renamed files are checked against live VM disks before being placed.
 
@@ -1769,6 +1771,8 @@ sudo vmrestore --vm my-vm --restore-path /tmp/restore --skip-tpm
 - **If TPM state is lost:** BitLocker will request a recovery key (find it in `tpm-state/bitlocker-recovery-keys.txt` in the backup)
 
 > **Restore result reflects TPM outcome (0.6.0):** when the disks restore but TPM/BitLocker state fails to apply, vmrestore no longer reports an unqualified success. The summary line carries a `TPM ✓` token on success or `TPM ✗ (manual unlock required)` on failure (the token is omitted entirely for VMs without TPM), so a half-restored guest cannot look fully healthy.
+>
+> **Every ✓ is verified (0.6.1):** since 0.6.1 each ✓ in the restore summary is confirmed against the actual state of the restored VM, so a partial or failed restore can no longer print an all-green summary. One narrow exception: if the backup's configuration is unusable, vmrestore cannot derive the expected disk set — a DR restore then warns in the log that its disk safety checks are being skipped and proceeds unverified (a clone restore refuses to run at all in that state).
 
 ---
 ## 12. UEFI/OVMF Firmware and NVRAM Restore
@@ -1844,7 +1848,7 @@ vmrestore handles these automatically — no manual action needed:
 | VM definition | DR re-injects the original UUID (undefine/redefine); clone defines with a new name, UUID, and MACs |
 | TPM state | Copied to `/var/lib/libvirt/swtpm/{UUID}/tpm2/` (`tss:tss`, mode 700); pre-existing state saved as `.pre-restore-<timestamp>` |
 | NVRAM | DR restores the chain-endpoint NVRAM over the original path (old copy saved as `.before-restore.<timestamp>`); clone copies it to `{clone}_VARS.fd` |
-| Disk integrity check | `qemu-img check` on every restored disk; the restore aborts (exit 4) if any check fails |
+| Disk integrity check | Every expected disk image must exist and pass `qemu-img check` before success — a missing disk stops the restore as incomplete, and "corrupt" and "could not be verified" are reported distinctly; all three outcomes abort the restore (exit 4). The check tolerates the engine's brief lock-release delay (a bounded wait, so momentary timing never fails a healthy restore). In the rare DR case where the backup's configuration is unusable, vmrestore warns that its disk safety checks are being skipped and proceeds unverified; clone restores refuse to run instead — see [Restore Scenarios](#9-restore-scenarios) |
 | Storage pool refresh | `virsh pool-refresh` on the containing pool |
 | Log file | Written to `/var/log/vmrestore/` with full command and timing details |
 

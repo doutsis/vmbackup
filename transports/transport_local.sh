@@ -108,14 +108,17 @@ _local_parse_rsync_bytes() {
         local num="${BASH_REMATCH[1]}"
         local suffix="${BASH_REMATCH[2]}"
         local multiplier=1
+        # rsync -h human-readable suffixes are 1000-based (K=1000, M=1000000, ...);
+        # FF-132: use 1000-based multipliers, and awk (not bc — an undeclared dep that
+        # silently yields 0 when absent) for the fractional multiply.
         case "$suffix" in
-            K) multiplier=1024 ;;
-            M) multiplier=$((1024 * 1024)) ;;
-            G) multiplier=$((1024 * 1024 * 1024)) ;;
-            T) multiplier=$((1024 * 1024 * 1024 * 1024)) ;;
-            P) multiplier=$((1024 * 1024 * 1024 * 1024 * 1024)) ;;
+            K) multiplier=1000 ;;
+            M) multiplier=$((1000 * 1000)) ;;
+            G) multiplier=$((1000 * 1000 * 1000)) ;;
+            T) multiplier=$((1000 * 1000 * 1000 * 1000)) ;;
+            P) multiplier=$((1000 * 1000 * 1000 * 1000 * 1000)) ;;
         esac
-        echo "$num * $multiplier" | bc 2>/dev/null | cut -d'.' -f1
+        awk -v n="$num" -v m="$multiplier" 'BEGIN { printf "%d", n * m }'
     else
         echo 0
     fi
@@ -167,14 +170,26 @@ transport_init() {
     fi
     
     # Check write access
-    local test_file="$dest_path/.replication_write_test_$$"
-    if ! touch "$test_file" 2>/dev/null; then
-        _local_log_error "init" "Cannot write to destination: $dest_path"
-        _local_log_error "init" "Check filesystem permissions"
-        return 1
+    # FF-188: under a dry-run replication the destination must NOT be mutated, so
+    # skip the touch/rm write-probe and fall back to a read-only permission check.
+    # Never report a real write succeeded when we did not perform one.
+    if [[ "${REPLICATION_DRY_RUN:-false}" == "true" ]]; then
+        if [[ -w "$dest_path" ]]; then
+            _local_log_info "init" "Dry-run: write-probe skipped; destination appears writable (permission check only)"
+        else
+            _local_log_error "init" "Dry-run: destination is not writable (permission check): $dest_path"
+            return 1
+        fi
+    else
+        local test_file="$dest_path/.replication_write_test_$$"
+        if ! touch "$test_file" 2>/dev/null; then
+            _local_log_error "init" "Cannot write to destination: $dest_path"
+            _local_log_error "init" "Check filesystem permissions"
+            return 1
+        fi
+        rm -f "$test_file" 2>/dev/null
+        _local_log_debug "init" "Write access verified"
     fi
-    rm -f "$test_file" 2>/dev/null
-    _local_log_debug "init" "Write access verified"
     
     # Get free space
     local free_bytes
@@ -220,10 +235,23 @@ transport_sync() {
     # Set bwlimit_final for metrics contract
     TRANSPORT_BWLIMIT_FINAL="$bwlimit"
     
+    # FF-135: a non-numeric bwlimit (e.g. "10M") must fail closed, not run
+    # unthrottled while the metric above claims a limit. bwlimit is KB/s (0=unlimited).
+    if [[ ! "$bwlimit" =~ ^[0-9]+$ ]]; then
+        _local_log_error "sync" "Invalid bwlimit '$bwlimit' (expected integer KB/s, 0=unlimited) - aborting sync"
+        return 1
+    fi
+    
     # Ensure source path has trailing slash for rsync directory sync
     [[ "${source_path}" != */ ]] && source_path="${source_path}/"
     
-    _local_log_info "sync" "Starting rsync ($sync_mode mode${bwlimit:+, bwlimit=${bwlimit}KB/s}${dry_run:+, DRY RUN})"
+    # FF-134: dry_run/bwlimit both carry non-empty sentinel values ("false"/"0"),
+    # so ${var:+...} always expanded — show the DRY RUN / bwlimit notes only when
+    # they are actually in force.
+    local _start_note="$sync_mode mode"
+    [[ "$bwlimit" -gt 0 ]] && _start_note+=", bwlimit=${bwlimit}KB/s"
+    [[ "$dry_run" == "true" ]] && _start_note+=", DRY RUN"
+    _local_log_info "sync" "Starting rsync ($_start_note)"
     _local_log_info "sync" "Source: $source_path"
     _local_log_info "sync" "Destination: $dest_path"
     
@@ -412,6 +440,14 @@ _local_verify_size() {
     source_size=$(tu_get_dir_size "$source_path")
     dest_size=$(tu_get_dir_size "$dest_path")
     
+    # FF-136: fail closed when du could not measure a side. If du fails on BOTH
+    # source and dest the tolerance math below evaluates 0<=0 and falsely "passes";
+    # a zero-byte source is likewise unmeasurable/unexpected for a backup store.
+    if [[ ! "$source_size" =~ ^[0-9]+$ ]] || [[ ! "$dest_size" =~ ^[0-9]+$ ]] || [[ "$source_size" -eq 0 ]]; then
+        _local_log_error "verify" "Size verification INCONCLUSIVE (source='$source_size' dest='$dest_size') - failing closed"
+        return 1
+    fi
+    
     local source_human dest_human
     source_human=$(tu_format_bytes "$source_size")
     dest_human=$(tu_format_bytes "$dest_size")
@@ -449,8 +485,17 @@ _local_verify_checksum() {
     
     # Check if any files would be transferred (indicating mismatch)
     local changes
-    changes=$(echo "$rsync_output" | grep -c '^[<>ch]' || echo 0)
-    
+    changes=$(echo "$rsync_output" | grep -c '^[<>ch]' || true)
+
+    # grep -c prints a count (incl. "0") and exits 1 on zero matches; the "|| true"
+    # keeps that expected zero-match rc from tripping pipefail. Fail CLOSED if the
+    # count is not an integer: a genuine grep error yields an empty string, which
+    # must never be read as "0 files differ".
+    if [[ ! "$changes" =~ ^[0-9]+$ ]]; then
+        _local_log_error "verify" "Checksum verification failed: non-numeric change count '$changes'"
+        return 1
+    fi
+
     if [[ "$changes" -eq 0 ]]; then
         _local_log_info "verify" "Checksum verification passed"
         return 0

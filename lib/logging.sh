@@ -27,10 +27,10 @@ _get_log_level_value() {
 
 # Log function with timestamp, process, function context
 log_msg() {
-  local level=$1
-  local process=$2
-  local function=$3
-  local message=$4
+  local level=${1:-INFO}
+  local process=${2:-}
+  local function=${3:-}
+  local message=${4:-}
 
   local timestamp=$(date '+%Y-%m-%d %H:%M:%S %Z')
   local log_line="[$timestamp] [$level] [$process] [$function] $message"
@@ -54,17 +54,17 @@ log_msg() {
 }
 
 log_info() {
-  log_msg "INFO" "$1" "$2" "$3"
+  log_msg "INFO" "${1:-}" "${2:-}" "${3:-}"
 }
 
 log_warn() {
-  log_msg "WARN" "$1" "$2" "$3"
+  log_msg "WARN" "${1:-}" "${2:-}" "${3:-}"
 }
 
 log_error() {
-  log_msg "ERROR" "$1" "$2" "$3"
+  log_msg "ERROR" "${1:-}" "${2:-}" "${3:-}"
 }
 
 log_debug() {
-  log_msg "DEBUG" "$1" "$2" "$3"
+  log_msg "DEBUG" "${1:-}" "${2:-}" "${3:-}"
 }

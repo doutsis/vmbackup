@@ -31,6 +31,13 @@ case "$1" in
         chown -R root:backup /opt/vmbackup
         chmod 750 /opt/vmbackup
 
+        # SEC-02: strip group/other-write recursively so a backup-group member
+        # cannot replace code the root nightly sources (lib/, modules/, config/,
+        # transports/, cloud_transports/). Idempotent -- self-heals umask-002 dir
+        # drift AND any world-readable config files on every install/upgrade.
+        # Capital X preserves the binaries' exec bit; files settle to 0640, dirs 0750.
+        chmod -R u=rwX,g=rX,o= /opt/vmbackup
+
         # Create log directory
         mkdir -p /var/log/vmbackup
         chown root:backup /var/log/vmbackup

@@ -40,8 +40,14 @@ _fstrim_is_vm_excluded() {
 
   local pattern
   while IFS= read -r pattern || [[ -n "$pattern" ]]; do
-    # Skip comments and empty lines
-    pattern=$(echo "$pattern" | sed 's/#.*//' | xargs)
+    # Skip comments and empty lines. FF-99: strip the comment with sed, then trim
+    # surrounding whitespace with bash parameter expansion — NOT xargs, which does
+    # shell word/quote parsing (aborts to empty on an apostrophe pattern -> the VM
+    # is silently NOT excluded) and collapses the internal spaces of a legal
+    # spaced VM name. [:space:] also drops a trailing CR from a CRLF-edited file.
+    pattern=$(printf '%s' "$pattern" | sed 's/#.*//')
+    pattern="${pattern#"${pattern%%[![:space:]]*}"}"
+    pattern="${pattern%"${pattern##*[![:space:]]}"}"
     [[ -z "$pattern" ]] && continue
 
     # shellcheck disable=SC2254
@@ -184,7 +190,13 @@ execute_fstrim_in_guest() {
   local trim_start_epoch
   trim_start_epoch=$(date +%s)
 
-  fstrim_output=$(timeout "$effective_timeout" virsh qemu-agent-command \
+  # FF-100: the external timeout(1) is a safety net for virsh ITSELF hanging, so
+  # it must exceed virsh's own --timeout by a margin (virsh needs strictly more
+  # wall-clock than its agent wait for connection setup/response handling).
+  # Without the margin a trim finishing near the deadline is SIGTERMed externally
+  # first (rc 124) and mislabelled a timeout though it completed in-guest.
+  local outer_timeout=$(( effective_timeout + 30 ))
+  fstrim_output=$(timeout "$outer_timeout" virsh qemu-agent-command \
       --timeout "$effective_timeout" "$vm_name" "$fstrim_cmd" 2>&1)
   local trim_status=$?
 

@@ -95,6 +95,14 @@ unset _VMBACKUP_LIB_DIR _lib
 # Dry-run mode: show what would happen without executing destructive operations
 DRY_RUN=false
 
+# UNI-322 / F-372 (R1): source the dry-run predicate API + dry_run_normalise_state
+# HERE — right after DRY_RUN is initialised and while source_lib_or_die (bootstrap.sh)
+# is available — so the predicate is DEFINED before its FIRST use in the pre-config
+# CLI-validation window (the --cancel-replication/--dry-run conflict check).
+# dry_run.sh's only deps are DRY_RUN (above) + exit_codes.sh (bootstrap loop); it does
+# NOT depend on config_instance.sh, so this earlier position breaks no load order.
+source_lib_or_die dry_run.sh
+
 # Guard against duplicate email reports (BUG-02: double email on SIGTERM)
 _EMAIL_SENT=false
 
@@ -137,6 +145,14 @@ done
 # Also handle --config-instance VALUE format
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --config-instance=*)
+            # FF-137: the pre-scan loop above accepts the equals form, but the
+            # main parser lacked this arm, so --config-instance=NAME fell through
+            # to the '*)' Unknown-option default. CONFIG_INSTANCE is already set
+            # by the pre-scan; consume the token here so parsing continues.
+            CONFIG_INSTANCE="${1#*=}"
+            shift
+            ;;
         --config-instance)
             [[ -n "${2:-}" ]] && CONFIG_INSTANCE="$2"
             shift 2 || break
@@ -462,19 +478,28 @@ _VMBACKUP_ENV_BACKUP_PATH="${BACKUP_PATH:-}"
 # before _VMBACKUP_CONFIG can be resolved.
 source_lib_or_die config_instance.sh
 
-# UNI-322 (Phase 7 commit 1): Source canonical dry-run predicate API
-# (is_dry_run, if_dry_run, if_not_dry_run + dry_run_normalise_state).
-# Strict-alphabetical position: config_instance < dry_run < exit_codes
-# (exit_codes is sourced from the inline bootstrap block at the top of
-# the file). Sourced BEFORE any load_*_module call so module-level
-# guards see the predicates. See lib/dry_run.sh `# LOAD ORDER:` block.
-# CLI parser (--dry-run handler) re-invokes dry_run_normalise_state
-# after parsing completes — see end of CLI parsing section.
-source_lib_or_die dry_run.sh
+# F-372 (R1): dry_run.sh is sourced early (near DRY_RUN init), not here. The CLI parser
+# re-invokes dry_run_normalise_state after parsing (below) to reflect a --dry-run flag.
 
-_VMBACKUP_CONFIG=$(get_config_file "$CONFIG_INSTANCE")
+# R1: get_config_file validates the instance name; a non-zero return means an
+# invalid/unsafe --config-instance. Fail loudly before building or sourcing
+# any path from it.
+if ! _VMBACKUP_CONFIG=$(get_config_file "$CONFIG_INSTANCE"); then
+    echo "Error: invalid config instance '${CONFIG_INSTANCE}' (allowed: letters, digits, . _ - ; no path separators)" >&2
+    exit "$EXIT_CONFIG"
+fi
 if [[ ! -f "$_VMBACKUP_CONFIG" ]]; then
     echo "Error: Config instance '${CONFIG_INSTANCE}' not found: $_VMBACKUP_CONFIG" >&2
+    exit "$EXIT_CONFIG"
+fi
+# FF-138: fail closed on a config SYNTAX error. With pipefail-only (no set -e)
+# a syntax error inside the .conf aborts the source mid-file and execution
+# would otherwise continue on a silent partial config (mis-filed backups /
+# lost retention+replication settings). bash -n checks syntax WITHOUT executing,
+# so a valid config whose last statement happens to return non-zero is NOT
+# affected (narrower than an rc check on source itself).
+if ! bash -n "$_VMBACKUP_CONFIG" 2>/dev/null; then
+    echo "Error: syntax error in config instance '${CONFIG_INSTANCE}' — check $_VMBACKUP_CONFIG" >&2
     exit "$EXIT_CONFIG"
 fi
 source "$_VMBACKUP_CONFIG"
@@ -517,6 +542,13 @@ _cleanup_stale_manifests() {
   local mf
   while IFS= read -r -d '' mf; do
     ((examined++))
+    # FF-139: --dry-run is read-only. Preview the reap but delete nothing (and
+    # do not count it, so "removed=N" stays truthful) — matches the sibling
+    # _config_prune_removed which already honours is_dry_run.
+    if is_dry_run; then
+      echo "vmbackup: [DRY-RUN] would remove stale manifest: $mf (skipping — read-only)"
+      continue
+    fi
     if rm -f "$mf"; then
       ((removed++))
       echo "vmbackup: removed stale manifest: $mf"
@@ -631,7 +663,10 @@ _config_prune_removed() {
             ((files_changed++))
             lines_changed=$((lines_changed + file_changes))
         fi
-    done < <(find "$config_root" -mindepth 2 -path "${config_root}/template" -prune -o -type f -name '*.conf' -print0 2>/dev/null)
+    # FF-140: -mindepth 2 suppresses ALL tests/actions (including -prune) at
+    # depth 1, so the depth-1 template/ dir was never pruned and its depth-2
+    # *.conf files were scanned. Drop -mindepth so -prune fires on template/.
+    done < <(find "$config_root" -path "${config_root}/template" -prune -o -type f -name '*.conf' -print0 2>/dev/null)
 
     echo ""
     echo "Scanned ${files_scanned} file(s); ${files_changed} file(s) with matches; ${lines_changed} line(s)${dry_label}."
@@ -668,9 +703,17 @@ LOG_LEVEL="${LOG_LEVEL:-INFO}"
 
 # Adaptive backup timeout - monitors actual progress instead of wall-clock limit
 # Prevents killing healthy large backups while still detecting true hangs
-BACKUP_STARTUP_GRACE=300      # Grace period (5 min) for NBD setup, VM pause, checkpoint creation
-BACKUP_STALL_THRESHOLD=180    # Declare backup hung if no I/O for this many seconds (3 min)
-BACKUP_CHECK_INTERVAL=30      # Check backup progress every N seconds
+BACKUP_STARTUP_GRACE="${BACKUP_STARTUP_GRACE:-300}"      # Grace period (5 min) for NBD setup, VM pause, checkpoint creation
+BACKUP_STALL_THRESHOLD="${BACKUP_STALL_THRESHOLD:-180}"    # Declare backup hung if no I/O for this many seconds (3 min)
+BACKUP_CHECK_INTERVAL="${BACKUP_CHECK_INTERVAL:-30}"      # Check backup progress every N seconds
+# R2: max consecutive filesystem-freeze stall-kills before perform_backup()
+# stops retrying and fails closed with LAST_ERROR_CODE=FSFREEZE_STALL. A single
+# transient stall that recovers on a later attempt must NOT trip this; only
+# repeated stalls reaching this count do. virtnbdbackup always freezes via the
+# guest agent (the engine has no freeze opt-out; -F only narrows mountpoints),
+# so a recurring freeze-stall means the guest agent is unhealthy and burning
+# more attempts just hangs again.
+BACKUP_FSFREEZE_STALL_LIMIT="${BACKUP_FSFREEZE_STALL_LIMIT:-2}"
 
 #################################################################################
 # VIRTNBDBACKUP COMMAND OPTIONS
@@ -707,16 +750,16 @@ VIRTNBD_FSFREEZE="${VIRTNBD_FSFREEZE:-true}"
 VIRTNBD_FSFREEZE_PATHS="${VIRTNBD_FSFREEZE_PATHS:-}"
 
 # Backup threshold in bytes (only backup if delta >= threshold)
-VIRTNBD_THRESHOLD=""
+VIRTNBD_THRESHOLD="${VIRTNBD_THRESHOLD:-}"
 
 # Backup output format: stream (thin-prov default) or raw (full-prov)
-VIRTNBD_OUTPUT_FORMAT="stream"
+VIRTNBD_OUTPUT_FORMAT="${VIRTNBD_OUTPUT_FORMAT:-stream}"
 
 # Use sparse detection (skip trimmed blocks, default=true)
-VIRTNBD_SPARSE_DETECTION=true
+VIRTNBD_SPARSE_DETECTION="${VIRTNBD_SPARSE_DETECTION:-true}"
 
 # Scratch directory for fleece operations (default /var/tmp)
-VIRTNBD_SCRATCH_DIR="/var/tmp"
+VIRTNBD_SCRATCH_DIR="${VIRTNBD_SCRATCH_DIR:-/var/tmp}"
 
 #################################################################################
 # PROCESS AND OPERATIONAL SETTINGS
@@ -727,19 +770,19 @@ VIRTNBD_SCRATCH_DIR="/var/tmp"
 #
 # CPU Priority (nice): -20=highest, 0=normal, 19=lowest
 # Lower values = more CPU time = faster backups but more VM impact
-PROCESS_PRIORITY=10
+PROCESS_PRIORITY="${PROCESS_PRIORITY:-10}"
 
 # I/O Priority Class (ionice -c):
 #   1 = Realtime (use with caution, can starve other I/O)
 #   2 = Best-effort (normal, respects nice level)
 #   3 = Idle (only when disk is idle - very slow)
-IO_PRIORITY_CLASS=2
+IO_PRIORITY_CLASS="${IO_PRIORITY_CLASS:-2}"
 
 # I/O Priority Level (ionice -n): 0-7 (only for class 2)
 #   0 = highest priority within class
 #   4 = normal
 #   7 = lowest priority within class
-IO_PRIORITY_LEVEL=5
+IO_PRIORITY_LEVEL="${IO_PRIORITY_LEVEL:-5}"
 
 #################################################################################
 # CHECKPOINT MANAGEMENT STRATEGY (Monthly Rotation with Health Checks)
@@ -748,11 +791,11 @@ IO_PRIORITY_LEVEL=5
 # Intelligent monthly backup strategy:
 # - Day 1 of month: Always FULL backup (resets all checkpoints)
 # - Days 2-28: AUTO mode (incremental if checkpoint healthy)
-CHECKPOINT_FORCE_FULL_ON_DAY=1        # Day of month for full backup
-CHECKPOINT_HEALTH_CHECK=yes            # Validate checkpoint before AUTO mode
-CHECKPOINT_MAX_DEPTH_WARN=10          # Warn if chain exceeds this
-CHECKPOINT_RETRY_AUTO_TO_FULL=yes     # Convert to FULL if AUTO fails
-CHECKPOINT_MAX_RETRIES_AUTO=1         # Max AUTO retries before FULL
+CHECKPOINT_FORCE_FULL_ON_DAY="${CHECKPOINT_FORCE_FULL_ON_DAY:-1}"        # Day of month for full backup
+CHECKPOINT_HEALTH_CHECK="${CHECKPOINT_HEALTH_CHECK:-yes}"            # Validate checkpoint before AUTO mode
+CHECKPOINT_MAX_DEPTH_WARN="${CHECKPOINT_MAX_DEPTH_WARN:-10}"          # Warn if chain exceeds this
+CHECKPOINT_RETRY_AUTO_TO_FULL="${CHECKPOINT_RETRY_AUTO_TO_FULL:-yes}"     # Convert to FULL if AUTO fails
+CHECKPOINT_MAX_RETRIES_AUTO="${CHECKPOINT_MAX_RETRIES_AUTO:-1}"         # Max AUTO retries before FULL
 
 #################################################################################
 # OPERATIONAL SETTINGS - LOADED FROM CONFIG
@@ -763,11 +806,11 @@ CHECKPOINT_MAX_RETRIES_AUTO=1         # Max AUTO retries before FULL
 #################################################################################
 
 # Retry configuration
-MAX_RETRIES=3
-RETRY_DELAY=30  # seconds
+MAX_RETRIES="${MAX_RETRIES:-3}"
+RETRY_DELAY="${RETRY_DELAY:-30}"  # seconds
 
 # State directory (locks, logs, recovery flags)
-STATE_DIR="${BACKUP_PATH}_state"
+STATE_DIR="${BACKUP_PATH%/}/_state"
 LOCK_DIR="${STATE_DIR}/locks"
 TEMP_DIR="${STATE_DIR}/temp"           # Temporary files and recovery flags
 LOG_DIR="${STATE_DIR}/logs"            # Per-backup log files (virtnbdbackup output)
@@ -786,8 +829,17 @@ LOG_FILE="${LOG_DIR}/vmbackup.log"
 CANCEL_REPLICATION_FLAG="${STATE_DIR}/cancel-replication"
 
 if [[ "${_CANCEL_REPLICATION_REQUESTED:-false}" == "true" ]]; then
-    mkdir -p "$STATE_DIR" 2>/dev/null
-    echo "$(date '+%Y-%m-%d %H:%M:%S') PID=$$ user=$(whoami)" > "$CANCEL_REPLICATION_FLAG"
+    # FF-142: fail closed on a control op. If STATE_DIR can't be created or the
+    # flag write fails (unmounted / read-only backup volume), do NOT report
+    # success — a running session would never see a flag that was never written.
+    if ! mkdir -p "$STATE_DIR" 2>/dev/null; then
+        echo "Error: cannot create state directory: $STATE_DIR" >&2
+        exit "$EXIT_STORAGE"
+    fi
+    if ! echo "$(date '+%Y-%m-%d %H:%M:%S') PID=$$ user=$(whoami)" > "$CANCEL_REPLICATION_FLAG"; then
+        echo "Error: failed to write cancel-replication flag: $CANCEL_REPLICATION_FLAG" >&2
+        exit "$EXIT_STORAGE"
+    fi
     echo "Replication cancellation requested."
     echo "Flag file created: $CANCEL_REPLICATION_FLAG"
     echo "Active replication jobs will terminate gracefully within ~30 seconds."
@@ -973,6 +1025,13 @@ ensure_backup_path_sgid() {
   has_sgid=$(stat -c '%a' "$BACKUP_PATH" 2>/dev/null)
 
   if [[ "$current_group" != "backup" || "${has_sgid:0:1}" != "2" ]]; then
+    # FF-159: --dry-run is read-only end-to-end. This runs as main()'s first
+    # statement (before the dry-run banner); preview the SGID bootstrap but
+    # mutate nothing. (dry-run-must-be-readonly class.)
+    if is_dry_run; then
+      echo "[vmbackup] [DRY-RUN] Would set $BACKUP_PATH to root:backup 2750 (skipping — read-only)" >&2
+      return 0
+    fi
     chown root:backup "$BACKUP_PATH" 2>/dev/null ||
       echo "[vmbackup] WARN: Failed to set ownership root:backup on $BACKUP_PATH" >&2
     chmod 2750 "$BACKUP_PATH" 2>/dev/null ||
@@ -1148,7 +1207,43 @@ validate_operational_settings() {
       ENABLE_AUTO_RECOVERY_ON_CHECKPOINT_CORRUPTION="yes"
       ;;
   esac
-  
+
+  #-----------------------------------------------------------------------------
+  # I/O / Process Priority Settings
+  #-----------------------------------------------------------------------------
+  # SEC-02 Vector-2: these values word-split UNQUOTED into the ionice/nice priority
+  # wrapper in perform_backup (split into argv by design), so a malformed root-owned
+  # config value would garble the wrapped command. Reject-and-default to a valid
+  # integer here — the word-split of a VALIDATED integer is safe and is the design.
+  # (10# forces base-10 so a zero-padded value like "08"/"09" isn't read as octal.)
+  if [[ ! "$IO_PRIORITY_CLASS" =~ ^[0-9]+$ ]] || (( 10#$IO_PRIORITY_CLASS < 1 || 10#$IO_PRIORITY_CLASS > 3 )); then
+    log_warn "vmbackup.sh" "validate_operational_settings" "INVALID: IO_PRIORITY_CLASS='$IO_PRIORITY_CLASS' (must be integer 1-3: 1=realtime, 2=best-effort, 3=idle)"
+    log_warn "vmbackup.sh" "validate_operational_settings" "USING DEFAULT: IO_PRIORITY_CLASS=2 (best-effort)"
+    IO_PRIORITY_CLASS=2
+  else
+    log_debug "vmbackup.sh" "validate_operational_settings" "IO_PRIORITY_CLASS=$IO_PRIORITY_CLASS (from config)"
+  fi
+
+  if [[ ! "$IO_PRIORITY_LEVEL" =~ ^[0-9]+$ ]] || (( 10#$IO_PRIORITY_LEVEL < 0 || 10#$IO_PRIORITY_LEVEL > 7 )); then
+    log_warn "vmbackup.sh" "validate_operational_settings" "INVALID: IO_PRIORITY_LEVEL='$IO_PRIORITY_LEVEL' (must be integer 0-7)"
+    log_warn "vmbackup.sh" "validate_operational_settings" "USING DEFAULT: IO_PRIORITY_LEVEL=5 (normal)"
+    IO_PRIORITY_LEVEL=5
+  else
+    log_debug "vmbackup.sh" "validate_operational_settings" "IO_PRIORITY_LEVEL=$IO_PRIORITY_LEVEL (from config)"
+  fi
+
+  # PROCESS_PRIORITY (nice) is the third SEC-02 Vector-2 lever: it word-splits
+  # UNQUOTED into the same priority_wrapper (perform_backup) AND is arithmetic-
+  # evaluated in `(( PROCESS_PRIORITY != 0 ))`. Signed integer -20..19; reject a
+  # leading-zero form too so the arithmetic context is octal-safe.
+  if [[ ! "$PROCESS_PRIORITY" =~ ^-?(0|[1-9][0-9]*)$ ]]; then
+    log_warn "vmbackup.sh" "validate_operational_settings" "INVALID: PROCESS_PRIORITY='$PROCESS_PRIORITY' (must be integer -20..19)"
+    log_warn "vmbackup.sh" "validate_operational_settings" "USING DEFAULT: PROCESS_PRIORITY=10 (low)"
+    PROCESS_PRIORITY=10
+  else
+    log_debug "vmbackup.sh" "validate_operational_settings" "PROCESS_PRIORITY=$PROCESS_PRIORITY (from config)"
+  fi
+
   #-----------------------------------------------------------------------------
   # Summary
   #-----------------------------------------------------------------------------
@@ -1228,6 +1323,16 @@ is_replication_cancelled() {
 
 # Remove the cancellation flag file after processing
 clear_replication_cancel_flag() {
+    # FF-162: --dry-run is read-only. The cancel flag is an operator-armed
+    # control file (pre-created via --cancel-replication to suppress the NEXT
+    # real session); consuming it during a preview silently loses the pending
+    # cancellation. Preview and keep it. (dry-run-must-be-readonly class.)
+    if is_dry_run; then
+        [[ -f "${CANCEL_REPLICATION_FLAG:-${STATE_DIR}/cancel-replication}" ]] && \
+          log_info "vmbackup.sh" "clear_replication_cancel_flag" \
+            "[DRY-RUN] Would clear replication cancel flag - skipping (read-only)"
+        return 0
+    fi
     if [[ -f "${CANCEL_REPLICATION_FLAG:-${STATE_DIR}/cancel-replication}" ]]; then
         local flag_contents
         flag_contents=$(cat "$CANCEL_REPLICATION_FLAG" 2>/dev/null)
@@ -1388,7 +1493,16 @@ invoke_cloud_replication() {
 # Applies uniformly to all replication types (local and cloud).
 #-------------------------------------------------------------------------------
 _invalidate_replication_state_files() {
-  local state_dir="${STATE_DIR:-${BACKUP_PATH}_state}"
+  # FF-161: --dry-run is read-only. These files are consumed by email/status
+  # reporting and are re-created only by a REAL replication run; under dry-run
+  # replication is skipped, so deleting them would wipe the last real session's
+  # reporting state. Preview and skip. (dry-run-must-be-readonly class.)
+  if is_dry_run; then
+    log_debug "vmbackup.sh" "_invalidate_replication_state_files" \
+      "[DRY-RUN] Would invalidate stale replication state files - skipping (read-only)"
+    return 0
+  fi
+  local state_dir="${STATE_DIR:-${BACKUP_PATH%/}/_state}"
 
   local -a state_files=(
     "${state_dir}/local_replication_state.txt"
@@ -1416,7 +1530,10 @@ check_dependencies() {
   # Required binaries
   # INT-07 (2026-05-23): xmllint removed — no callers remained in the
   # codebase; was a phantom dependency. debian/control already clean.
-  local required_tools=("virsh" "virtnbdbackup" "bash" "grep" "awk" "sed" "cut" "tr" "wc" "find" "date" "stat" "mkdir" "rm" "touch" "chmod" "tar")
+  # DEP-01 (118-spaces): sha256sum is load-bearing — vm_fs_name() derives the
+  # per-VM backup folder token from it. If absent, the encoder fails CLOSED
+  # (refuses to mis-file), so gate it here to fail loudly up front instead.
+  local required_tools=("virsh" "virtnbdbackup" "bash" "grep" "awk" "sed" "cut" "tr" "wc" "find" "date" "stat" "mkdir" "rm" "touch" "chmod" "tar" "sha256sum")
   
   log_info "vmbackup.sh" "check_dependencies" "Verifying required dependencies"
   
@@ -1436,6 +1553,16 @@ check_dependencies() {
       log_warn "vmbackup.sh" "check_dependencies" "OPTIONAL: $tool not found (archival compression will use fallback)"
     fi
   done
+
+  # R5: jq is used only by the stale-bitmap self-healer
+  # (remove_stale_qemu_bitmaps). Packaged installs already depend on jq via
+  # debian/control; source/manual installs may lack it. Report it honestly as
+  # optional with an accurate message (it is not a compression tool) so a
+  # missing jq is visible rather than silently degrading the recovery path.
+  if ! command -v jq &>/dev/null; then
+    missing_optional+=("jq")
+    log_warn "vmbackup.sh" "check_dependencies" "OPTIONAL: jq not found (stale-bitmap cleanup/self-heal will be skipped with a warning)"
+  fi
   
   # Check libvirt daemon is running (virsh availability already checked in the loop above)
   if command -v virsh &>/dev/null && ! lv_daemon_alive; then
@@ -1476,14 +1603,18 @@ check_dependencies() {
     local aa_local_file="/etc/apparmor.d/local/abstractions/libvirt-qemu"
     local aa_abstraction="/etc/apparmor.d/abstractions/libvirt-qemu"
     
-    # Check if the scratch dir is allowed in libvirt-qemu AppArmor profile
-    local scratch_pattern="${scratch_dir}/virtnbdbackup.*"
+    # FF-143: check the CONFIGURED scratch dir's rule, not the bare literal
+    # 'virtnbdbackup'. With a custom VIRTNBD_SCRATCH_DIR the packaged /var/tmp
+    # rule still contains 'virtnbdbackup', so the old grep passed while the
+    # backup would fail at runtime for exactly the reason this check exists to
+    # catch. Grep (fixed-string) for '<scratch_dir>/virtnbdbackup'.
+    local scratch_rule="${scratch_dir}/virtnbdbackup"
     local needs_fix=false
     
     if [[ -f "$aa_abstraction" ]]; then
-      # Check if virtnbdbackup socket access is already allowed
-      if ! grep -q "virtnbdbackup" "$aa_abstraction" 2>/dev/null && \
-         ! grep -q "virtnbdbackup" "$aa_local_file" 2>/dev/null; then
+      # Check if virtnbdbackup socket access is allowed for THIS scratch dir
+      if ! grep -qF "$scratch_rule" "$aa_abstraction" 2>/dev/null && \
+         ! grep -qF "$scratch_rule" "$aa_local_file" 2>/dev/null; then
         needs_fix=true
       fi
     fi
@@ -1838,17 +1969,24 @@ source_lib_or_die vm_lock.sh
 #   0 = Backup completed normally (with or without progress)
 #   1 = Backup stalled and was killed (likely FSFREEZE hang)
 #
-# CRITICAL EDGE CASE (Not Currently Handled):
-#   - perform_backup() does NOT distinguish between return value 0 vs 1
-#   - Retry logic retries with FSFREEZE still enabled (-F flag)
-#   - If stall was caused by FSFREEZE, retry will hang the same way
-#   - Should disable FSFREEZE on retry: VIRTNBD_FSFREEZE=false before retry
-#   - See GitHub #102 mitigation strategy for future enhancement
+# FREEZE-STALL SIGNALLING (R2):
+#   - On a stall-kill this function also touches the sentinel file passed as $4
+#     (when provided). perform_backup() reads that sentinel to tell a freeze
+#     stall apart from an ordinary virtnbdbackup failure, because the failure
+#     path's `wait $monitor_pid || true` swallows this function's return code
+#     and the success path never waits on the monitor at all.
+#   - perform_backup() then classifies the failure as FSFREEZE_STALL and, after
+#     BACKUP_FSFREEZE_STALL_LIMIT consecutive freeze stalls, stops retrying and
+#     fails closed. Disabling the freeze on retry is NOT an option here:
+#     virtnbdbackup 2.x always freezes via the guest agent (-F only narrows the
+#     mountpoints, it cannot turn freezing off), so a retry re-freezes the same
+#     way. Containing the hang and reporting it honestly is the fix.
 
 monitor_backup_progress() {
   local backup_pid=$1
   local backup_dir=$2
   local vm_name=$3
+  local _stall_sentinel="${4:-}"   # R2: touched on a freeze-stall kill (optional)
   
   # PHASE 0: Wait for virtnbdbackup to create *.data.partial file
   # File creation can be delayed on slow systems (NBD setup, VM pause, checkpoint creation)
@@ -1912,7 +2050,11 @@ monitor_backup_progress() {
       # If stalled too long, assume FSFREEZE hang and kill backup
       if (( stall_time >= BACKUP_STALL_THRESHOLD )); then
         log_error "vmbackup.sh" "monitor_backup_progress" "FSFREEZE TIMEOUT DETECTED: VM $vm_name stalled for ${BACKUP_STALL_THRESHOLD}s - killing backup"
-        log_error "vmbackup.sh" "monitor_backup_progress" "  (This usually indicates guest agent FSFREEZE failure - retry should disable FSFREEZE)"
+        log_error "vmbackup.sh" "monitor_backup_progress" "  (Guest agent likely failed to freeze filesystems; perform_backup will classify this as FSFREEZE_STALL and contain it)"
+        # R2: signal the parent that THIS kill was a freeze stall. The failure
+        # path's `wait $monitor_pid || true` discards our return code, so a
+        # sentinel file is the reliable channel.
+        [[ -n "$_stall_sentinel" ]] && : > "$_stall_sentinel" 2>/dev/null
         kill $backup_pid 2>/dev/null
         return 1  # Signal that this was a stall kill, not normal exit
       fi
@@ -1929,7 +2071,7 @@ monitor_backup_progress() {
 # Check if lock exists
 has_lock() {
   local vm_name=${1:?Error: vm_name required}
-  local lock_file="$LOCK_DIR/vmbackup-${vm_name}.lock"
+  local lock_file; lock_file=$(vm_lock_file "$vm_name" 2>/dev/null) || lock_file=""  # LOCK-01: token-keyed
   
   # Check if lock file exists
   [[ -f "$lock_file" ]] || return 1
@@ -1938,26 +2080,26 @@ has_lock() {
   local lock_pid=$(cat "$lock_file" 2>/dev/null)
   [[ -z "$lock_pid" ]] && return 1
   
-  # Check if process is still running
-  if ! kill -0 "$lock_pid" 2>/dev/null; then
-    # Process not running - remove stale lock and return false
-    log_debug "vmbackup.sh" "has_lock" "Stale lock for '$vm_name': PID $lock_pid not running, removing"
-    rm -f "$lock_file"
-    return 1
+  # Verify a live, legitimate holder. The canonical allowlist
+  # (vmbackup/vmrestore/virtnbdbackup) lives in lib/vm_lock.sh so this hot-path
+  # site can't drift and reap a live vmrestore/virtnbdbackup holder (FF-6).
+  if vm_lock_holder_live "$lock_pid"; then
+    log_debug "vmbackup.sh" "has_lock" "Active lock for '$vm_name': PID $lock_pid is a live vmbackup/vmrestore/virtnbdbackup holder"
+    return 0
   fi
   
-  # Verify it's actually a backup process (not PID reuse)
-  local cmdline=$(cat "/proc/$lock_pid/cmdline" 2>/dev/null | tr '\0' ' ')
-  if [[ ! "$cmdline" =~ vmbackup ]]; then
-    # Different process using same PID - remove stale lock
-    log_debug "vmbackup.sh" "has_lock" "Stale lock for '$vm_name': PID $lock_pid reused by non-backup process, removing"
-    rm -f "$lock_file"
+  # Dead PID, or PID reused by an unrelated process - remove stale lock.
+  # SP-DR: --dry-run is read-only end-to-end. Skip ONLY the file deletion; the
+  # semantic answer is unchanged (return 1 = "no live lock"). A surviving stale
+  # file is inert for the preview (backup_vm skips create_lock under dry-run) and
+  # is reaped by create_lock on the next REAL run.
+  if is_dry_run; then
+    log_debug "vmbackup.sh" "has_lock" "[DRY-RUN] Would remove stale lock: $lock_file (PID $lock_pid not a live holder) - skipping (read-only)"
     return 1
   fi
-  
-  # Lock is valid and from active backup process
-  log_debug "vmbackup.sh" "has_lock" "Active lock for '$vm_name': PID $lock_pid is running vmbackup"
-  return 0
+  log_debug "vmbackup.sh" "has_lock" "Stale lock for '$vm_name': PID $lock_pid is not a live vmbackup/vmrestore/virtnbdbackup holder, removing"
+  rm -f "$lock_file"
+  return 1
 }
 
 #################################################################################
@@ -1969,23 +2111,32 @@ has_lock() {
 # Purpose: Recover from interrupted backup and allow retry in same session
 emergency_cleanup_current_vm() {
   local vm_name=${1:?Error: vm_name required}
+
+  if is_dry_run; then
+    log_info "vmbackup.sh" "emergency_cleanup_current_vm" "[DRY-RUN] Would clean up lock/bitmaps/partial files for VM: $vm_name - skipping (read-only)"
+    return 0
+  fi
   
   log_warn "vmbackup.sh" "emergency_cleanup_current_vm" "Starting emergency cleanup for VM: $vm_name"
   
   # Remove lock file
-  local lock_file="$LOCK_DIR/vmbackup-${vm_name}.lock"
+  local lock_file; lock_file=$(vm_lock_file "$vm_name" 2>/dev/null) || lock_file=""  # LOCK-01: token-keyed
   if [[ -f "$lock_file" ]]; then
     log_debug "vmbackup.sh" "emergency_cleanup_current_vm" "Deleting lock file: $lock_file"
     rm -f "$lock_file"
     log_info "vmbackup.sh" "emergency_cleanup_current_vm" "Removed stale lock file: $lock_file"
   fi
   
+  # CLEANUP-01 (118-spaces): BACKUP_BASE_DIR was never defined (only BACKUP_PATH
+  # exists), so "$BACKUP_BASE_DIR/$vm_name" resolved to "/$vm_name" — the
+  # filesystem root, not the VM's backup tree. Use BACKUP_PATH + the vm_fs_name
+  # token (also correct for spaced names).
+  local _ec_tok; _ec_tok=$(vm_fs_name "$vm_name" 2>/dev/null) || _ec_tok=""
+  local backup_dir=""; [[ -n "$_ec_tok" ]] && backup_dir="${BACKUP_PATH}${_ec_tok}"
+
   # Remove orphaned bitmaps (Issue #223: metadata deleted but QEMU bitmap persists)
   # This is critical because orphaned bitmaps cause "bitmap not found in backing chain" errors
-  remove_orphaned_vm_bitmaps "$vm_name" "$BACKUP_BASE_DIR/$vm_name" || true
-  
-  # Remove partial/incomplete backup files from this session
-  local backup_dir="$BACKUP_BASE_DIR/$vm_name"
+  [[ -n "$backup_dir" ]] && remove_orphaned_vm_bitmaps "$vm_name" "$backup_dir" || true
   if [[ -d "$backup_dir" ]]; then
     # Find incomplete backup directories (marked with .incomplete suffix)
     log_debug "vmbackup.sh" "emergency_cleanup_current_vm" "Searching for .incomplete directories in: $backup_dir"
@@ -2006,7 +2157,7 @@ detect_interrupted_backup() {
   local vm_name=${1:?Error: vm_name required}
   
   # Check for fresh stale lock (<5 minutes old indicates recent interrupt)
-  local lock_file="$LOCK_DIR/vmbackup-${vm_name}.lock"
+  local lock_file; lock_file=$(vm_lock_file "$vm_name" 2>/dev/null) || lock_file=""  # LOCK-01: token-keyed
   if [[ -f "$lock_file" ]]; then
     local lock_age=$(($(date +%s) - $(stat -c %Y "$lock_file" 2>/dev/null)))
     if [[ $lock_age -lt 300 ]]; then  # < 5 minutes
@@ -2043,6 +2194,17 @@ remove_orphaned_vm_bitmaps() {
     return 1
   fi
   
+  # FF-145: qemu-img info --output=json emits pretty-printed, multi-line JSON,
+  # which the old single-line grep '"bitmaps":\[.*\]' could NEVER match — this
+  # function was a guaranteed silent no-op. Parse with jq. jq is a hard package
+  # dependency (debian/control), so packaged installs never hit this arm; on a
+  # source install warn + return 1 (matching the qemu-img arm above) rather
+  # than silently degrade back to a no-op.
+  if ! command -v jq &>/dev/null; then
+    log_warn "vmbackup.sh" "remove_orphaned_vm_bitmaps" "jq not found - cannot enumerate qemu-img bitmaps; skipping orphaned-bitmap cleanup for VM $vm_name"
+    return 1
+  fi
+  
   local removed_count=0
   local failed_count=0
   
@@ -2053,24 +2215,21 @@ remove_orphaned_vm_bitmaps() {
     [[ -z "$disk_path" ]] && continue
     [[ ! -e "$disk_path" ]] && continue
     
-    # Use qemu-img info to find bitmaps
-    local bitmap_json=$(qemu-img info --output=json "$disk_path" 2>/dev/null | grep -o '"bitmaps":\[.*\]' | head -1)
-    
-    if [[ -n "$bitmap_json" ]]; then
-      # Extract and remove each bitmap
-      while read -r bitmap_name; do
-        [[ -z "$bitmap_name" ]] && continue
-        log_info "vmbackup.sh" "remove_orphaned_vm_bitmaps" "Removing bitmap '$bitmap_name' from disk: $disk_path"
-        
-        if qemu-img bitmap --remove "$disk_path" "$bitmap_name" 2>/dev/null; then
-          log_info "vmbackup.sh" "remove_orphaned_vm_bitmaps" "✓ Successfully removed bitmap: $bitmap_name"
-          removed_count=$((removed_count + 1))
-        else
-          log_error "vmbackup.sh" "remove_orphaned_vm_bitmaps" "✗ Failed to remove bitmap: $bitmap_name from $disk_path"
-          failed_count=$((failed_count + 1))
-        fi
-      done < <(echo "$bitmap_json" | grep -o '"name":"[^"]*"' | cut -d'"' -f4)
-    fi
+    # Enumerate this disk's persistent bitmaps from qemu-img's JSON via jq
+    # (FF-145: pretty-printed multi-line JSON; the old single-line grep matched
+    # nothing). Recurse for any "bitmaps" array and emit each bitmap name.
+    while read -r bitmap_name; do
+      [[ -z "$bitmap_name" ]] && continue
+      log_info "vmbackup.sh" "remove_orphaned_vm_bitmaps" "Removing bitmap '$bitmap_name' from disk: $disk_path"
+      
+      if qemu-img bitmap --remove "$disk_path" "$bitmap_name" 2>/dev/null; then
+        log_info "vmbackup.sh" "remove_orphaned_vm_bitmaps" "✓ Successfully removed bitmap: $bitmap_name"
+        removed_count=$((removed_count + 1))
+      else
+        log_error "vmbackup.sh" "remove_orphaned_vm_bitmaps" "✗ Failed to remove bitmap: $bitmap_name from $disk_path"
+        failed_count=$((failed_count + 1))
+      fi
+    done < <(qemu-img info --output=json "$disk_path" 2>/dev/null | jq -r '.. | .bitmaps? // empty | .[]? | .name? // empty' 2>/dev/null)
   done < <(lv_list_disk_paths "$vm_name")
   
   if [[ $removed_count -gt 0 || $failed_count -gt 0 ]]; then
@@ -2156,6 +2315,14 @@ check_file_descriptors() {
   
   log_info "vmbackup.sh" "check_file_descriptors" "Current FDs: $current / $limit"
   
+  # FF-146: 'ulimit -n' can be the literal 'unlimited' (systemd LimitNOFILE=
+  # infinity). In the arithmetic below the unset word 'unlimited' evaluates to 0,
+  # so the low-FD branch always fires and `ulimit -n $((unlimited+512))` = 512,
+  # LOWERING the session limit. An unlimited budget can never be low — skip.
+  if [[ "$limit" == "unlimited" ]]; then
+    return 0
+  fi
+  
   if (( current > limit - 100 )); then
     log_warn "vmbackup.sh" "check_file_descriptors" "Low file descriptors: $current / $limit"
     
@@ -2172,6 +2339,18 @@ check_backup_destination() {
   if [[ ! -d "$BACKUP_PATH" ]]; then
     log_error "vmbackup.sh" "check_backup_destination" "Backup path does not exist: $BACKUP_PATH"
     return 1
+  fi
+  
+  # Dry-run must not mutate the store: skip the probe-file write + rm and the
+  # recursive permission sweep. Still fail-closed — validate the destination
+  # with read-only checks (existence checked above; writability via [[ -w ]]).
+  if is_dry_run; then
+    if [[ ! -w "$BACKUP_PATH" ]]; then
+      log_error "vmbackup.sh" "check_backup_destination" "Cannot write to backup path: $BACKUP_PATH"
+      return 1
+    fi
+    log_info "vmbackup.sh" "check_backup_destination" "[DRY-RUN] Would write probe file and recursively set backup permissions on $BACKUP_PATH (validated via read-only checks)"
+    return 0
   fi
   
   # Test write access
@@ -2344,18 +2523,22 @@ cleanup_system_checkpoints_and_locks() {
       
       log_warn "vmbackup.sh" "cleanup_system_checkpoints_and_locks" "Found stale lock file: $lock_file (PID: $locked_pid, VM: $vm_name)"
       
-      # Check if the process in the lock file is still running
-      if [[ -n "$locked_pid" ]] && kill -0 "$locked_pid" 2>/dev/null; then
-        # Process is running - verify it's actually a backup process for this VM
-        local proc_cmdline=$(cat "/proc/$locked_pid/cmdline" 2>/dev/null | tr '\0' ' ')
-        if [[ "$proc_cmdline" == *"vmbackup"* ]] || [[ "$proc_cmdline" == *"virtnbdbackup"* ]]; then
-          log_warn "vmbackup.sh" "cleanup_system_checkpoints_and_locks" "Lock file is old BUT backup process IS running (PID: $locked_pid) - keeping lock"
-          continue
-        fi
+      # Check the lock file's PID is a live, legitimate holder. The allowlist
+      # (vmbackup/vmrestore/virtnbdbackup) lives in lib/vm_lock.sh so this reaper
+      # can't drift and reap a live restore's lock (FF-24).
+      if vm_lock_holder_live "$locked_pid"; then
+        log_warn "vmbackup.sh" "cleanup_system_checkpoints_and_locks" "Lock file is old BUT a backup/restore process IS running (PID: $locked_pid) - keeping lock"
+        continue
       fi
       
       # No running backup process found - safe to delete the stale lock
       log_warn "vmbackup.sh" "cleanup_system_checkpoints_and_locks" "Stale lock detected for VM: $vm_name (no active backup process) - removing and will retry"
+      # SP-DR: --dry-run is read-only. Show what WOULD be reaped but delete
+      # nothing and do NOT count it, so "Files removed: N" stays truthful.
+      if is_dry_run; then
+        log_info "vmbackup.sh" "cleanup_system_checkpoints_and_locks" "[DRY-RUN] Would delete stale lock: $lock_file - skipping (read-only)"
+        continue
+      fi
       rm -f "$lock_file"
       log_info "vmbackup.sh" "cleanup_system_checkpoints_and_locks" "Deleted stale lock: $lock_file"
       ((stale_count++))
@@ -2940,7 +3123,10 @@ determine_backup_level() {
   
   # RULE 1: First day of month = FULL if no valid full backup exists yet in current period
   # This ensures we get a monthly baseline, but allows incremental if already backed up today
-  if [[ "$day_of_month" == "$(printf '%02d' $CHECKPOINT_FORCE_FULL_ON_DAY)" ]]; then
+  # FF-148: force base-10. printf '%02d' treats a zero-padded value ('08'/'09')
+  # as invalid octal and substitutes 0 -> '00', which never equals date's '08'/
+  # '09', so the monthly forced FULL was silently skipped. 10# forces decimal.
+  if [[ "$day_of_month" == "$(printf '%02d' "$((10#$CHECKPOINT_FORCE_FULL_ON_DAY))")" ]]; then
     # Check if a valid full backup already exists for this period (using cached validation)
     if is_cache_valid "$vm_name"; then
       local cached_state=$(get_cached_validation_state)
@@ -3141,6 +3327,16 @@ remove_stale_qemu_bitmaps() {
     return 0
   fi
 
+  # R5: jq parses the QEMU monitor JSON below. Without it we cannot tell
+  # "no stale bitmaps" from "couldn't check", so guard explicitly and warn
+  # here rather than letting an empty parse fall through to the reassuring
+  # "No stale virtnbdbackup bitmaps found" log line further down. Packaged
+  # installs always have jq (debian/control); this protects source installs.
+  if ! command -v jq &>/dev/null; then
+    log_warn "vmbackup.sh" "remove_stale_qemu_bitmaps" "bitmap cleanup unavailable: jq not found - cannot check for stale virtnbdbackup bitmaps on VM $vm_name"
+    return 0
+  fi
+
   # Query all block devices and extract virtnbdbackup dirty bitmaps
   local query_output
   # [LIBVIRT-KEEPER: QEMU-monitor bitmap surgery — not generic libvirt]
@@ -3185,6 +3381,27 @@ remove_stale_qemu_bitmaps() {
   return 0
 }
 
+# _fail_chain_archive: FF-14 fail-closed handler for chain/copy archival failure.
+# WHY: a failure from archive_existing_checkpoint_chain() means the existing
+#   restore point was NOT safely archived. The callers used to log_warn and fall
+#   through into destructive cleanup, silently discarding the only good backup.
+#   We now refuse the cleanup before any delete so nothing is lost (fail-closed).
+# PRESERVES: backup_dir is left exactly as-is (no checkpoints deleted, no data
+#   removed); re-running retries archival. Sets CHAIN_ARCHIVE_FAILED for the
+#   caller's fail-closed report. Always returns 1.
+# Args: <vm_name> <backup_dir> <what>   (<what> = short noun, e.g. "checkpoint chain")
+_fail_chain_archive() {
+  local vm_name="$1"
+  local backup_dir="$2"
+  local what="$3"
+  log_error "vmbackup.sh" "prepare_backup_directory" "[Cleanup 2/2] Archival of $what for VM $vm_name FAILED - preserved IN PLACE at $backup_dir (nothing deleted)"
+  log_error "vmbackup.sh" "prepare_backup_directory" "[Cleanup 2/2] Cleanup REFUSED fail-closed - no files deleted, existing restore point retained"
+  log_error "vmbackup.sh" "prepare_backup_directory" "[Cleanup 2/2] REMEDIATION: check free space / permissions / read-only state under <period>/.archives/chain-<date>"
+  log_error "vmbackup.sh" "prepare_backup_directory" "[Cleanup 2/2] Re-run the backup to retry archival once the underlying condition is resolved"
+  set_backup_error "CHAIN_ARCHIVE_FAILED" "Archival of $what failed - cleanup refused fail-closed, $backup_dir preserved in place" "Check free space/permissions under <period>/.archives/chain-<date>, then re-run"
+  return 1
+}
+
 # Pre-backup cleanup: prepare directory based on validation state
 # Returns: 0 if successful, 1 if cleanup failed
 prepare_backup_directory() {
@@ -3205,7 +3422,13 @@ prepare_backup_directory() {
       if archive_existing_checkpoint_chain "$vm_name" "$backup_dir"; then
         log_info "vmbackup.sh" "prepare_backup_directory" "[Cleanup 2/2] Copy backup archived successfully - proceeding with new backup chain"
       else
-        log_warn "vmbackup.sh" "prepare_backup_directory" "[Cleanup 2/2] Archive failed but continuing - copy backup files may remain"
+        _fail_chain_archive "$vm_name" "$backup_dir" "copy backup"
+        return 1
+      fi
+
+      if is_dry_run; then
+        log_info "vmbackup.sh" "prepare_backup_directory" "[DRY-RUN] would clear orphaned QEMU checkpoints + checkpoints/ dir + copy metadata for new chain (VM: $vm_name)"
+        return 0
       fi
       
       local cleanup_count=0
@@ -3256,6 +3479,11 @@ prepare_backup_directory() {
     clean)
       # State is clean - minimal cleanup needed
       log_info "vmbackup.sh" "prepare_backup_directory" "[Cleanup 2/2] Directory validated: clean state, proceeding with backup"
+
+      if is_dry_run; then
+        log_info "vmbackup.sh" "prepare_backup_directory" "[DRY-RUN] would remove stale backup.*.log files for VM: $vm_name"
+        return 0
+      fi
       
       local cleanup_count=0
       for file in "$backup_dir"/backup.*.log; do
@@ -3307,6 +3535,10 @@ prepare_backup_directory() {
       
       # YES MODE: Auto-cleanup and proceed
       log_warn "vmbackup.sh" "prepare_backup_directory" "AUTO-RECOVERY ENABLED: Cleaning stale checkpoint data"
+      if is_dry_run; then
+        log_info "vmbackup.sh" "prepare_backup_directory" "[DRY-RUN] would clean stale checkpoint data (archive chain, delete checkpoints + bitmaps, clean directory) and force FULL for VM: $vm_name"
+        return 0
+      fi
       
       # Archive existing valid backup chain before cleanup destroys it
       local has_valid_chain=false
@@ -3319,7 +3551,8 @@ prepare_backup_directory() {
         if archive_existing_checkpoint_chain "$vm_name" "$backup_dir"; then
           log_info "vmbackup.sh" "prepare_backup_directory" "[Cleanup 2/2] Previous chain archived successfully"
         else
-          log_warn "vmbackup.sh" "prepare_backup_directory" "[Cleanup 2/2] Chain archival failed - proceeding with cleanup anyway"
+          _fail_chain_archive "$vm_name" "$backup_dir" "checkpoint chain"
+          return 1
         fi
       else
         log_debug "vmbackup.sh" "prepare_backup_directory" "[Cleanup 2/2] No valid backup chain to archive"
@@ -3402,6 +3635,10 @@ prepare_backup_directory() {
       
       # YES MODE: Auto-cleanup and proceed
       log_warn "vmbackup.sh" "prepare_backup_directory" "AUTO-RECOVERY ENABLED: Resetting broken checkpoint chain"
+      if is_dry_run; then
+        log_info "vmbackup.sh" "prepare_backup_directory" "[DRY-RUN] would reset broken checkpoint chain (archive chain, delete checkpoints + bitmaps, clean directory) and force FULL for VM: $vm_name"
+        return 0
+      fi
       
       # Archive existing valid backup chain before cleanup destroys it
       local has_valid_chain=false
@@ -3414,7 +3651,8 @@ prepare_backup_directory() {
         if archive_existing_checkpoint_chain "$vm_name" "$backup_dir"; then
           log_info "vmbackup.sh" "prepare_backup_directory" "[Cleanup 2/2] Previous chain archived successfully"
         else
-          log_warn "vmbackup.sh" "prepare_backup_directory" "[Cleanup 2/2] Chain archival failed - proceeding with cleanup anyway"
+          _fail_chain_archive "$vm_name" "$backup_dir" "checkpoint chain"
+          return 1
         fi
       else
         log_debug "vmbackup.sh" "prepare_backup_directory" "[Cleanup 2/2] No valid backup chain to archive"
@@ -3471,6 +3709,10 @@ prepare_backup_directory() {
         "[Cleanup 2/2] ORPHANED CHECKPOINT METADATA DETECTED - checkpoint files exist but backup data is missing"
       log_error "vmbackup.sh" "prepare_backup_directory" \
         "[Cleanup 2/2] This indicates incomplete/failed backups. Performing aggressive cleanup and forcing FULL backup"
+      if is_dry_run; then
+        log_info "vmbackup.sh" "prepare_backup_directory" "[DRY-RUN] would aggressively clean orphaned checkpoint metadata + incomplete backup data and force FULL for VM: $vm_name"
+        return 0
+      fi
       
       local cleanup_count=0
       
@@ -3524,6 +3766,11 @@ prepare_backup_directory() {
         "[Cleanup 2/2] INCOMPLETE BACKUP DETECTED - partial/interrupted backup files or empty checkpoint directory found"
       log_error "vmbackup.sh" "prepare_backup_directory" \
         "[Cleanup 2/2] Partial backup files and all checkpoint metadata will be removed to allow fresh backup attempt"
+
+      if is_dry_run; then
+        log_info "vmbackup.sh" "prepare_backup_directory" "[DRY-RUN] would clean incomplete backup data (archive valid chain, delete checkpoints + bitmaps, remove partial/data files) and force FULL for VM: $vm_name"
+        return 0
+      fi
       
       # Archive existing valid backup chain before cleanup destroys it
       # An interrupted incremental may still have a valid FULL that's restorable
@@ -3537,7 +3784,8 @@ prepare_backup_directory() {
         if archive_existing_checkpoint_chain "$vm_name" "$backup_dir"; then
           log_info "vmbackup.sh" "prepare_backup_directory" "[Cleanup 2/2] Previous chain archived successfully"
         else
-          log_warn "vmbackup.sh" "prepare_backup_directory" "[Cleanup 2/2] Chain archival failed - proceeding with cleanup anyway"
+          _fail_chain_archive "$vm_name" "$backup_dir" "checkpoint chain"
+          return 1
         fi
       else
         log_debug "vmbackup.sh" "prepare_backup_directory" "[Cleanup 2/2] No valid backup chain to archive"
@@ -3605,6 +3853,34 @@ perform_backup() {
   local backup_dir=$3
   local attempt=1
   local backup_type
+  # R2: freeze-stall detection state. The progress monitor touches
+  # $_stall_sentinel when it kills an attempt for a filesystem-freeze stall;
+  # we count those across attempts and fail closed at BACKUP_FSFREEZE_STALL_LIMIT.
+  # vm_name is already charset-validated upstream, so it is safe in the path.
+  local _stall_sentinel="${TEMP_DIR}/.fsfreeze-stall.$$.${vm_name}"
+  local _freeze_stall_count=0
+  local _freeze_stall_seen=false
+  rm -f "$_stall_sentinel" 2>/dev/null || true
+  # FF-150: build the reap-pattern for THIS VM's virtnbdbackup only. pgrep/pkill
+  # -f compile the pattern with glibc regcomp(REG_EXTENDED), where GNU regex
+  # operators (\< \> \` \') stay active — backslash-escaping a NON-metacharacter
+  # would forge an operator, not a literal — so we escape ONLY the true ERE
+  # metacharacters ( . [ ] ( ) { } * + ? | ^ $ \ ) and pass every other byte
+  # through untouched. Anchoring to the "-d <name> -l" argv boundary that
+  # lib/virtnbd.sh always emits means a substring or special-character name can
+  # never match a DIFFERENT VM's in-flight backup; a name embedding the literal
+  # " -l " token can still prefix-match, but that is unreachable in-session
+  # (single-session pidfile guard + sequential per-VM loop) and accepted.
+  # Pure-bash character loop (no sed/awk).
+  local _vnb_c _vnb_esc="" _vnb_i
+  for (( _vnb_i=0; _vnb_i<${#vm_name}; _vnb_i++ )); do
+    _vnb_c="${vm_name:_vnb_i:1}"
+    case "$_vnb_c" in
+      '.'|'['|']'|'('|')'|'{'|'}'|'*'|'+'|'?'|'|'|'^'|'$'|\\) _vnb_esc+="\\$_vnb_c" ;;
+      *) _vnb_esc+="$_vnb_c" ;;
+    esac
+  done
+  local _vnb_reap_pat="virtnbdbackup -d ${_vnb_esc} -l"
   
   # PRE-BACKUP VALIDATION: Use cached validation state from backup_vm()
   # validate_backup_state() was already called in backup_vm() before this function
@@ -3643,6 +3919,9 @@ perform_backup() {
   log_info "vmbackup.sh" "perform_backup" "Starting $backup_type backup for VM: $vm_name (attempt 1/$((MAX_RETRIES + 1)))"
   
   while (( attempt <= MAX_RETRIES + 1 )); do
+    # R2: clear any freeze-stall sentinel from a previous attempt so detection
+    # only ever reflects THIS attempt's monitor.
+    rm -f "$_stall_sentinel" 2>/dev/null || true
     # UNI-014 M1: build virtnbdbackup argv via lib/virtnbd.sh helper.
     # Strategy: Leverage virtnbdbackup's native capabilities for full/incremental backups,
     # compression, and changed block tracking (CBT) via QEMU dirty bitmaps/checkpoints.
@@ -3694,7 +3973,7 @@ perform_backup() {
     local backup_pid=$!
     
     # Start progress monitor in background - watches for stalls, not elapsed time
-    monitor_backup_progress $backup_pid "$backup_dir" "$vm_name" &
+    monitor_backup_progress $backup_pid "$backup_dir" "$vm_name" "$_stall_sentinel" &
     local monitor_pid=$!
     
     # Wait for backup to complete
@@ -3753,6 +4032,15 @@ perform_backup() {
       # are owned by backup group, in case it overrides SGID behaviour
       set_backup_permissions "$backup_dir" --recursive
       
+      # R2: if earlier attempts freeze-stalled but this one succeeded, the copy
+      # IS quiesced (virtnbdbackup always freezes; a clean run means the freeze
+      # worked this time). Surface the flaky guest agent without downgrading the
+      # backup or its reported consistency.
+      if [[ "$_freeze_stall_seen" == true ]]; then
+        log_warn "vmbackup.sh" "perform_backup" \
+          "Backup of $vm_name SUCCEEDED but survived $_freeze_stall_count earlier filesystem-freeze stall(s). The copy IS quiesced (the freeze succeeded on the final attempt); investigate qemu-guest-agent in the guest, which is intermittently slow to freeze."
+      fi
+      
       return 0
     else
       local exit_code=$?
@@ -3766,19 +4054,57 @@ perform_backup() {
       kill $monitor_pid 2>/dev/null || true
       wait $monitor_pid 2>/dev/null || true
       
+      # R2: did the monitor kill THIS attempt for a filesystem-freeze stall?
+      # (The wait above discarded the monitor's return code, so read the
+      # sentinel it leaves behind.)
+      local _was_freeze_stall=false
+      if [[ -f "$_stall_sentinel" ]]; then
+        _was_freeze_stall=true
+        _freeze_stall_seen=true
+        ((_freeze_stall_count++))
+        rm -f "$_stall_sentinel" 2>/dev/null || true
+        log_error "vmbackup.sh" "perform_backup" \
+          "Backup of $vm_name killed after a filesystem-freeze stall (no I/O for ${BACKUP_STALL_THRESHOLD}s) — freeze stall #${_freeze_stall_count} of max ${BACKUP_FSFREEZE_STALL_LIMIT}"
+      fi
+      
       # Capture virtnbdbackup log tail for error reporting
       local log_tail=""
       if [[ -f "$backup_log" ]]; then
         log_tail=$(tail -5 "$backup_log" 2>/dev/null | tr '\n' ' ' | cut -c1-200)
       fi
       
-      # Set specific error code with virtnbdbackup exit code
-      set_backup_error "VIRTNBD_EXIT_${exit_code}" "virtnbdbackup failed with exit code $exit_code" "$log_tail"
+      # Set specific error code. R2: a freeze stall gets its own honest code so
+      # the summary explains the cause instead of a generic engine exit status.
+      if [[ "$_was_freeze_stall" == true ]]; then
+        set_backup_error "FSFREEZE_STALL" \
+          "Guest agent did not respond to filesystem freeze within ${BACKUP_STALL_THRESHOLD}s; backup was killed to avoid an indefinite hang" \
+          "$log_tail"
+      else
+        set_backup_error "VIRTNBD_EXIT_${exit_code}" "virtnbdbackup failed with exit code $exit_code" "$log_tail"
+      fi
       
       # ═══════════════════════════════════════════════════════════════════════════
       # RETRY SELF-HEALING: Archive valid chain, re-validate, and cleanup
       # Before retrying, preserve any valid backup data and get fresh state
       # ═══════════════════════════════════════════════════════════════════════════
+      
+      # R2: fail closed once freeze stalls keep recurring. A retry always
+      # re-freezes (the engine has no opt-out), so repeated freeze stalls mean
+      # the guest agent is unhealthy and more attempts just hang again. The
+      # single-stall-then-recover case is preserved: we only break AT the limit.
+      if [[ "$_was_freeze_stall" == true ]] && (( _freeze_stall_count >= BACKUP_FSFREEZE_STALL_LIMIT )); then
+        log_error "vmbackup.sh" "perform_backup" \
+          "Filesystem-freeze stalls reached the limit (${_freeze_stall_count}/${BACKUP_FSFREEZE_STALL_LIMIT}) for VM $vm_name — refusing to retry. The guest agent is not responding to freeze; investigate qemu-guest-agent inside the guest."
+        # Reap any lingering virtnbdbackup and abort the libvirt job before bailing.
+        if pgrep -f "$_vnb_reap_pat" &>/dev/null; then           # FF-150
+            pkill -f "$_vnb_reap_pat" 2>/dev/null || true
+            sleep 2
+            pgrep -f "$_vnb_reap_pat" &>/dev/null && \
+                pkill -9 -f "$_vnb_reap_pat" 2>/dev/null || true
+        fi
+        lv_domjobabort "$vm_name"
+        break
+      fi
       
       # SMART RETRY STRATEGY: If AUTO failed, try FULL instead of retrying AUTO
       if [[ "$backup_type" == "auto" && "$CHECKPOINT_RETRY_AUTO_TO_FULL" == "yes" && $attempt -le $CHECKPOINT_MAX_RETRIES_AUTO ]]; then
@@ -3787,13 +4113,13 @@ perform_backup() {
           "AUTO backup failed, converting to FULL backup (attempt $attempt of $((MAX_RETRIES + 1)))"
         
         # Ensure virtnbdbackup and children are fully terminated
-        if pgrep -f "virtnbdbackup.*${vm_name}" &>/dev/null; then
+        if pgrep -f "$_vnb_reap_pat" &>/dev/null; then           # FF-150
             log_warn "vmbackup.sh" "perform_backup" "virtnbdbackup still running for $vm_name — killing"
-            pkill -f "virtnbdbackup.*${vm_name}" 2>/dev/null || true
+            pkill -f "$_vnb_reap_pat" 2>/dev/null || true
             sleep 2
             # Force kill if still alive
-            pgrep -f "virtnbdbackup.*${vm_name}" &>/dev/null && \
-                pkill -9 -f "virtnbdbackup.*${vm_name}" 2>/dev/null || true
+            pgrep -f "$_vnb_reap_pat" &>/dev/null && \
+                pkill -9 -f "$_vnb_reap_pat" 2>/dev/null || true
         fi
         # Abort any lingering libvirt backup job
         lv_domjobabort "$vm_name"
@@ -3829,7 +4155,7 @@ perform_backup() {
         fi
         
         backup_type="full"
-        sleep $RETRY_DELAY
+        sleep "$RETRY_DELAY"
         continue
       fi
       
@@ -3840,13 +4166,13 @@ perform_backup() {
           "Retrying $backup_type backup in $RETRY_DELAY seconds (attempt $attempt of $((MAX_RETRIES + 1)))"
         
         # Ensure virtnbdbackup and children are fully terminated
-        if pgrep -f "virtnbdbackup.*${vm_name}" &>/dev/null; then
+        if pgrep -f "$_vnb_reap_pat" &>/dev/null; then           # FF-150
             log_warn "vmbackup.sh" "perform_backup" "virtnbdbackup still running for $vm_name — killing"
-            pkill -f "virtnbdbackup.*${vm_name}" 2>/dev/null || true
+            pkill -f "$_vnb_reap_pat" 2>/dev/null || true
             sleep 2
             # Force kill if still alive
-            pgrep -f "virtnbdbackup.*${vm_name}" &>/dev/null && \
-                pkill -9 -f "virtnbdbackup.*${vm_name}" 2>/dev/null || true
+            pgrep -f "$_vnb_reap_pat" &>/dev/null && \
+                pkill -9 -f "$_vnb_reap_pat" 2>/dev/null || true
         fi
         # Abort any lingering libvirt backup job
         lv_domjobabort "$vm_name"
@@ -3894,7 +4220,7 @@ perform_backup() {
           backup_type="$new_backup_type"
         fi
         
-        sleep $RETRY_DELAY
+        sleep "$RETRY_DELAY"
       else
         # Out of retries, break out of loop
         break
@@ -3922,8 +4248,17 @@ verify_backup() {
   local file_count=$(find "$backup_dir" -maxdepth 1 -type f ! -name ".full-backup-done" ! -name "*.sha256" 2>/dev/null | wc -l)
   local total_size=$(du -sh "$backup_dir" --exclude=.archives 2>/dev/null | awk '{print $1}')
   
-  if (( file_count == 0 )); then
-    log_error "vmbackup.sh" "verify_backup" "No backup files found in $backup_dir"
+  # FF-151: the fail-closed "empty backup" backstop must key on real restorable
+  # payload (*.data), not the raw file count. virtnbdbackup can exit 0 having
+  # written nothing, leaving only non-payload files (.full-backup-month marker,
+  # .agent-status, backup.*.log). The old count excluded '.full-backup-done' — a
+  # marker this tool never writes — so those files kept file_count > 0 and the
+  # backstop passed vacuously. *.data is the canonical payload extension used
+  # everywhere else in this file.
+  local data_count
+  data_count=$(find "$backup_dir" -maxdepth 1 -type f -name "*.data" 2>/dev/null | wc -l)
+  if (( data_count == 0 )); then
+    log_error "vmbackup.sh" "verify_backup" "No backup data files (*.data) found in $backup_dir"
     log_error "vmbackup.sh" "verify_backup" "Directory contents: $(ls -la "$backup_dir" 2>/dev/null | tail -20)"
     return 1
   fi
@@ -4110,7 +4445,9 @@ check_discard_granularity() {
 # Returns: Unix timestamp of last backup, or 0 if no backup exists
 get_last_backup_timestamp() {
   local vm_name=$1
-  local safe_name=$(printf '%s' "$vm_name" | sed 's/[^A-Za-z0-9._-]/_/g')
+  # R3: route through the single strict validator (was an inline sed slug).
+  local safe_name
+  safe_name=$(vm_fs_name "$vm_name") || return $?
   local vm_dir="${BACKUP_PATH}${safe_name}"
   
   # Use VM-first structure via integration module
@@ -4132,7 +4469,7 @@ get_last_backup_timestamp() {
   # changing the archive layout.
   if [[ -d "$backup_dir" ]]; then
     local newest_backup_file
-    newest_backup_file=$(find "$backup_dir" -maxdepth 3 -type f \( -name "*.full.data" -o -name "*.inc.data" -o -name "*.copy.data" \) -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
+    newest_backup_file=$(find "$backup_dir" -maxdepth 3 -type f \( -name "*.full.data" -o -name "*.inc.virtnbdbackup.*.data" -o -name "*.copy.data" \) -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
     
     if [[ -n "$newest_backup_file" && -f "$newest_backup_file" ]]; then
       local ts
@@ -4150,7 +4487,7 @@ get_last_backup_timestamp() {
   #   for the period-dir hop:  <vm>/<period>/.archives/chain-*/<file>.data
   if [[ -d "$vm_dir" ]]; then
     local newest_backup_file
-    newest_backup_file=$(find "$vm_dir" -maxdepth 4 -type f \( -name "*.full.data" -o -name "*.inc.data" -o -name "*.copy.data" \) -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
+    newest_backup_file=$(find "$vm_dir" -maxdepth 4 -type f \( -name "*.full.data" -o -name "*.inc.virtnbdbackup.*.data" -o -name "*.copy.data" \) -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
     
     if [[ -n "$newest_backup_file" && -f "$newest_backup_file" ]]; then
       local ts
@@ -4187,6 +4524,7 @@ has_offline_vm_changed() {
   # Check if any VM disk files have been modified since last backup
   # Use virsh to get VM disk paths
   local disk_changed=0
+  local disks_examined=0   # FF-152: count disks actually stat-compared
   
   while IFS= read -r disk_path; do
     [[ -z "$disk_path" ]] && continue
@@ -4202,6 +4540,7 @@ has_offline_vm_changed() {
       log_warn "vmbackup.sh" "has_offline_vm_changed" "Could not stat disk: $disk_path"
       continue
     fi
+    ((disks_examined++))   # FF-152: a disk was actually verified
     
     # Compare disk modification time to last backup time
     if (( disk_mtime > last_backup_time )); then
@@ -4216,6 +4555,13 @@ has_offline_vm_changed() {
   if (( disk_changed == 1 )); then
     log_info "vmbackup.sh" "has_offline_vm_changed" "Offline VM $vm_name has changed - backup required"
     return 0  # Changed
+  elif (( disks_examined == 0 )); then
+    # FF-152: fail closed. If lv_list_disk_paths yielded nothing (transient
+    # virsh empty-enumeration on this contended host) or every listed disk was
+    # missing/unstat-able, NOTHING was verified — treat as changed so the
+    # offline backup is not silently skipped on an unverified VM.
+    log_warn "vmbackup.sh" "has_offline_vm_changed" "Offline VM $vm_name: no disks could be examined (enumeration/stat failure) - treating as changed (fail-closed)"
+    return 0  # Changed (fail-closed)
   else
     log_info "vmbackup.sh" "has_offline_vm_changed" "Offline VM $vm_name disks unchanged - backup can be skipped"
     return 1  # Not changed
@@ -4393,6 +4739,96 @@ detect_policy_change() {
   return 1
 }
 
+# B4/CLEAN-01: output channels for the shared chain-archival mover, read by the
+# caller immediately after _archive_chain_files returns.
+declare -gA _ARCHIVE_LAST_COUNTS=()
+declare -g  _ARCHIVE_LAST_TOTAL=0
+declare -g  _ARCHIVE_LAST_PATH=""
+
+# _archive_chain_files <vm_name> <period_dir>
+# Shared canonical chain-archival mover. Relocates a period's chain artefacts into
+# <period_dir>/.archives/chain-<YYYY-MM-DD>[.N]/ -- the ONLY archived-chain layout
+# vmrestore and orphan-retention recognise. Side-effect-free beyond the moves and
+# the two output channels above: NO session globals, NO SQLite, NO INT-15 (each
+# caller owns its own bookkeeping). Used by BOTH archive_existing_checkpoint_chain
+# (in-backup path) and archive_active_chains (retention period-boundary path) so the
+# two can never drift apart again (B4/CLEAN-01 Q1).
+# Output: stdout = chain-archive path (empty if nothing moved); _ARCHIVE_LAST_TOTAL
+#         = total artefacts moved/copied; _ARCHIVE_LAST_COUNTS = per-class counts.
+# Returns: 0 = >=1 artefact archived; 1 = mkdir failure; 2 = nothing to move (no
+#          directory is left behind -- the mkdir-gate, CLEAN-01 Fault 2/3).
+_archive_chain_files() {
+  local vm_name="$1" period_dir="$2"
+  _ARCHIVE_LAST_COUNTS=()
+  _ARCHIVE_LAST_TOTAL=0
+
+  local archive_base="${period_dir}/.archives"
+  local archive_date; archive_date=$(date +%Y-%m-%d)
+  local chain_archive="${archive_base}/chain-${archive_date}"
+  local _n=0
+  while [[ -d "$chain_archive" ]]; do
+    ((_n++))
+    chain_archive="${archive_base}/chain-${archive_date}.${_n}"
+  done
+
+  mkdir -p "$chain_archive" || {
+    log_error "vmbackup.sh" "_archive_chain_files" "Failed to create archive directory: $chain_archive"
+    return 1
+  }
+
+  local _moved=0
+
+  # Move one find-matched file class into the archive; record count under <key>.
+  _acf_move() {
+    local key="$1"; shift
+    local n=0 file
+    while IFS= read -r file; do
+      [[ -z "$file" ]] && continue
+      if mv "$file" "$chain_archive/"; then ((n++)); ((_moved++)); fi
+    done < <(find "$period_dir" -maxdepth 1 "$@" 2>/dev/null)
+    _ARCHIVE_LAST_COUNTS[$key]=$n
+  }
+  _acf_move metadata  -type f -name "virtnbdbackup.*.xml"
+  _acf_move vmconfig  -type f -name "vmconfig.virtnbdbackup.*.xml"
+  _acf_move full      -type f \( -name "*.full.data" -o -name "*.copy.data" \)
+  _acf_move inc       -type f -name "*.inc.virtnbdbackup.*.data"
+  _acf_move cpt       -type f -name "*.cpt"
+  _acf_move chksum    -type f -name "*.data.chksum"
+  _acf_move qcow_json -type f -name "*.qcow.json"
+  _acf_move nvram     -type f \( -name "*_VARS.fd" -o -name "*_VARS.fd.virtnbdbackup.*" -o -name "OVMF_CODE*.fd" -o -name "OVMF_CODE*.fd.virtnbdbackup.*" \)
+  unset -f _acf_move
+
+  # Directory classes moved whole.
+  local _d
+  for _d in checkpoints tpm-state config; do
+    if [[ -d "$period_dir/$_d" ]]; then
+      if mv "$period_dir/$_d" "$chain_archive/"; then _ARCHIVE_LAST_COUNTS[$_d]=1; ((_moved++)); else _ARCHIVE_LAST_COUNTS[$_d]=0; fi
+    fi
+  done
+
+  # .tpm-backup-marker is COPIED, not moved: the marker must remain in the period
+  # so the next chain's first backup detects TPM capability.
+  if [[ -f "$period_dir/.tpm-backup-marker" ]]; then
+    if cp "$period_dir/.tpm-backup-marker" "$chain_archive/"; then _ARCHIVE_LAST_COUNTS[tpm_marker]=1; ((_moved++)); fi
+  fi
+
+  _ARCHIVE_LAST_TOTAL=$_moved
+  if (( _moved == 0 )); then
+    # mkdir-gate: leave NOTHING on a no-op boundary -- remove the just-created
+    # chain dir AND the .archives parent if we left it empty (an empty .archives/
+    # would otherwise make the stub-reaper preserve the period forever).
+    rmdir "$chain_archive" 2>/dev/null || true
+    rmdir "$archive_base" 2>/dev/null || true
+    _ARCHIVE_LAST_PATH=""
+    return 2
+  fi
+  # Outputs travel via globals (NOT stdout): callers read _ARCHIVE_LAST_PATH /
+  # _ARCHIVE_LAST_TOTAL directly, because capturing via $(...) would fork a
+  # subshell and lose every global this function set.
+  _ARCHIVE_LAST_PATH="$chain_archive"
+  return 0
+}
+
 archive_existing_checkpoint_chain() {
   local vm_name=$1
   local backup_dir=$2
@@ -4420,198 +4856,34 @@ archive_existing_checkpoint_chain() {
   local restore_point_count
   restore_point_count=$(find "$backup_dir" -maxdepth 1 -name "virtnbdbackup.*.xml" -type f 2>/dev/null | wc -l)
   
-  # Create archives directory structure
-  local archive_base="$backup_dir/.archives"
-  local archive_date=$(date +%Y-%m-%d)
-  local chain_archive="$archive_base/chain-${archive_date}"
-  
-  # Handle multiple chains on same day: chain-2026-02-10, chain-2026-02-10.1, chain-2026-02-10.2, etc
-  local archive_counter=0
-  while [[ -d "$chain_archive" ]]; do
-    ((archive_counter++))
-    chain_archive="$archive_base/chain-${archive_date}.${archive_counter}"
-  done
-  
-  mkdir -p "$chain_archive" || {
-    log_error "vmbackup.sh" "archive_existing_checkpoint_chain" "Failed to create archive directory: $chain_archive"
+  # B4/CLEAN-01: relocate the chain's artefacts into the canonical
+  # .archives/chain-<date>[.N]/ layout via the shared mover (one routine shared
+  # with retention's archive_active_chains so the two can never drift again).
+  _archive_chain_files "$vm_name" "$backup_dir"
+  local _acf_rc=$?
+  local chain_archive="$_ARCHIVE_LAST_PATH"
+  if (( _acf_rc == 2 )); then
+    log_info "vmbackup.sh" "archive_existing_checkpoint_chain" \
+      "No chain artefacts to archive for $vm_name in $backup_dir - nothing moved"
+    return 0
+  elif (( _acf_rc != 0 )); then
+    log_error "vmbackup.sh" "archive_existing_checkpoint_chain" \
+      "Failed to archive chain for $vm_name (shared mover rc=$_acf_rc)"
     return 1
-  }
-  
-  log_info "vmbackup.sh" "archive_existing_checkpoint_chain" \
-    "Archiving checkpoint chain for VM $vm_name to: $chain_archive"
-  
-  # Archive all checkpoint metadata files (virtnbdbackup.*.xml)
-  local metadata_count=0
-  while IFS= read -r metadata_file; do
-    if mv "$metadata_file" "$chain_archive/"; then
-      ((metadata_count++))
-      log_debug "vmbackup.sh" "archive_existing_checkpoint_chain" \
-        "Archived metadata: $(basename "$metadata_file")"
-    else
-      log_warn "vmbackup.sh" "archive_existing_checkpoint_chain" \
-        "Failed to move metadata file: $metadata_file"
-    fi
-  done < <(find "$backup_dir" -maxdepth 1 -name "virtnbdbackup.*.xml" -type f 2>/dev/null)
-  
-  # Archive VM config XML files (vmconfig.virtnbdbackup.*.xml)
-  # These are per-checkpoint VM domain XML snapshots written by virtnbdrestore.
-  # Without these, restores must fall back to config/ directory XML (lacks disk paths).
-  local vmconfig_count=0
-  while IFS= read -r vmconfig_file; do
-    if mv "$vmconfig_file" "$chain_archive/"; then
-      ((vmconfig_count++))
-      log_debug "vmbackup.sh" "archive_existing_checkpoint_chain" \
-        "Archived vmconfig: $(basename "$vmconfig_file")"
-    else
-      log_warn "vmbackup.sh" "archive_existing_checkpoint_chain" \
-        "Failed to move vmconfig file: $vmconfig_file"
-    fi
-  done < <(find "$backup_dir" -maxdepth 1 -name "vmconfig.virtnbdbackup.*.xml" -type f 2>/dev/null)
-  
-  # Archive full backup data file (*.full.data)
-  local full_count=0
-  while IFS= read -r full_file; do
-    if mv "$full_file" "$chain_archive/"; then
-      ((full_count++))
-      log_debug "vmbackup.sh" "archive_existing_checkpoint_chain" \
-        "Archived full backup: $(basename "$full_file")"
-    else
-      log_warn "vmbackup.sh" "archive_existing_checkpoint_chain" \
-        "Failed to move full backup file: $full_file"
-    fi
-  done < <(find "$backup_dir" -maxdepth 1 \( -name "*.full.data" -o -name "*.copy.data" \) -type f 2>/dev/null)
-  
-  # Archive incremental backup data files (*.inc.virtnbdbackup.*.data)
-  local inc_count=0
-  while IFS= read -r inc_file; do
-    if mv "$inc_file" "$chain_archive/"; then
-      ((inc_count++))
-      log_debug "vmbackup.sh" "archive_existing_checkpoint_chain" \
-        "Archived incremental: $(basename "$inc_file")"
-    else
-      log_warn "vmbackup.sh" "archive_existing_checkpoint_chain" \
-        "Failed to move incremental file: $inc_file"
-    fi
-  done < <(find "$backup_dir" -maxdepth 1 -name "*.inc.virtnbdbackup.*.data" -type f 2>/dev/null)
-  
-  # Archive checkpoint marker files (*.cpt)
-  local cpt_count=0
-  while IFS= read -r cpt_file; do
-    if mv "$cpt_file" "$chain_archive/"; then
-      ((cpt_count++))
-      log_debug "vmbackup.sh" "archive_existing_checkpoint_chain" \
-        "Archived checkpoint marker: $(basename "$cpt_file")"
-    else
-      log_warn "vmbackup.sh" "archive_existing_checkpoint_chain" \
-        "Failed to move checkpoint marker: $cpt_file"
-    fi
-  done < <(find "$backup_dir" -maxdepth 1 -name "*.cpt" -type f 2>/dev/null)
-  
-  # Archive checksum files (*.data.chksum) — virtnbdbackup's targetIsEmpty() uses *.data* glob,
-  # so leftover .chksum files cause "already contains full or copy backup" errors on retry
-  local chksum_count=0
-  while IFS= read -r chksum_file; do
-    if mv "$chksum_file" "$chain_archive/"; then
-      ((chksum_count++))
-      log_debug "vmbackup.sh" "archive_existing_checkpoint_chain" \
-        "Archived checksum: $(basename "$chksum_file")"
-    else
-      log_warn "vmbackup.sh" "archive_existing_checkpoint_chain" \
-        "Failed to move checksum file: $chksum_file"
-    fi
-  done < <(find "$backup_dir" -maxdepth 1 -name "*.data.chksum" -type f 2>/dev/null)
-  
-  # Archive any checkpoint subdirectory if present
-  if [[ -d "$backup_dir/checkpoints" ]]; then
-    if mv "$backup_dir/checkpoints" "$chain_archive/"; then
-      log_debug "vmbackup.sh" "archive_existing_checkpoint_chain" \
-        "Archived checkpoints subdirectory"
-    else
-      log_warn "vmbackup.sh" "archive_existing_checkpoint_chain" \
-        "Failed to move checkpoints subdirectory"
-    fi
   fi
-  
-  # Archive qcow metadata files (*.qcow.json) — per-checkpoint disk geometry/format info
-  local qcow_json_count=0
-  while IFS= read -r qcow_file; do
-    if mv "$qcow_file" "$chain_archive/"; then
-      ((qcow_json_count++))
-      log_debug "vmbackup.sh" "archive_existing_checkpoint_chain" \
-        "Archived qcow metadata: $(basename "$qcow_file")"
-    else
-      log_warn "vmbackup.sh" "archive_existing_checkpoint_chain" \
-        "Failed to move qcow metadata: $qcow_file"
-    fi
-  done < <(find "$backup_dir" -maxdepth 1 -name "*.qcow.json" -type f 2>/dev/null)
-  
-  # Archive NVRAM/OVMF firmware files (UEFI VM state — filenames may contain spaces)
-  local nvram_count=0
-  while IFS= read -r nvram_file; do
-    if mv "$nvram_file" "$chain_archive/"; then
-      ((nvram_count++))
-      log_debug "vmbackup.sh" "archive_existing_checkpoint_chain" \
-        "Archived NVRAM/OVMF: $(basename "$nvram_file")"
-    else
-      log_warn "vmbackup.sh" "archive_existing_checkpoint_chain" \
-        "Failed to move NVRAM/OVMF file: $nvram_file"
-    fi
-  done < <(find "$backup_dir" -maxdepth 1 \( -name "*_VARS.fd" -o -name "*_VARS.fd.virtnbdbackup.*" -o -name "OVMF_CODE*.fd" -o -name "OVMF_CODE*.fd.virtnbdbackup.*" \) -type f 2>/dev/null)
-  
-  # Archive TPM state directory if present
-  local tpm_archived=0
-  if [[ -d "$backup_dir/tpm-state" ]]; then
-    if mv "$backup_dir/tpm-state" "$chain_archive/"; then
-      tpm_archived=1
-      log_debug "vmbackup.sh" "archive_existing_checkpoint_chain" \
-        "Archived tpm-state subdirectory"
-    else
-      log_warn "vmbackup.sh" "archive_existing_checkpoint_chain" \
-        "Failed to move tpm-state subdirectory"
-    fi
-  fi
-  
-  # Archive .tpm-backup-marker if present (gate file for vmrestore TPM restore)
-  # Use cp (not mv) — the marker must remain in the period dir for the next chain's
-  # first backup to detect TPM capability. It will be overwritten each backup cycle.
-  local tpm_marker_archived=0
-  if [[ -f "$backup_dir/.tpm-backup-marker" ]]; then
-    if cp "$backup_dir/.tpm-backup-marker" "$chain_archive/"; then
-      tpm_marker_archived=1
-      log_debug "vmbackup.sh" "archive_existing_checkpoint_chain" \
-        "Archived .tpm-backup-marker (copied)"
-    else
-      log_warn "vmbackup.sh" "archive_existing_checkpoint_chain" \
-        "Failed to copy .tpm-backup-marker"
-    fi
-  fi
-  
-  # Archive config subdirectory if present (per-chain VM XML snapshots)
-  local config_archived=0
-  if [[ -d "$backup_dir/config" ]]; then
-    if mv "$backup_dir/config" "$chain_archive/"; then
-      config_archived=1
-      log_debug "vmbackup.sh" "archive_existing_checkpoint_chain" \
-        "Archived config subdirectory"
-    else
-      log_warn "vmbackup.sh" "archive_existing_checkpoint_chain" \
-        "Failed to move config subdirectory"
-    fi
-  fi
-  
-  local total_archived=$((metadata_count + vmconfig_count + full_count + inc_count + cpt_count + chksum_count + qcow_json_count + nvram_count + tpm_archived + tpm_marker_archived + config_archived))
+  local total_archived=${_ARCHIVE_LAST_TOTAL:-0}
   log_info "vmbackup.sh" "archive_existing_checkpoint_chain" \
     "Archived chain for VM $vm_name: $total_archived files to $chain_archive"
-  
+
   # Log chain archive as a file operation (summary-level, not per-file)
   if declare -f log_file_operation >/dev/null 2>&1; then
     local archive_total_bytes
-    archive_total_bytes=$(du -sb "$chain_archive" 2>/dev/null | cut -f1 || echo 0)
+    archive_total_bytes=$(_du_bytes "$chain_archive")
     log_file_operation "move" "$vm_name" "$backup_dir" "$chain_archive" \
-      "directory" "Chain archived: ${total_archived} files (${metadata_count} metadata, ${vmconfig_count} vmconfig, ${full_count} full, ${inc_count} inc, ${cpt_count} cpt, ${chksum_count} chksum, ${qcow_json_count} qcow.json, ${nvram_count} nvram, ${tpm_marker_archived} tpm-marker)" \
+      "directory" "Chain archived: ${total_archived} files (${_ARCHIVE_LAST_COUNTS[metadata]:-0} metadata, ${_ARCHIVE_LAST_COUNTS[vmconfig]:-0} vmconfig, ${_ARCHIVE_LAST_COUNTS[full]:-0} full, ${_ARCHIVE_LAST_COUNTS[inc]:-0} inc, ${_ARCHIVE_LAST_COUNTS[cpt]:-0} cpt, ${_ARCHIVE_LAST_COUNTS[chksum]:-0} chksum, ${_ARCHIVE_LAST_COUNTS[qcow_json]:-0} qcow.json, ${_ARCHIVE_LAST_COUNTS[nvram]:-0} nvram, ${_ARCHIVE_LAST_COUNTS[tpm_marker]:-0} tpm-marker)" \
       "archive_existing_checkpoint_chain" "true"
   fi
-  
+
   # Set global tracking variables for session logging
   # These are read by backup_vm() regardless of which code path triggered the archival
   _ARCHIVE_CHAIN_ARCHIVED="true"
@@ -4633,14 +4905,18 @@ archive_existing_checkpoint_chain() {
   # G6/G7: Log archive to SQLite chain_health + chain_events audit trail
   if declare -f sqlite_archive_chain >/dev/null 2>&1; then
     # Derive period_id via get_period_id when available (handles accumulate correctly).
-    # Fallback to basename of parent directory for non-integration deployments.
+    # Fallback to the period-directory NAME for non-integration deployments.
+    # FF-153: chain_archive is <period_dir>/.archives/chain-<date>, so ONE
+    # dirname yields '.archives' — two dirname hops are needed to reach the
+    # period directory whose basename is the period id.
     local archive_period_id
     if declare -f get_vm_rotation_policy >/dev/null 2>&1 && declare -f get_period_id >/dev/null 2>&1; then
       archive_period_id=$(get_period_id "$(get_vm_rotation_policy "$vm_name")" 2>/dev/null)
     fi
-    archive_period_id="${archive_period_id:-$(basename "$(dirname "$chain_archive")")}"
+    archive_period_id="${archive_period_id:-$(basename "$(dirname "$(dirname "$chain_archive")")")}"
     local archive_chain_id=$(basename "$chain_archive")
-    local archive_size=$(du -sb "$chain_archive" 2>/dev/null | cut -f1 || echo 0)
+    local archive_size
+    archive_size=$(_du_bytes "$chain_archive")
     
     sqlite_archive_chain "$vm_name" "$archive_period_id" "$archive_chain_id" \
       "$chain_archive" "$archive_size"
@@ -4704,15 +4980,31 @@ backup_vm() {
       return $BACKUP_RC_EXCLUDED
     fi
     log_info "vmbackup.sh" "backup_vm" "[DRY-RUN] pre_backup_hook: policy=$_dr_policy (chain archiving skipped)"
-  elif ! pre_backup_hook "$vm_name"; then
-    # VM excluded by policy - log to session summary
-    _log_vm_backup_summary "$vm_name" "$backup_start_time" "$backup_start_epoch" \
-      "EXCLUDED" "n/a" "0" "0" "" "0" "$vm_policy" "" \
-      "vm_excluded" "excluded by rotation policy (policy=$vm_policy)" "0" "0"
-    # Bug 2 fix: run retention + stub cleanup for excluded VMs
-    declare -f run_retention_for_unbacked_vm >/dev/null 2>&1 && \
-      run_retention_for_unbacked_vm "$vm_name" "excluded"
-    return $BACKUP_RC_EXCLUDED  # Return 2 = excluded (don't count as success)
+  else
+    # NAME-02 (118-spaces): distinguish an intentional policy exclusion from a
+    # pre-backup ERROR. pre_backup_hook returns BACKUP_RC_EXCLUDED for policy=never
+    # and any other non-zero for a fault (e.g. a vm_fs_name hash failure). The old
+    # `! pre_backup_hook` collapsed EVERY non-zero to EXCLUDED, laundering errors
+    # into a benign-looking "success / 0 failed" (the exact thing that hid NAME-01).
+    pre_backup_hook "$vm_name"
+    local _ph_rc=$?
+    if [[ "$_ph_rc" -eq "$BACKUP_RC_EXCLUDED" ]]; then
+      # VM excluded by policy - log to session summary
+      _log_vm_backup_summary "$vm_name" "$backup_start_time" "$backup_start_epoch" \
+        "EXCLUDED" "n/a" "0" "0" "" "0" "$vm_policy" "" \
+        "vm_excluded" "excluded by rotation policy (policy=$vm_policy)" "0" "0"
+      # Bug 2 fix: run retention + stub cleanup for excluded VMs
+      declare -f run_retention_for_unbacked_vm >/dev/null 2>&1 && \
+        run_retention_for_unbacked_vm "$vm_name" "excluded"
+      return $BACKUP_RC_EXCLUDED  # Return 2 = excluded (don't count as success)
+    elif [[ "$_ph_rc" -ne 0 ]]; then
+      # A non-policy pre-backup failure -> FAILED, never silent.
+      log_error "vmbackup.sh" "backup_vm" "pre-backup hook failed for VM '$vm_name' (rc=$_ph_rc)"
+      _log_vm_backup_summary "$vm_name" "$backup_start_time" "$backup_start_epoch" \
+        "FAILED" "n/a" "0" "0" "" "0" "$vm_policy" "" \
+        "pre_backup_error" "pre-backup hook failed (rc=$_ph_rc)" "0" "0"
+      return 1  # FAILED (counted as a failure by the session loop)
+    fi
   fi
   
   #############################################################################
@@ -4737,8 +5029,20 @@ backup_vm() {
   while true; do
     # Check lock
     if has_lock "$vm_name"; then
-      # Lock exists - check if it's from recent interruption
-      if [[ "$recovery_attempted" == false ]] && detect_interrupted_backup "$vm_name"; then
+      # FF-48: post-FF-6, has_lock returns 0 ONLY when the lock's PID is a LIVE
+      # vmbackup/vmrestore/virtnbdbackup owner (anything else is reaped) — so a lock
+      # seen here is ALWAYS a legitimate live process, never a stale artefact.
+      # Emergency recovery must therefore fire ONLY when WE are that owner: a
+      # same-session Ctrl+Z / interrupt that re-enters backup_vm with our own $$
+      # still in the lock file. A live FOREIGN holder (e.g. a vmrestore mid-restore
+      # of this same VM) must fall through to the skip arm and fail closed — never
+      # be emergency-cleaned, or vmbackup would steal the lock and back up a VM
+      # mid-restore (reopening FF-6). pid==$$ is the discriminator because
+      # create_lock only ever writes the main process's own $$.
+      local _lk_file; _lk_file=$(vm_lock_file "$vm_name" 2>/dev/null) || _lk_file=""  # LOCK-01: token-keyed
+      local _lk_pid; _lk_pid=$(cat "$_lk_file" 2>/dev/null)
+      # Recover only OUR OWN interrupted lock (pid==$$); never a live foreign holder.
+      if [[ "$_lk_pid" == "$$" ]] && [[ "$recovery_attempted" == false ]] && detect_interrupted_backup "$vm_name"; then
         log_warn "vmbackup.sh" "backup_vm" "Detected interrupted backup for $vm_name - performing emergency recovery"
         emergency_cleanup_current_vm "$vm_name"
         recovery_attempted=true
@@ -4748,11 +5052,18 @@ backup_vm() {
         log_info "vmbackup.sh" "backup_vm" "Retrying backup for $vm_name after emergency recovery"
         continue
       else
-        log_warn "vmbackup.sh" "backup_vm" "Backup already in progress for VM: $vm_name (skipping)"
+        log_warn "vmbackup.sh" "backup_vm" "Backup already in progress for VM: $vm_name (lock held by live PID ${_lk_pid:-unknown}) - skipping"
         _log_vm_backup_summary "$vm_name" "$backup_start_time" "$backup_start_epoch" \
           "SKIPPED" "n/a" "0" "0" "already in progress" "0" "$vm_policy" "" \
           "backup_skipped" "already in progress (lock exists)" "0" "0"
-        return 1
+        # FF-48b: return 0 (was 1), matching the offline-unchanged skip arm's
+        # SKIPPED+return-0 contract. rc1 DOUBLE-COUNTED this VM: the session
+        # loop's fail_count++ AND the post-loop SKIPPED sweep both fired, then
+        # backed_up_count -= skipped_count decremented a VM never added to it,
+        # so backed_up_count could go NEGATIVE and a benign concurrent-restore
+        # skip raised a FALSE nightly failure. rc0 => backed_up_count++ then -=
+        # its own SKIPPED row => net 0 (skip-only, not failed).
+        return 0
       fi
     fi
     
@@ -4811,15 +5122,21 @@ backup_vm() {
   local backup_dir
   backup_dir=$(get_backup_dir "$vm_name")
   local agent_status_file="$backup_dir/.agent-status"
-  mkdir -p "$backup_dir" 2>/dev/null
-  
-  if [[ "$vm_status" == "running" ]]; then
-    if [[ "$has_qemu_agent" == "true" ]]; then
-      echo "yes" > "$agent_status_file"
-      log_debug "vmbackup.sh" "backup_vm" "Agent status recorded: VM $vm_name HAS agent (persisted to .agent-status)"
-    else
-      echo "no" > "$agent_status_file"
-      log_debug "vmbackup.sh" "backup_vm" "Agent status recorded: VM $vm_name NO agent (persisted to .agent-status)"
+  # 118/dry-run: backup_dir is the slug+hash TOKEN folder. Creating it (and writing
+  # .agent-status into it) during a preview pre-makes the folder, which then blocks
+  # MIG-01's no-clobber migration on the next real run. Skip all of it under --dry-run.
+  if is_dry_run; then
+    log_info "vmbackup.sh" "backup_vm" "[DRY-RUN] would create backup dir + record agent status for $vm_name — skipping"
+  else
+    mkdir -p "$backup_dir" 2>/dev/null
+    if [[ "$vm_status" == "running" ]]; then
+      if [[ "$has_qemu_agent" == "true" ]]; then
+        echo "yes" > "$agent_status_file"
+        log_debug "vmbackup.sh" "backup_vm" "Agent status recorded: VM $vm_name HAS agent (persisted to .agent-status)"
+      else
+        echo "no" > "$agent_status_file"
+        log_debug "vmbackup.sh" "backup_vm" "Agent status recorded: VM $vm_name NO agent (persisted to .agent-status)"
+      fi
     fi
   fi
   
@@ -4878,12 +5195,14 @@ backup_vm() {
       log_info "vmbackup.sh" "backup_vm" "ACTION PLAN: 1) Archive existing chain (if any), 2) Clear virsh checkpoints, 3) Create fresh full (copy) backup"
       
       # Check if there's an existing checkpoint chain to archive
-      if find "$backup_dir" -maxdepth 1 \( -name "virtnbdbackup.*.xml" -o -name "*.full.data" -o -name "*.inc.virtnbdbackup.*.data" \) -print -quit 2>/dev/null | grep -q .; then
+      if find "$backup_dir" -maxdepth 1 \( -name "virtnbdbackup.*.xml" -o -name "*.full.data" -o -name "*.inc.virtnbdbackup.*.data" -o -name "*.copy.data" -o -name "vmconfig.copy.xml" \) -print -quit 2>/dev/null | grep -q .; then
         log_info "vmbackup.sh" "backup_vm" "Existing checkpoint chain found for $vm_name - archiving before fresh full backup"
         
         # Archive the existing chain (full + any incrementals)
         # Note: archive_existing_checkpoint_chain sets _ARCHIVE_CHAIN_ARCHIVED and _ARCHIVE_RESTORE_POINTS
-        if archive_existing_checkpoint_chain "$vm_name" "$backup_dir"; then
+        if is_dry_run; then
+          log_info "vmbackup.sh" "backup_vm" "[DRY-RUN] would archive existing checkpoint chain for $vm_name before fresh full — skipping"
+        elif archive_existing_checkpoint_chain "$vm_name" "$backup_dir"; then
           log_info "vmbackup.sh" "backup_vm" "Successfully archived checkpoint chain for VM: $vm_name ($_ARCHIVE_RESTORE_POINTS restore points)"
           
           # NOTE: virsh checkpoints persist in qcow2 and cannot be deleted while VM is offline.
@@ -4915,7 +5234,9 @@ backup_vm() {
     # CRITICAL: Different cleanup strategy for offline vs online VMs
     # Offline VMs: Clean everything for fresh full backup (old chain was already archived)
     # Online VMs: Clean only old logs - PRESERVE backup data and checkpoints for incremental backups
-    if [[ "$vm_status" == "shut off" ]]; then
+    if is_dry_run; then
+      log_info "vmbackup.sh" "backup_vm" "[DRY-RUN] would clean backup directory before backup (status=$vm_status) — skipping"
+    elif [[ "$vm_status" == "shut off" ]]; then
       # OFFLINE VM: Clean everything for fresh full backup
       # Note: If checkpoint chain existed, it was already archived above before we get here
       log_info "vmbackup.sh" "backup_vm" "Offline VM - cleaning backup directory for fresh full backup"
@@ -4994,40 +5315,51 @@ backup_vm() {
     local has_existing_chain=false
     if [[ $CACHED_CHECKPOINT_COUNT -gt 0 ]]; then
       has_existing_chain=true
-    elif find "$backup_dir" -maxdepth 1 \( -name "*.full.data" -o -name "*.inc.virtnbdbackup.*.data" \) -print -quit 2>/dev/null | grep -q .; then
+    elif find "$backup_dir" -maxdepth 1 \( -name "*.full.data" -o -name "*.inc.virtnbdbackup.*.data" -o -name "*.copy.data" \) -print -quit 2>/dev/null | grep -q .; then
       has_existing_chain=true
     fi
     
     if [[ "$has_existing_chain" == "true" ]]; then
-      log_info "vmbackup.sh" "backup_vm" "Archiving existing chain before starting new policy baseline"
-      
-      # Archive the existing chain
-      if archive_existing_checkpoint_chain "$vm_name" "$backup_dir"; then
-        log_info "vmbackup.sh" "backup_vm" "Chain archived successfully to: $_ARCHIVE_PATH"
-        
-        # Delete QEMU checkpoints to allow fresh start
-        local checkpoints=()
-        mapfile -t checkpoints < <(lv_checkpoint_list_virtnbd "$vm_name")
-        if [[ ${#checkpoints[@]} -gt 0 ]]; then
-          log_info "vmbackup.sh" "backup_vm" "Clearing ${#checkpoints[@]} QEMU checkpoints for new chain"
-          for cp in "${checkpoints[@]}"; do
-            lv_checkpoint_delete_metadata "$vm_name" "$cp" || true
-          done
-        fi
-        
-        # Update cache to reflect fresh start
-        CACHED_CHECKPOINT_COUNT=0
-        CACHED_CHAIN_HEALTHY="true"
-        CACHED_VALIDATION_STATE="clean"
-        
-        log_info "vmbackup.sh" "backup_vm" "Policy change handling complete - proceeding with FULL backup"
+      if is_dry_run; then
+        # DRY-RUN: preview only — mutate nothing. List checkpoints read-only to
+        # report the count that WOULD be cleared; leave CACHED_* at validated
+        # values (no fake fresh-start). The only downstream mutator of that
+        # stale state is the checkpoint-corruption arm below, dry-run-guarded
+        # by item R2-C.
+        local dr_checkpoints=()
+        mapfile -t dr_checkpoints < <(lv_checkpoint_list_virtnbd "$vm_name")
+        log_info "vmbackup.sh" "backup_vm" "[DRY-RUN] Would archive existing chain and clear ${#dr_checkpoints[@]} QEMU checkpoint(s) for policy change ${_POLICY_CHANGE_PREVIOUS} → ${_POLICY_CHANGE_CURRENT} (VM: $vm_name)"
       else
-        log_error "vmbackup.sh" "backup_vm" "Failed to archive chain during policy change - aborting"
-        set_backup_error "POLICY_CHANGE_ARCHIVE_FAILED" "Could not archive chain during policy change" ""
-        _log_vm_backup_summary "$vm_name" "$backup_start_time" "$backup_start_epoch" \
-          "FAILED" "archive" "0" "0" "policy change archive failed" "0" "$vm_policy" "$backup_dir" \
-          "backup_failed" "policy change archive failed" "0" "0"
-        return 1
+        log_info "vmbackup.sh" "backup_vm" "Archiving existing chain before starting new policy baseline"
+        
+        # Archive the existing chain
+        if archive_existing_checkpoint_chain "$vm_name" "$backup_dir"; then
+          log_info "vmbackup.sh" "backup_vm" "Chain archived successfully to: $_ARCHIVE_PATH"
+          
+          # Delete QEMU checkpoints to allow fresh start
+          local checkpoints=()
+          mapfile -t checkpoints < <(lv_checkpoint_list_virtnbd "$vm_name")
+          if [[ ${#checkpoints[@]} -gt 0 ]]; then
+            log_info "vmbackup.sh" "backup_vm" "Clearing ${#checkpoints[@]} QEMU checkpoints for new chain"
+            for cp in "${checkpoints[@]}"; do
+              lv_checkpoint_delete_metadata "$vm_name" "$cp" || true
+            done
+          fi
+          
+          # Update cache to reflect fresh start
+          CACHED_CHECKPOINT_COUNT=0
+          CACHED_CHAIN_HEALTHY="true"
+          CACHED_VALIDATION_STATE="clean"
+          
+          log_info "vmbackup.sh" "backup_vm" "Policy change handling complete - proceeding with FULL backup"
+        else
+          log_error "vmbackup.sh" "backup_vm" "Failed to archive chain during policy change - aborting"
+          set_backup_error "POLICY_CHANGE_ARCHIVE_FAILED" "Could not archive chain during policy change" ""
+          _log_vm_backup_summary "$vm_name" "$backup_start_time" "$backup_start_epoch" \
+            "FAILED" "archive" "0" "0" "policy change archive failed" "0" "$vm_policy" "$backup_dir" \
+            "backup_failed" "policy change archive failed" "0" "0"
+          return 1
+        fi
       fi
     else
       log_info "vmbackup.sh" "backup_vm" "No existing chain to archive - proceeding with FULL backup for new policy"
@@ -5047,37 +5379,43 @@ backup_vm() {
       log_warn "vmbackup.sh" "backup_vm" "AUTO-RECOVERY ENABLED: Deleting corrupted checkpoints for $vm_name"
       log_warn "vmbackup.sh" "backup_vm" "WARNING: This will reset point-in-time recovery baseline and force a FULL backup"
       
-      # Log state BEFORE deletion for forensics
-      local cp_dir_exists="no"
-      local cpt_file_count=0
-      [[ -d "$backup_dir/checkpoints" ]] && cp_dir_exists="yes"
-      cpt_file_count=$(ls -1 "$backup_dir"/*.cpt 2>/dev/null | wc -l)
-      log_warn "vmbackup.sh" "backup_vm" "[DELETE-BEFORE] checkpoints dir exists: $cp_dir_exists, .cpt files: $cpt_file_count"
-      log_warn "vmbackup.sh" "backup_vm" "[DELETE] Target: $backup_dir/checkpoints and $backup_dir/*.cpt"
-      
-      rm -rf "$backup_dir/checkpoints" "$backup_dir"/*.cpt 2>/dev/null
-      local rm_result=$?
-      
-      # Log state AFTER deletion
-      local cp_dir_after="no"
-      local cpt_after=0
-      [[ -d "$backup_dir/checkpoints" ]] && cp_dir_after="yes"
-      cpt_after=$(ls -1 "$backup_dir"/*.cpt 2>/dev/null | wc -l)
-      log_info "vmbackup.sh" "backup_vm" "[DELETE-AFTER] checkpoints dir exists: $cp_dir_after, .cpt files: $cpt_after, rm exit code: $rm_result"
-      
-      if [[ $rm_result -eq 0 ]]; then
-        log_info "vmbackup.sh" "backup_vm" "Checkpoint metadata deleted successfully - next backup will be FULL (recovery mode)"
-        log_info "vmbackup.sh" "backup_vm" "After recovery FULL backup, incremental backups will resume normally"
-        # Update cache to reflect cleanup
-        CACHED_CHECKPOINT_COUNT=0
-        CACHED_CHAIN_HEALTHY="true"
-        CACHED_VALIDATION_STATE="clean"
+      # DRY-RUN: Skip — auto-recovery deletes real backup-store checkpoint metadata
+      # (rm -rf checkpoints/ + *.cpt) and rewrites the CACHED_* chain state; preview only.
+      if is_dry_run; then
+        log_info "vmbackup.sh" "backup_vm" "[DRY-RUN] Would delete corrupted checkpoint metadata ($backup_dir/checkpoints and $backup_dir/*.cpt) and reset checkpoint chain to force a FULL backup for VM: $vm_name"
       else
-        log_error "vmbackup.sh" "backup_vm" "Failed to delete corrupted checkpoint metadata"
-        _log_vm_backup_summary "$vm_name" "$backup_start_time" "$backup_start_epoch" \
-          "FAILED" "recovery" "0" "0" "checkpoint delete failed" "0" "$vm_policy" "$backup_dir" \
-          "backup_failed" "checkpoint delete failed during recovery" "${retry_count:-0}" "0"
-        return 1
+        # Log state BEFORE deletion for forensics
+        local cp_dir_exists="no"
+        local cpt_file_count=0
+        [[ -d "$backup_dir/checkpoints" ]] && cp_dir_exists="yes"
+        cpt_file_count=$(ls -1 "$backup_dir"/*.cpt 2>/dev/null | wc -l)
+        log_warn "vmbackup.sh" "backup_vm" "[DELETE-BEFORE] checkpoints dir exists: $cp_dir_exists, .cpt files: $cpt_file_count"
+        log_warn "vmbackup.sh" "backup_vm" "[DELETE] Target: $backup_dir/checkpoints and $backup_dir/*.cpt"
+
+        rm -rf "$backup_dir/checkpoints" "$backup_dir"/*.cpt 2>/dev/null
+        local rm_result=$?
+
+        # Log state AFTER deletion
+        local cp_dir_after="no"
+        local cpt_after=0
+        [[ -d "$backup_dir/checkpoints" ]] && cp_dir_after="yes"
+        cpt_after=$(ls -1 "$backup_dir"/*.cpt 2>/dev/null | wc -l)
+        log_info "vmbackup.sh" "backup_vm" "[DELETE-AFTER] checkpoints dir exists: $cp_dir_after, .cpt files: $cpt_after, rm exit code: $rm_result"
+
+        if [[ $rm_result -eq 0 ]]; then
+          log_info "vmbackup.sh" "backup_vm" "Checkpoint metadata deleted successfully - next backup will be FULL (recovery mode)"
+          log_info "vmbackup.sh" "backup_vm" "After recovery FULL backup, incremental backups will resume normally"
+          # Update cache to reflect cleanup
+          CACHED_CHECKPOINT_COUNT=0
+          CACHED_CHAIN_HEALTHY="true"
+          CACHED_VALIDATION_STATE="clean"
+        else
+          log_error "vmbackup.sh" "backup_vm" "Failed to delete corrupted checkpoint metadata"
+          _log_vm_backup_summary "$vm_name" "$backup_start_time" "$backup_start_epoch" \
+            "FAILED" "recovery" "0" "0" "checkpoint delete failed" "0" "$vm_policy" "$backup_dir" \
+            "backup_failed" "checkpoint delete failed during recovery" "${retry_count:-0}" "0"
+          return 1
+        fi
       fi
     elif [[ "$ENABLE_AUTO_RECOVERY_ON_CHECKPOINT_CORRUPTION" == "warn" ]]; then
       # WARN MODE: Fail with clear remediation steps
@@ -5181,7 +5519,11 @@ backup_vm() {
     log_warn "vmbackup.sh" "backup_vm" "SELF-HEAL: Marker file exists but is empty: $full_backup_marker"
     log_warn "vmbackup.sh" "backup_vm" "  Writing correct value '$current_month' — future runs will read it normally"
     last_full_month="$current_month"
-    echo "$current_month" > "$full_backup_marker"
+    if is_dry_run; then
+      log_info "vmbackup.sh" "backup_vm" "[DRY-RUN] Would self-heal empty marker: write '$current_month' → $full_backup_marker (skipping write)"
+    else
+      echo "$current_month" > "$full_backup_marker"
+    fi
   fi
   
   # Force full backup if:
@@ -5197,19 +5539,31 @@ backup_vm() {
     
     if [[ -f "${TEMP_DIR}/vmbackup-recovery-${vm_name}.flag" ]]; then
       log_warn "vmbackup.sh" "backup_vm" "Recovery action: Forcing FULL backup for $vm_name to reset checkpoints/bitmaps"
-      log_debug "vmbackup.sh" "backup_vm" "Deleting recovery flag: ${TEMP_DIR}/vmbackup-recovery-${vm_name}.flag"
-      rm -f "${TEMP_DIR}/vmbackup-recovery-${vm_name}.flag"
+      if is_dry_run; then
+        log_info "vmbackup.sh" "backup_vm" "[DRY-RUN] Would consume recovery flag: ${TEMP_DIR}/vmbackup-recovery-${vm_name}.flag (leaving it in place for the real backup)"
+      else
+        log_debug "vmbackup.sh" "backup_vm" "Deleting recovery flag: ${TEMP_DIR}/vmbackup-recovery-${vm_name}.flag"
+        rm -f "${TEMP_DIR}/vmbackup-recovery-${vm_name}.flag"
+      fi
     fi
     
     # Update full backup month marker
-    echo "$current_month" > "$full_backup_marker"
-    log_debug "vmbackup.sh" "backup_vm" "Updated full-backup-month marker: $full_backup_marker → $current_month"
+    if is_dry_run; then
+      log_info "vmbackup.sh" "backup_vm" "[DRY-RUN] Would update full-backup-month marker: $full_backup_marker → $current_month (skipping write)"
+    else
+      echo "$current_month" > "$full_backup_marker"
+      log_debug "vmbackup.sh" "backup_vm" "Updated full-backup-month marker: $full_backup_marker → $current_month"
+    fi
   elif [[ "$vm_status" == "shut off" ]] && [[ "${_ARCHIVE_CHAIN_ARCHIVED:-false}" == "true" ]]; then
     # OFFLINE VM ARCHIVAL TRIGGER: If checkpoint chain was just archived, force FULL backup
     # This creates a fresh baseline after archiving the previous chain
     backup_type="full"
     log_info "vmbackup.sh" "backup_vm" "FULL backup forced: Offline VM $vm_name had checkpoint chain archived, creating fresh baseline"
-    echo "$current_month" > "$full_backup_marker"
+    if is_dry_run; then
+      log_info "vmbackup.sh" "backup_vm" "[DRY-RUN] Would update full-backup-month marker: $full_backup_marker → $current_month (skipping write)"
+    else
+      echo "$current_month" > "$full_backup_marker"
+    fi
   else
     log_info "vmbackup.sh" "backup_vm" "INCREMENTAL backup (auto mode): continuing within month $current_month (last full: $last_full_month)"
   fi
@@ -5251,7 +5605,15 @@ backup_vm() {
         if archive_existing_checkpoint_chain "$vm_name" "$backup_dir"; then
           log_info "vmbackup.sh" "backup_vm" "Successfully archived orphaned offline backup for VM: $vm_name"
         else
-          log_error "vmbackup.sh" "backup_vm" "Failed to archive orphaned offline backup for VM: $vm_name - continuing with FULL backup (data may be lost)"
+          # FF-155: fail closed, matching the two sibling archive-before-destroy
+          # paths. Continuing into the FULL would overwrite the orphaned offline
+          # restore point on a single archive fault (e.g. .archives mkdir ENOSPC).
+          log_error "vmbackup.sh" "backup_vm" "Failed to archive orphaned offline backup for VM: $vm_name - aborting FULL to avoid overwriting the previous offline restore point"
+          set_backup_error "ORPHAN_ARCHIVE_FAILED" "Could not archive orphaned offline backup before FULL" ""
+          _log_vm_backup_summary "$vm_name" "$backup_start_time" "$backup_start_epoch" \
+            "FAILED" "archive" "0" "0" "orphan archive failed" "0" "$vm_policy" "$backup_dir" \
+            "backup_failed" "orphan archive failed" "0" "0"
+          return 1
         fi
       else
         log_debug "vmbackup.sh" "backup_vm" "Orphan check: $orphan_checkpoint_count virsh checkpoints exist - not orphaned (normal full backup with existing chain)"
@@ -5273,6 +5635,12 @@ backup_vm() {
   local paused=false
   if [[ "$vm_status" == "running" ]]; then
     if ! [[ "$has_qemu_agent" == "true" ]]; then
+      # DRY-RUN: preview only — a preview must never suspend a running guest.
+      # Emit the would-pause preview in place of the warn+pause; paused stays
+      # false (so both resume blocks below no-op) and VM_WAS_PAUSED stays 0.
+      if is_dry_run; then
+        log_info "vmbackup.sh" "backup_vm" "[DRY-RUN] Would pause VM: $vm_name for backup (no QEMU guest agent available) - skipping (read-only)"
+      else
       log_warn "vmbackup.sh" "backup_vm" "QEMU guest agent not available for VM: $vm_name - pausing for backup"
       
       if pause_vm "$vm_name"; then
@@ -5288,6 +5656,7 @@ backup_vm() {
         _log_vm_backup_summary "$vm_name" "$backup_start_time" "$backup_start_epoch" "$final_status" "$final_backup_type" "$checkpoint_before" "0" "$final_error" "0" "$vm_policy" "$backup_dir" \
           "backup_failed" "Failed to pause VM for backup (no QEMU agent)" "${retry_count:-0}" "0"
         return 1
+      fi
       fi
     else
       log_info "vmbackup.sh" "backup_vm" "QEMU guest agent available for VM: $vm_name - using agent-assisted backup"
@@ -5471,14 +5840,36 @@ backup_vm() {
 _log_interrupted_chain() {
   local signal_name="${1:-UNKNOWN}"
   
-  # Find current VM from lock file
-  local current_vm=$(ls -t "$LOCK_DIR"/vmbackup-*.lock 2>/dev/null | head -1 | sed 's|.*vmbackup-\(.*\)\.lock|\1|')
-  
+  # FF-48b: select ONLY a lock OWNED by THIS process ($$). The newest lock in
+  # LOCK_DIR can belong to a live FOREIGN holder — marking THAT VM's chain broken
+  # writes a phantom SQLite row (the FF-48 mis-selection). Glob candidates, keep
+  # only files whose content == $$, pick the newest OWN lock by mtime; if none,
+  # current_vm stays empty and the existing empty-guard below writes nothing.
+  local current_vm="" _own_lock="" _own_mtime=0 _cand _cpid _cmt
+  for _cand in "$LOCK_DIR"/vmbackup-*.lock; do
+    [[ -f "$_cand" ]] || continue
+    _cpid=$(cat "$_cand" 2>/dev/null)
+    [[ "$_cpid" == "$$" ]] || continue
+    _cmt=$(stat -c %Y "$_cand" 2>/dev/null) || _cmt=0
+    [[ "$_cmt" -ge "$_own_mtime" ]] && { _own_mtime=$_cmt; _own_lock=$_cand; }
+  done
+  # FF-156: derive the vm_fs_name TOKEN from the OWNED lock filename via
+  # parameter expansion. The old greedy sed 's|.*vmbackup-\(.*\)\.lock|\1|' let
+  # '.*' consume through the LAST 'vmbackup-', truncating tokens for VMs named
+  # 'vmbackup-*'. ## strips up to the last '/vmbackup-' (always the lock-file
+  # prefix), so BACKUP_PATH may itself contain 'vmbackup-'.
+  [[ -n "$_own_lock" ]] && { current_vm="${_own_lock##*/vmbackup-}"; current_vm="${current_vm%.lock}"; }
+
   if [[ -z "$current_vm" ]]; then
     log_debug "vmbackup.sh" "_log_interrupted_chain" "No active backup detected"
     return 0
   fi
-  
+
+  # M2 (118-spaces): the lock filename is the vm_fs_name TOKEN (LOCK-01). Map it
+  # back to the REAL libvirt name so the chain-broken SQLite row + policy lookup
+  # below are keyed by the real name (a token key would write a phantom row).
+  declare -f _prune_real_name >/dev/null 2>&1 && current_vm=$(_prune_real_name "$current_vm")
+
   log_warn "vmbackup.sh" "_log_interrupted_chain" \
     "Signal $signal_name received during backup of: $current_vm"
   
@@ -5558,6 +5949,28 @@ _handle_notifier_rc() {
             log_warn "vmbackup.sh" "$site" \
                 "Failed to send email report (rc=$rc; backup data preserved)"
             # Do NOT set _EMAIL_SENT — cleanup_on_exit may retry on a fresh path.
+            ;;
+    esac
+}
+
+# Slack-side parallel of _handle_notifier_rc. Sets _SLACK_SENT so the four
+# fire-once sites don't double-post. Same 3-way rc: 0=sent, 2=skipped, *=failed.
+_handle_slack_rc() {
+    local rc="${1:-0}"
+    local site="${2:-unknown}"
+    case "$rc" in
+        0)
+            log_info "vmbackup.sh" "$site" "Slack notification sent successfully"
+            _SLACK_SENT=true
+            ;;
+        2)
+            log_debug "vmbackup.sh" "$site" \
+                "Slack notification intentionally skipped (per SLACK_ON_SUCCESS / SLACK_ON_FAILURE config or module disabled)"
+            _SLACK_SENT=true
+            ;;
+        *)
+            log_warn "vmbackup.sh" "$site" \
+                "Failed to send Slack notification (rc=$rc; backup data preserved)"
             ;;
     esac
 }
@@ -5643,6 +6056,23 @@ cleanup_on_exit() {
     fi
   fi
 
+  # Slack notification on non-zero exit — parallel to the email block above.
+  # Fires from the same gate; independent of email.
+  if [[ $exit_code -ne 0 ]] && \
+     [[ -n "${SQLITE_CURRENT_SESSION_ID:-}" ]] && \
+     [[ "${_SLACK_SENT:-false}" != "true" ]] && \
+     ! is_dry_run && \
+     [[ -f "${SCRIPT_DIR}/modules/slack_notification_module.sh" ]]; then
+    # shellcheck source=/dev/null
+    source "${SCRIPT_DIR}/modules/slack_notification_module.sh"
+    if load_slack_config; then
+      local _slack_end_time _src=0
+      _slack_end_time=$(date '+%Y-%m-%d %H:%M:%S %Z')
+      send_slack_notification "${session_start_time:-unknown}" "$_slack_end_time" "failed" || _src=$?
+      _handle_slack_rc "$_src" cleanup_on_exit
+    fi
+  fi
+
   log_info "vmbackup.sh" "cleanup_on_exit" "Cleaning up temporary files before exit (exit code: $exit_code)"
   
   # Remove stale lock files — only those whose owning process is no longer running.
@@ -5655,7 +6085,10 @@ cleanup_on_exit() {
       lock_pid=$(cat "$lock_file" 2>/dev/null)
       # Only delete if the owning process is gone (or PID is empty/unreadable)
       if [[ -z "$lock_pid" ]] || ! kill -0 "$lock_pid" 2>/dev/null; then
-        if rm -f "$lock_file"; then
+        if is_dry_run; then
+          log_debug "vmbackup.sh" "cleanup_on_exit" "[DRY-RUN] Would remove stale lock: $(basename "$lock_file") (PID ${lock_pid:-unknown} not running) - skipping (read-only)"
+          stale_found=true
+        elif rm -f "$lock_file"; then
           log_debug "vmbackup.sh" "cleanup_on_exit" "Deleted stale lock file: $(basename "$lock_file") (PID ${lock_pid:-unknown} not running)"
           stale_found=true
         fi
@@ -5692,11 +6125,15 @@ cleanup_on_exit() {
   if [[ -d "$TEMP_DIR" ]]; then
     local recovery_flags=$(find "$TEMP_DIR" -name "vmbackup-recovery-*.flag" -type f 2>/dev/null)
     if [[ -n "$recovery_flags" ]]; then
-      while IFS= read -r flag_file; do
-        if rm -f "$flag_file"; then
-          log_debug "vmbackup.sh" "cleanup_on_exit" "Deleted recovery flag: $(basename "$flag_file")"
-        fi
-      done <<< "$recovery_flags"
+      if is_dry_run; then
+        log_info "vmbackup.sh" "cleanup_on_exit" "[DRY-RUN] Would clear stale recovery flag(s) under $TEMP_DIR — leaving in place (dry-run mutates nothing)"
+      else
+        while IFS= read -r flag_file; do
+          if rm -f "$flag_file"; then
+            log_debug "vmbackup.sh" "cleanup_on_exit" "Deleted recovery flag: $(basename "$flag_file")"
+          fi
+        done <<< "$recovery_flags"
+      fi
     fi
   fi
   
@@ -5718,9 +6155,28 @@ cleanup_on_exit() {
 # Emergency handler for CTRL+Z (SIGTSTP) - suspend signal
 # When user presses CTRL+Z, cleanup current VM before suspending
 handle_sigtstp() {
-  # Find which VM is currently being backed up by checking recent lock files
-  local current_vm=$(ls -t "$LOCK_DIR"/vmbackup-*.lock 2>/dev/null | head -1 | sed 's|.*vmbackup-\(.*\)\.lock|\1|')
-  
+  # FF-48b: select ONLY a lock OWNED by THIS process ($$). The newest lock in
+  # LOCK_DIR can belong to a live FOREIGN holder (e.g. an in-flight vmrestore of
+  # this same VM); emergency_cleanup rm's that lock + the VM's *.incomplete/
+  # *.partial files — bulldozing a live foreign holder is the FF-48 class. Glob
+  # the candidates (no ls-parsing/word-split; the -f check absorbs the no-match
+  # literal, so no nullglob needed), keep only files whose content == $$, pick the
+  # newest OWN lock by mtime; if none, do NO cleanup (suspend cleanly below).
+  local current_vm="" _own_lock="" _own_mtime=0 _cand _cpid _cmt
+  for _cand in "$LOCK_DIR"/vmbackup-*.lock; do
+    [[ -f "$_cand" ]] || continue
+    _cpid=$(cat "$_cand" 2>/dev/null)
+    [[ "$_cpid" == "$$" ]] || continue
+    _cmt=$(stat -c %Y "$_cand" 2>/dev/null) || _cmt=0
+    [[ "$_cmt" -ge "$_own_mtime" ]] && { _own_mtime=$_cmt; _own_lock=$_cand; }
+  done
+  # FF-156: derive the vm_fs_name TOKEN via parameter expansion (see twin site
+  # in _log_interrupted_chain). The old greedy sed truncated tokens for VMs
+  # literally named 'vmbackup-*'. ## strips up to the last '/vmbackup-'.
+  [[ -n "$_own_lock" ]] && { current_vm="${_own_lock##*/vmbackup-}"; current_vm="${current_vm%.lock}"; }
+  # M2 (118-spaces): map the lock-filename token back to the real libvirt name.
+  [[ -n "$current_vm" ]] && declare -f _prune_real_name >/dev/null 2>&1 && current_vm=$(_prune_real_name "$current_vm")
+
   if [[ -n "$current_vm" ]]; then
     log_warn "vmbackup.sh" "handle_sigtstp" "CTRL+Z detected during backup of $current_vm - performing emergency cleanup"
     
@@ -5762,6 +6218,18 @@ handle_sigterm() {
       log_debug "vmbackup.sh" "handle_sigterm" "Email disabled or not configured for this instance"
     fi
   fi
+
+  # Slack (parallel to the email block above)
+  if ! is_dry_run && \
+     [[ "${_SLACK_SENT:-false}" != "true" ]] && \
+     [[ -f "${SCRIPT_DIR}/modules/slack_notification_module.sh" ]]; then
+    source "${SCRIPT_DIR}/modules/slack_notification_module.sh"
+    if load_slack_config; then
+      local _src=0
+      send_slack_notification "${session_start_time:-unknown}" "$session_end_time" "failed" || _src=$?
+      _handle_slack_rc "$_src" handle_sigterm
+    fi
+  fi
   
   exit 143
 }
@@ -5794,6 +6262,17 @@ _format_size() {
     fi
 }
 
+# FF-158: safe byte count for a path. `du -sb | cut -f1 || echo 0` under
+# pipefail appends a 2nd line ("0") when du fails mid-scan but still prints a
+# total, yielding a two-line value that breaks the caller's arithmetic. Capture
+# then validate a single integer (0 on any failure/non-numeric).
+_du_bytes() {
+    local _n
+    _n=$(du -sb "$1" 2>/dev/null | cut -f1)
+    [[ "$_n" =~ ^[0-9]+$ ]] || _n=0
+    printf '%s' "$_n"
+}
+
 # Discovery listing — filesystem scan, size reporting, prune command hints
 # Args: $1 - vm_filter (optional, specific VM name)
 # Uses: BACKUP_PATH
@@ -5805,6 +6284,17 @@ _prune_list() {
     _PRUNE_LIST_TOTAL_ARCHIVE_BYTES=0
     _PRUNE_LIST_VM_COUNT=0
     _PRUNE_LIST_VM_FILTER="$vm_filter"
+    # FF-157: the walker passes the on-disk FOLDER token (vm_fs_name slug) to the
+    # callback, but --vm carries the real libvirt name. For spaced/special names
+    # the raw name never equals the token, so precompute the current + pre-118
+    # legacy token forms; the callback matches any of the three.
+    _PRUNE_LIST_VM_FILTER_TOKEN=""
+    _PRUNE_LIST_VM_FILTER_TOKEN_LEGACY=""
+    if [[ -n "$vm_filter" ]]; then
+        _PRUNE_LIST_VM_FILTER_TOKEN=$(vm_fs_name "$vm_filter" 2>/dev/null) || _PRUNE_LIST_VM_FILTER_TOKEN=""
+        declare -f vm_fs_name_legacy >/dev/null 2>&1 && \
+            _PRUNE_LIST_VM_FILTER_TOKEN_LEGACY=$(vm_fs_name_legacy "$vm_filter" 2>/dev/null)
+    fi
     if [[ -n "$vm_filter" ]]; then
         _PRUNE_LIST_SHOW_CHAIN_CMDS=true
     else
@@ -5857,13 +6347,19 @@ _prune_list_vm_cb() {
     local vm_name="$1"
     local vm_dir="$2"
 
-    # Honour --vm filter (walker has no built-in filtering).
-    if [[ -n "$_PRUNE_LIST_VM_FILTER" && "$vm_name" != "$_PRUNE_LIST_VM_FILTER" ]]; then
+    # Honour --vm filter (walker passes the on-disk folder token as $vm_name).
+    # FF-157: match the raw name (token supplied verbatim), the current
+    # vm_fs_name token, or the pre-118 legacy token, so spaced/special names
+    # resolve to their folder.
+    if [[ -n "$_PRUNE_LIST_VM_FILTER" \
+          && "$vm_name" != "$_PRUNE_LIST_VM_FILTER" \
+          && "$vm_name" != "$_PRUNE_LIST_VM_FILTER_TOKEN" \
+          && "$vm_name" != "$_PRUNE_LIST_VM_FILTER_TOKEN_LEGACY" ]]; then
         return 1
     fi
 
     local vm_bytes vm_size
-    vm_bytes=$(du -sb "$vm_dir" 2>/dev/null | cut -f1 || echo 0)
+    vm_bytes=$(_du_bytes "$vm_dir")
     vm_size=$(_format_size "$vm_bytes")
     _PRUNE_LIST_TOTAL_BYTES=$(( _PRUNE_LIST_TOTAL_BYTES + vm_bytes ))
     (( _PRUNE_LIST_VM_COUNT++ )) || true
@@ -5882,7 +6378,7 @@ _prune_list_period_cb() {
     local period_dir="$4"
 
     local period_bytes period_size
-    period_bytes=$(du -sb "$period_dir" 2>/dev/null | cut -f1 || echo 0)
+    period_bytes=$(_du_bytes "$period_dir")
     period_size=$(_format_size "$period_bytes")
 
     printf "  %-28s %10s    %s\n" "$period_id" "$period_size" \
@@ -5895,7 +6391,7 @@ _prune_list_period_cb() {
     local archives_dir="${period_dir}.archives"
     local archives_total_bytes=0
     if [[ -d "$archives_dir" ]]; then
-        archives_total_bytes=$(du -sb "$archives_dir" 2>/dev/null | cut -f1 || echo 0)
+        archives_total_bytes=$(_du_bytes "$archives_dir")
     fi
     active_bytes=$(( period_bytes - archives_total_bytes ))
     local active_size
@@ -5925,7 +6421,7 @@ _prune_list_period_cb() {
                 [[ -d "$chain_dir" ]] || continue
                 local chain_name chain_bytes chain_size
                 chain_name=$(basename "$chain_dir")
-                chain_bytes=$(du -sb "$chain_dir" 2>/dev/null | cut -f1 || echo 0)
+                chain_bytes=$(_du_bytes "$chain_dir")
                 chain_size=$(_format_size "$chain_bytes")
 
                 if [[ "$_PRUNE_LIST_SHOW_CHAIN_CMDS" == "true" ]]; then
@@ -6176,6 +6672,17 @@ _run_replicate_only() {
     fi
   fi
 
+  # Slack (parallel to the email block above)
+  if [[ "${_SLACK_SENT:-false}" != "true" ]] && \
+     [[ -f "${SCRIPT_DIR}/modules/slack_notification_module.sh" ]]; then
+    source "${SCRIPT_DIR}/modules/slack_notification_module.sh"
+    if load_slack_config; then
+      local _src=0
+      send_slack_notification "$session_start_time" "$session_end_time" "$final_status" || _src=$?
+      _handle_slack_rc "$_src" main
+    fi
+  fi
+
   log_info "vmbackup.sh" "main" "===== REPLICATE-ONLY MODE END (exit=$any_failed) ====="
   return $any_failed
 }
@@ -6192,6 +6699,28 @@ _sqlite_end_replicate_only() {
 #################################################################################
 # PRUNE MODE
 #################################################################################
+
+# PRUNE-01 (118-spaces): the all-VMs prune walker derives the VM identity from the
+# backup folder name = the vm_fs_name TOKEN (or the pre-118 legacy slug). But
+# retention keys rotation policy + SQLite by the REAL libvirt name. Map the folder
+# name back to the real name (for any LIVE domain) so a policy=never spaced VM is
+# honoured rather than pruned; an orphan folder (no live domain) keeps its own
+# name (pre-existing default-policy behaviour). Map built once, both token forms.
+_PRUNE_TOKEN2REAL_BUILT=0
+declare -gA _PRUNE_TOKEN2REAL=()
+_prune_real_name() {
+    local key=$1
+    if [[ "$_PRUNE_TOKEN2REAL_BUILT" -eq 0 ]]; then
+        local d t
+        while IFS= read -r d; do
+            [[ -z "$d" ]] && continue
+            t=$(vm_fs_name "$d" 2>/dev/null)        && _PRUNE_TOKEN2REAL["$t"]="$d"
+            t=$(vm_fs_name_legacy "$d" 2>/dev/null) && _PRUNE_TOKEN2REAL["$t"]="$d"
+        done < <(lv_list_all_domains 2>/dev/null)
+        _PRUNE_TOKEN2REAL_BUILT=1
+    fi
+    printf '%s' "${_PRUNE_TOKEN2REAL[$key]:-$key}"
+}
 
 # Main prune dispatch — target parsing, validation, confirmation, execution
 # Uses globals: _PRUNE_TARGET, _TARGET_VM, _PRUNE_CONFIRM_SKIP, DRY_RUN, BACKUP_PATH
@@ -6255,7 +6784,7 @@ run_prune_mode() {
     # Validate VM exists on disk (if specified)
     if [[ -n "$vm_name" ]]; then
         local safe_name
-        safe_name=$(sanitize_vm_name "$vm_name") || exit $?
+        safe_name=$(vm_fs_name "$vm_name") || exit $?
         local vm_dir="${BACKUP_PATH}${safe_name}"
         if [[ ! -d "$vm_dir" ]]; then
             echo "Error: VM not found: $vm_name"
@@ -6270,12 +6799,53 @@ run_prune_mode() {
     local target_type="${target%%:*}"
     local target_param="${target#*:}"
     [[ "$target_type" == "$target_param" ]] && target_param=""
+
+    # FF-9 selector validation (defense-in-depth, runs before any disk lookup).
+    # chain/period reject an EMPTY selector whether or not a ':' was given: a
+    # bare `chain`/`period` (no colon) leaves target_param="" (cleared on the
+    # line above). The chain-search loop below would then test ".archives/"
+    # (an empty path component), MATCH the period's .archives directory, and
+    # _remove_archive_chain (modules/retention_module.sh) would rm -rf the whole
+    # .archives tree — wholesale archive loss. The public CLI already requires
+    # the colon for chain/period; this in-function guard aligns the two layers.
+    case "$target_type" in
+        chain|period)
+            if [[ -z "$target_param" ]]; then
+                echo "Error: --prune $target_type requires a non-empty selector (e.g. ${target_type}:NAME)"
+                echo "Run: sudo ./vmbackup.sh --help"
+                log_error "vmbackup.sh" "run_prune_mode" "Empty selector for --prune $target_type: '$target'"
+                return 1
+            fi
+            ;;
+    esac
+    # A ':' parameter is only meaningful for archives/chain/period. When a colon
+    # is present, reject list/all (no parameter allowed) and reject empty or
+    # path-traversing selectors (e.g. `archives:`, `period:2025/..`, `chain:a/b`)
+    # fail-closed. Bare `archives` (no colon, target_param="") stays mass-scoped.
+    if [[ "$target" == *:* ]]; then
+        case "$target_type" in
+            list|all)
+                echo "Error: --prune $target_type does not take a ':' parameter"
+                echo "Run: sudo ./vmbackup.sh --help"
+                log_error "vmbackup.sh" "run_prune_mode" "--prune $target_type takes no parameter: '$target'"
+                return 1
+                ;;
+            *)
+                if [[ -z "$target_param" || "$target_param" == */* || "$target_param" == "." || "$target_param" == ".." ]]; then
+                    echo "Error: Invalid --prune $target_type selector: '$target_param'"
+                    echo "Run: sudo ./vmbackup.sh --help"
+                    log_error "vmbackup.sh" "run_prune_mode" "Invalid selector for --prune $target_type: '$target'"
+                    return 1
+                fi
+                ;;
+        esac
+    fi
     
     # Validate specific targets exist on disk
     case "$target_type" in
         period)
             local safe_name
-            safe_name=$(sanitize_vm_name "$vm_name") || exit $?
+            safe_name=$(vm_fs_name "$vm_name") || exit $?
             local period_dir="${BACKUP_PATH}${safe_name}/${target_param}"
             if [[ ! -d "$period_dir" ]]; then
                 echo "Error: Period not found: $vm_name/$target_param"
@@ -6287,7 +6857,7 @@ run_prune_mode() {
         chain)
             # Chain target needs to find the chain in any period's .archives
             local safe_name
-            safe_name=$(sanitize_vm_name "$vm_name") || exit $?
+            safe_name=$(vm_fs_name "$vm_name") || exit $?
             local found_chain=""
             local found_period=""
             local period_dir
@@ -6310,7 +6880,7 @@ run_prune_mode() {
             if [[ -n "$target_param" ]]; then
                 # archives:<period> — verify period exists
                 local safe_name
-                safe_name=$(sanitize_vm_name "$vm_name") || exit $?
+                safe_name=$(vm_fs_name "$vm_name") || exit $?
                 local period_dir="${BACKUP_PATH}${safe_name}/${target_param}"
                 if [[ ! -d "$period_dir" ]]; then
                     echo "Error: Period not found: $vm_name/$target_param"
@@ -6331,21 +6901,21 @@ run_prune_mode() {
             if [[ -n "$target_param" ]]; then
                 # archives:<period> — one period's archives
                 local safe_name
-                safe_name=$(sanitize_vm_name "$vm_name") || exit $?
+                safe_name=$(vm_fs_name "$vm_name") || exit $?
                 local archives_dir="${BACKUP_PATH}${safe_name}/${target_param}/.archives"
                 if [[ -d "$archives_dir" ]]; then
-                    preview_bytes=$(du -sb "$archives_dir" 2>/dev/null | cut -f1 || echo 0)
+                    preview_bytes=$(_du_bytes "$archives_dir")
                 fi
                 preview_desc="archives in $vm_name/$target_param"
             elif [[ -n "$vm_name" ]]; then
                 # archives for one VM (all periods)
                 local safe_name
-                safe_name=$(sanitize_vm_name "$vm_name") || exit $?
+                safe_name=$(vm_fs_name "$vm_name") || exit $?
                 local period_dir
                 for period_dir in "${BACKUP_PATH}${safe_name}"/*/; do
                     [[ -d "${period_dir}.archives" ]] || continue
                     local ab
-                    ab=$(du -sb "${period_dir}.archives" 2>/dev/null | cut -f1 || echo 0)
+                    ab=$(_du_bytes "${period_dir}.archives")
                     preview_bytes=$(( preview_bytes + ab ))
                 done
                 preview_desc="all archives for $vm_name"
@@ -6360,7 +6930,7 @@ run_prune_mode() {
                     for pd in "$vd"*/; do
                         [[ -d "${pd}.archives" ]] || continue
                         local ab
-                        ab=$(du -sb "${pd}.archives" 2>/dev/null | cut -f1 || echo 0)
+                        ab=$(_du_bytes "${pd}.archives")
                         preview_bytes=$(( preview_bytes + ab ))
                     done
                 done
@@ -6368,19 +6938,19 @@ run_prune_mode() {
             fi
             ;;
         chain)
-            preview_bytes=$(du -sb "$found_chain" 2>/dev/null | cut -f1 || echo 0)
+            preview_bytes=$(_du_bytes "$found_chain")
             preview_desc="chain $target_param in $vm_name/$found_period"
             ;;
         period)
             local safe_name
-            safe_name=$(sanitize_vm_name "$vm_name") || exit $?
-            preview_bytes=$(du -sb "${BACKUP_PATH}${safe_name}/${target_param}" 2>/dev/null | cut -f1 || echo 0)
+            safe_name=$(vm_fs_name "$vm_name") || exit $?
+            preview_bytes=$(_du_bytes "${BACKUP_PATH}${safe_name}/${target_param}")
             preview_desc="period $target_param for $vm_name"
             ;;
         all)
             local safe_name
-            safe_name=$(sanitize_vm_name "$vm_name") || exit $?
-            preview_bytes=$(du -sb "${BACKUP_PATH}${safe_name}" 2>/dev/null | cut -f1 || echo 0)
+            safe_name=$(vm_fs_name "$vm_name") || exit $?
+            preview_bytes=$(_du_bytes "${BACKUP_PATH}${safe_name}")
             preview_desc="ALL data for $vm_name"
             ;;
     esac
@@ -6419,10 +6989,32 @@ run_prune_mode() {
     
     echo ""
     
+    # FF-52 (R5-C): acquire the per-VM lock before any single-VM deletion so a
+    # prune cannot race a concurrent backup/restore of the same VM. create_lock
+    # is the sole, non-destructive acquirer: a live vmbackup/vmrestore/
+    # virtnbdbackup holder -> return 1 WITHOUT touching the file; a dead/reused
+    # PID -> reap + acquire. No has_lock pre-probe (that probe is destructive and
+    # its regex misses vmrestore). The all-VMs sweep locks per VM in its own loop.
+    if [[ -n "$vm_name" ]]; then
+        if ! create_lock "$vm_name"; then
+            local _lf
+            _lf=$(vm_lock_file "$vm_name" 2>/dev/null)
+            local _hp=""
+            [[ -n "$_lf" && -f "$_lf" ]] && _hp=$(cat "$_lf" 2>/dev/null)
+            echo "Error: Cannot prune $vm_name - a backup or restore is in progress (PID ${_hp:-unknown})"
+            echo "Retry after the backup/restore completes."
+            log_error "vmbackup.sh" "run_prune_mode" "Refusing prune of $vm_name - live lock held by PID ${_hp:-unknown}"
+            return 1
+        fi
+    fi
+
     # Execute deletion
     local success_count=0
     local fail_count=0
     local total_freed=0
+    # FF-52 (R5-C): rc-neutral count of VMs the all-VMs sweep skipped because a
+    # live lock was held; surfaced in the summary so a skip is never silent.
+    local skipped_locked=0
     
     case "$target_type" in
         archives)
@@ -6440,7 +7032,7 @@ run_prune_mode() {
             elif [[ -n "$vm_name" ]]; then
                 # archives for one VM (all periods)
                 local safe_name
-                safe_name=$(sanitize_vm_name "$vm_name") || exit $?
+                safe_name=$(vm_fs_name "$vm_name") || { local _rc=$?; remove_lock "$vm_name"; exit $_rc; }
                 local period_dir
                 for period_dir in "${BACKUP_PATH}${safe_name}"/*/; do
                     [[ -d "$period_dir" ]] || continue
@@ -6464,6 +7056,20 @@ run_prune_mode() {
                     [[ -d "$vd" ]] || continue
                     local vn=$(basename "$vd")
                     [[ "$vn" == _* || "$vn" == .* ]] && continue
+                    vn=$(_prune_real_name "$vn")   # PRUNE-01: token/legacy folder -> real name for policy + SQLite
+                    # FF-52 (R5-C): lock this VM before sweeping its archives.
+                    # create_lock-first (no destructive pre-probe); a live
+                    # vmbackup/vmrestore/virtnbdbackup holder -> skip this VM with
+                    # a WARN naming the holder (fail-closed, never queue-behind).
+                    if ! create_lock "$vn"; then
+                        local _hp=""
+                        local _lf
+                        _lf=$(vm_lock_file "$vn" 2>/dev/null)
+                        [[ -n "$_lf" && -f "$_lf" ]] && _hp=$(cat "$_lf" 2>/dev/null)
+                        log_warn "vmbackup.sh" "run_prune_mode" "Skipping archives prune for $vn: live lock held by PID ${_hp:-unknown}"
+                        (( skipped_locked++ ))
+                        continue
+                    fi
                     local period_dir
                     for period_dir in "$vd"*/; do
                         [[ -d "$period_dir" ]] || continue
@@ -6480,6 +7086,7 @@ run_prune_mode() {
                             (( fail_count++ ))
                         fi
                     done
+                    remove_lock "$vn"
                 done
             fi
             ;;
@@ -6500,7 +7107,7 @@ run_prune_mode() {
             if [[ $rc -eq 0 ]]; then
                 # Verify deletion actually happened (protection/keep-last may skip)
                 local safe_name
-                safe_name=$(sanitize_vm_name "$vm_name") || exit $?
+                safe_name=$(vm_fs_name "$vm_name") || { local _rc=$?; remove_lock "$vm_name"; exit $_rc; }
                 if [[ ! -d "${BACKUP_PATH}${safe_name}/${target_param}" ]]; then
                     total_freed=$preview_bytes
                 fi
@@ -6523,12 +7130,27 @@ run_prune_mode() {
             ;;
     esac
     
+    # FF-52 (R5-C): release the single-VM lock acquired above before the summary
+    # returns. Explicit (not a RETURN trap): the many pre-acquisition validation
+    # returns would misfire a function-scoped trap, and the in-case vm_fs_name
+    # '|| exit' paths release-then-exit themselves. rm -f is idempotent, so a
+    # double release never faults. Guarded on vm_name; the all-VMs sweep
+    # locks/releases per VM inline and does not reach here holding a lock.
+    [[ -n "$vm_name" ]] && remove_lock "$vm_name"
+
     # Summary
     local freed_size
     freed_size=$(_format_size "$total_freed")
     
     echo "vmbackup prune — complete"
     echo "  Freed: ${freed_size}"
+    # FF-52 (R5-C): surface VMs the all-VMs sweep skipped because a live lock was
+    # held. rc-neutral — a skip is not a failure, but it must be visible so an
+    # operator never reads "skipped, backup in progress" as "nothing to prune".
+    if [[ ${skipped_locked:-0} -gt 0 ]]; then
+        echo "  Skipped (locked): ${skipped_locked} (a backup/restore was in progress; retry later)"
+        log_warn "vmbackup.sh" "run_prune_mode" "Prune skipped ${skipped_locked} VM(s) holding a live lock"
+    fi
     if [[ $fail_count -gt 0 ]]; then
         echo "  Errors: ${fail_count} (check ${LOG_FILE})"
         log_error "vmbackup.sh" "run_prune_mode" \
@@ -6587,7 +7209,15 @@ main() {
     # Lock file exists — check if holder is still alive
     local existing_pid
     existing_pid=$(cat "$session_pidfile" 2>/dev/null)
-    if [[ -n "$existing_pid" ]] && kill -0 "$existing_pid" 2>/dev/null; then
+    # FF-160: kill -0 alone can't distinguish a live vmbackup session from an
+    # unrelated process that recycled the PID after an unclean shutdown (the
+    # pidfile lives on the persistent backup volume and survives reboots).
+    # Mirror the per-VM lock's /proc/<pid>/cmdline check (lib/vm_lock.sh) so a
+    # reused PID whose process is NOT vmbackup is treated as a stale file.
+    local existing_cmdline=""
+    [[ -n "$existing_pid" ]] && existing_cmdline=$(tr '\0' ' ' < "/proc/$existing_pid/cmdline" 2>/dev/null)
+    if [[ -n "$existing_pid" ]] && kill -0 "$existing_pid" 2>/dev/null \
+         && [[ "$existing_cmdline" == *"vmbackup"* ]]; then
       die "Another vmbackup session is already running (PID $existing_pid) — aborting" "main" "$EXIT_LOCK"
     fi
     # Stale PID file — remove and retry once
@@ -6696,6 +7326,12 @@ main() {
   else
     die "FATAL: vmbackup_integration.sh not found at: $integration_module" "main" "$EXIT_DEPENDENCY"
   fi
+
+  # MIG-01 (118-spaces): on-disk layout migrator. Optional — only renames the few
+  # pre-118 unsafe-named folders to the slug+hash token; absence is non-fatal.
+  local migrate_module="$script_dir/modules/migrate_layout.sh"
+  [[ -f "$migrate_module" ]] && source "$migrate_module" 2>/dev/null \
+    && log_info "vmbackup.sh" "main" "MIG-01 layout migrator loaded"
 
   # PRUNE MODE: dispatch now that config, SQLite, and integration modules are loaded
   # Prune skips replication modules, FSTRIM, pre-flight checks, and session tracking
@@ -6832,7 +7468,15 @@ main() {
   local excluded_count=0
   local skipped_count=0
   local fail_count=0
-  
+
+  # MIG-01 (118-spaces): migrate any pre-118 unsafe-named folder to its slug+hash
+  # token BEFORE the backup loop derives a path — so a fresh chain never lands in
+  # the legacy folder. Runs over every libvirt-enumerated VM; safe names are
+  # no-ops, so the 99% of VMs are untouched. Idempotent + honours dry-run.
+  if declare -f migrate_all_layouts >/dev/null 2>&1; then
+    migrate_all_layouts
+  fi
+
   for vm_name in "${vm_list[@]}"; do
     [[ -z "$vm_name" ]] && continue
     
@@ -7094,7 +7738,10 @@ main() {
     IFS='|' read -r vm status btype duration ckpt size err policy <<< "$result"
     if [[ "$size" != "N/A" ]]; then
       local bytes_val
-      bytes_val=$(numfmt --from=iec "${size%B}" 2>/dev/null || echo 0)
+      # FF-163: sizes are formatted with `numfmt --to=iec-i` (e.g. '1.5GiB'),
+      # and ${size%B} leaves an 'i' suffix ('1.5Gi') that --from=iec REJECTS,
+      # so every >=1KiB VM contributed 0. Parse with the matching --from=iec-i.
+      bytes_val=$(numfmt --from=iec-i "${size%B}" 2>/dev/null || echo 0)
       total_bytes=$((total_bytes + bytes_val))
     fi
   done
@@ -7147,6 +7794,18 @@ main() {
     fi
   else
     log_debug "vmbackup.sh" "main" "Email report module not found - skipping email notification"
+  fi
+
+  # Slack (parallel to the email block above)
+  if ! is_dry_run && \
+     [[ "${_SLACK_SENT:-false}" != "true" ]] && \
+     [[ -f "${SCRIPT_DIR}/modules/slack_notification_module.sh" ]]; then
+    source "${SCRIPT_DIR}/modules/slack_notification_module.sh"
+    if load_slack_config; then
+      local _src=0
+      send_slack_notification "$session_start_time" "$session_end_time" "$overall_status" || _src=$?
+      _handle_slack_rc "$_src" main
+    fi
   fi
   
   if (( fail_count > 0 )); then

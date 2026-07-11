@@ -1,4 +1,4 @@
-h#!/usr/bin/env bash
+#!/usr/bin/env bash
 #===============================================================================
 # chain_validation.sh - Chain Integrity Validation Module
 #===============================================================================
@@ -112,8 +112,22 @@ validate_chain_integrity() {
         # -print -quit avoids SIGPIPE on find under `set -o pipefail`
         if find "$chain_dir" -maxdepth 1 -name "*.copy.data" -print -quit 2>/dev/null | grep -q .; then
             _cv_info "Copy-mode backup detected (no checkpoint chain)"
-            CHAIN_VALID="true"
             CHAIN_TOTAL_CHECKPOINTS=1
+            # FF-171: fail closed on an interrupted copy. The old path accepted the
+            # chain on the FIRST *.copy.data with no partial check, so a torn
+            # multi-disk copy (a disk still *.copy.data.partial after an interrupted
+            # run) was classified fully restorable. Reject if any partial sibling exists.
+            local copy_partial
+            copy_partial=$(find "$chain_dir" -maxdepth 1 -name "*.copy.data.partial" -print -quit 2>/dev/null)
+            if [[ -n "$copy_partial" ]]; then
+                _cv_warn "Copy-mode backup interrupted (partial present): $copy_partial"
+                CHAIN_VALID="false"
+                CHAIN_RESTORABLE_COUNT=0
+                CHAIN_BROKEN_AT="0"
+                CHAIN_BREAK_REASON="partial_copy_file"
+                return 0
+            fi
+            CHAIN_VALID="true"
             CHAIN_RESTORABLE_COUNT=1
             return 0
         fi
@@ -238,7 +252,7 @@ validate_chain_integrity() {
                 local chksum_file="${data_file}.chksum"
                 if [[ -f "$chksum_file" ]]; then
                     local expected_sum
-                    expected_sum=$(cat "$chksum_file" 2>/dev/null | awk '{print $1}')
+                    expected_sum=$(awk '{print $1}' "$chksum_file" 2>/dev/null)
                     if [[ -n "$expected_sum" ]]; then
                         local actual_sum
                         actual_sum=$(sha256sum "$data_file" 2>/dev/null | awk '{print $1}')
@@ -249,7 +263,22 @@ validate_chain_integrity() {
                             break
                         fi
                         _cv_debug "Checkpoint $i ($cp_name): Checksum verified for $disk"
+                    else
+                        # FF-72: an empty/unreadable .chksum cannot verify integrity in
+                        # a mode advertised as full checksum verification — fail closed
+                        # rather than count the checkpoint restorable unchecked.
+                        cp_valid=false
+                        cp_reason="unverifiable_chksum:$chksum_file"
+                        _cv_error "Checkpoint $i ($cp_name): Empty/unreadable checksum sidecar: $chksum_file"
+                        break
                     fi
+                else
+                    # FF-72: a missing .chksum sidecar in deep mode is itself an
+                    # integrity anomaly — fail closed (was: silently restorable).
+                    cp_valid=false
+                    cp_reason="missing_chksum:$chksum_file"
+                    _cv_error "Checkpoint $i ($cp_name): Missing checksum sidecar: $chksum_file"
+                    break
                 fi
             fi
         done
@@ -390,13 +419,45 @@ scan_all_chains() {
         return 1
     fi
     
+    # FF-172: an accumulate-layout VM keeps its chain directly in vm_dir (with
+    # sibling subdirs checkpoints/config/tpm-state), not in period subdirs.
+    # Validate vm_dir itself as one chain instead of emitting a bogus broken row
+    # per non-period subdir. AMENDED (E16): fire this arm ONLY when no
+    # data-bearing period dir exists — a mixed layout (stray root chain file on a
+    # periodic VM, the FF-192 phenomenon) must still walk its periods.
+    # get_vm_periods (the period enumerator) lives in lib/period.sh; if it is not
+    # loaded (standalone sourcing / load-order change) we cannot prove the layout
+    # is pure-accumulate, so guard on its presence and fall through to the period
+    # walk rather than misclassify a mixed-layout VM (fail closed).
+    if declare -f get_vm_periods >/dev/null 2>&1 \
+       && find "$vm_dir" -maxdepth 1 \( -name "*.cpt" -o -name "*.full.data" -o -name "*.copy.data" \) -print -quit 2>/dev/null | grep -q .; then
+        local _p172 _has_period=0
+        while IFS= read -r _p172; do
+            [[ -n "$_p172" ]] || continue
+            if find "$vm_dir/$_p172" -maxdepth 1 -type f -name '*.data' -print -quit 2>/dev/null | grep -q .; then
+                _has_period=1
+                break
+            fi
+        done < <(get_vm_periods "$vm_dir" 2>/dev/null)
+        if [[ "$_has_period" -eq 0 ]]; then
+            local acc_id
+            acc_id=$(basename "$vm_dir")
+            validate_chain_integrity "$vm_name" "$vm_dir" "quick"
+            echo -e "$acc_id\t$CHAIN_VALID\t$CHAIN_TOTAL_CHECKPOINTS\t$CHAIN_RESTORABLE_COUNT\t${CHAIN_BROKEN_AT:-}\t${CHAIN_BREAK_REASON:-}"
+            return 0
+        fi
+    fi
+
     # Find all period directories
     while IFS= read -r period_dir; do
         local period_id
         period_id=$(basename "$period_dir")
         
-        # Skip special directories
-        [[ "$period_id" == "_state" || "$period_id" == "_archive" ]] && continue
+        # FF-172: converge on the canonical walker skip-list — skip every
+        # underscore- or dot-prefixed dir (_state, .archives, .tmp, ...), not just
+        # the stale literal '_state'/'_archive' pair ('_archive' never existed; the
+        # real archive store is '.archives').
+        [[ "$period_id" == _* || "$period_id" == .* ]] && continue
         
         # Validate chain
         validate_chain_integrity "$vm_name" "$period_dir" "quick"

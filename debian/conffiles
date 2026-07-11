@@ -5,4 +5,5 @@
 /opt/vmbackup/config/default/fstrim_exclude.conf
 /opt/vmbackup/config/default/replication_cloud.conf
 /opt/vmbackup/config/default/replication_local.conf
+/opt/vmbackup/config/default/slack.conf
 /etc/apparmor.d/local/abstractions/libvirt-qemu

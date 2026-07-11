@@ -40,21 +40,22 @@
     - [Query Cookbook](#query-cookbook)
 15. [Session Summary & Tracking](#session-summary--tracking)
 16. [Email Reporting System](#email-reporting-system)
-17. [Interrupt Recovery](#interrupt-recovery)
-18. [File Inventory](#file-inventory)
+17. [Slack Notifications](#slack-notifications)
+18. [Interrupt Recovery](#interrupt-recovery)
+19. [File Inventory](#file-inventory)
     - [Backup Files](#backup-files)
-19. [Replication Architecture](#replication-architecture)
+20. [Replication Architecture](#replication-architecture)
     - [Local Replication](#local-replication-replication_local_modulesh)
     - [Cloud Replication](#cloud-replication-replication_cloud_modulesh)
     - [Transport Drivers](#transport-drivers-transportssh)
     - [Transport Function Contract](#transport-function-contract)
     - [Transport Metrics Contract](#transport-metrics-contract)
     - [Implementing a New Transport](#implementing-a-new-transport)
-20. [Directory Structure Evolution: Three-Month Extrapolation](#directory-structure-evolution-three-month-extrapolation)
-21. [Known Issues & Mitigations](#known-issues--mitigations)
+21. [Directory Structure Evolution: Three-Month Extrapolation](#directory-structure-evolution-three-month-extrapolation)
+22. [Known Issues & Mitigations](#known-issues--mitigations)
     - [VirtIO discard_granularity & Windows TRIM Performance](#virtio-discard_granularity--windows-trim-performance)
     - [QEMU Agent Hang on FSTRIM Interruption](#qemu-agent-hang-on-fstrim-interruption)
-22. [Exit Codes](#exit-codes)
+23. [Exit Codes](#exit-codes)
 
 ---
 
@@ -120,7 +121,7 @@ Exactly one mode is required per invocation. Modes are mutually exclusive.
 | Option | Applies to | Description |
 |--------|-----------|-------------|
 | `--vm NAME` | `--run`, `--prune`, `--status` | Target specific VM(s), comma-separated. With `--run`, replication is skipped. With `--prune`, only a single VM name is accepted. With `--status`, selects a VM for `--status` (history) or `--status --chains` (detail). |
-| `--dry-run` | `--run`, `--prune`, `--replicate-only` | Preview without writing anything. |
+| `--dry-run` | `--run`, `--prune`, `--replicate-only`, `--config-prune-removed` | Preview without writing anything. A dry run changes no backup data and never touches a VM's runtime state — recovery actions, stale-lock housekeeping, and the pause a real run performs for an agent-less VM are all preview-only: they report what they *would* do. |
 | `--config-instance NAME` | all modes | Load config from `config/NAME/` instead of `config/default/`. |
 | `--yes`, `-y` | `--prune` | Skip confirmation prompt (for scripted use). |
 | `--days N` | `--status` | Time window in days (default: 1 = today). |
@@ -139,16 +140,20 @@ The following combinations are rejected at startup:
 | `--run` + `--replicate-only` | Replication already runs as part of `--run` |
 | `--replicate-only` + `--vm` | Replication operates on the entire backup path |
 | `--prune` + `--replicate-only` | Separate operations |
-| `--cancel-replication` + anything | Standalone signal only |
+| `--cancel-replication` + `--run` / `--prune` / `--replicate-only` / `--vm` / `--dry-run` | Cancel is a standalone signal — these five combinations are rejected |
 | `--prune` + multiple VMs | Prune requires a single VM name |
 | `--status` + `--run` | Status is read-only; backup is a separate operation |
 | `--status` + `--prune` | Separate operations |
 | `--status` + `--replicate-only` | Separate operations |
 | `--vm` without `--run`, `--prune` or `--status` | `--vm` modifies a mode; it is not a mode itself |
 
+> **Note:** `--cancel-replication` is meant to run on its own. Combining it with `--status` or `--config-prune-removed` is *not* rejected — the other mode runs first and the cancel signal is silently never sent. Always invoke `--cancel-replication` by itself.
+
 ### Concurrency
 
 A global PID lock (`$STATE_DIR/vmbackup.pid`) prevents concurrent vmbackup invocations. If a scheduled backup is already running, a manual invocation will fail with a clear error.
+
+Each VM is additionally protected by a per-VM lock (`_state/locks/vmbackup-<vm>.lock`, where `<vm>` is the filesystem-safe form of the VM name) that is shared with [vmrestore](vmrestore.md), giving end-to-end mutual exclusion between the two tools: a backup and a restore of the same VM can never run at the same time. A scheduled backup that finds a restore in progress skips that VM — reported once as skipped, not counted as a failure. Every cleanup path treats a lock held by a live vmbackup, vmrestore, or virtnbdbackup process as legitimate; a lock is only ever reaped once its owning process is dead.
 
 ### Examples
 
@@ -224,7 +229,7 @@ Download the latest `.deb` from [Releases](https://github.com/doutsis/vmbackup/r
 
 ```bash
 # Download the latest vmbackup_<version>_all.deb from the Releases page, then:
-sudo dpkg -i vmbackup_*_all.deb
+sudo apt install ./vmbackup_*_all.deb
 ```
 
 The single `.deb` installs **both** `vmbackup` and `vmrestore`. When upgrading from a standalone `vmrestore` install, the old package is removed automatically — the package declares `Provides`/`Replaces`/`Conflicts: vmrestore`.
@@ -240,7 +245,7 @@ cd vmbackup
 
 ```bash
 make package
-sudo dpkg -i build/vmbackup_*.deb
+sudo apt install ./build/vmbackup_*.deb
 ```
 
 **Option 2 — Direct install (any distro):**
@@ -300,8 +305,7 @@ sudo cp /opt/vmbackup/systemd/vmbackup.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now vmbackup.timer
 
-# Create initial configuration
-cp -r /opt/vmbackup/config/template /opt/vmbackup/config/default
+# Initial configuration — the clone already ships config/default/; just edit it
 nano /opt/vmbackup/config/default/vmbackup.conf
 ```
 
@@ -323,8 +327,9 @@ nano /opt/vmbackup/config/default/vmbackup.conf
 | `msmtp` | `msmtp` | For email reports | Email notifications |
 | `rsync` | `rsync` | For replication | Local replication sync |
 | `rclone` | `rclone` | For cloud replication | Cloud replication |
+| `curl` | `curl` | For Slack notifications | Webhook POST |
 
-When installed via the **`.deb` package**, all required packages except `virtnbdbackup` are pulled in automatically as Debian dependencies. **`make install` installs the vmbackup files only** — it does not run a package manager, so on the source-install path you must provision the prerequisites yourself (see the table above). `virtnbdbackup` is always installed separately, from your distro's package manager or directly from the [virtnbdbackup project](https://github.com/abbbi/virtnbdbackup?tab=readme-ov-file#installation).
+The **`.deb` package** declares all required packages as Debian dependencies, including `virtnbdbackup` (≥2.28) — `dpkg -i` fails on missing dependencies (leaving the package unconfigured until they are installed), while `sudo apt install ./vmbackup_*_all.deb` resolves and installs them automatically. (Essential system tools such as `util-linux` are present on every Debian install and are not declared.) **`make install` installs the vmbackup files only** — it does not run a package manager, so on the source-install path you must provision every prerequisite yourself (see the table above), installing `virtnbdbackup` from your distro's package manager or directly from the [virtnbdbackup project](https://github.com/abbbi/virtnbdbackup?tab=readme-ov-file#installation).
 
 Development and testing has been done on Debian 13 with virtnbdbackup 2.28 from Debian's repository.
 
@@ -358,7 +363,7 @@ On Debian/Ubuntu systems with AppArmor enabled, QEMU is restricted from creating
 Failed to bind socket to /var/tmp/virtnbdbackup.XXXX: Permission denied
 ```
 
-**Detection:** `vmbackup.sh` detects a missing AppArmor override during `check_dependencies()` and logs an error with remediation commands. The backup will **not proceed** until the override is installed.
+**Detection:** `vmbackup.sh` detects a missing AppArmor override during `check_dependencies()` and logs an error with remediation commands. The run itself continues, but backups of running VMs will fail at NBD socket creation until the override is installed.
 
 **Fix via .deb package (recommended):**
 
@@ -480,7 +485,7 @@ sudo nano /opt/vmbackup/config/default/vmbackup.conf
 | `BACKUP_PATH` | Directory where backups are stored (must exist — see below) | `/mnt/backup/vms/` |
 | `LOG_LEVEL` | Verbosity: `ERROR`, `WARN`, `INFO`, `DEBUG` | `INFO` |
 
-> Both settings have runtime defaults in `vmbackup.sh` (`BACKUP_PATH` falls back to `/mnt/backup/vms/`, `LOG_LEVEL` to `INFO`), and the shipped `config/default/vmbackup.conf` already carries explicit values — so vmbackup will not fail merely because you didn't touch them. They are listed here because a production install should set `BACKUP_PATH` **deliberately** rather than rely on the fallback, not because the runtime contract strictly requires them.
+> `LOG_LEVEL` has a runtime default (`INFO`) and can be left alone. `BACKUP_PATH` cannot: the shipped `config/default/vmbackup.conf` sets the placeholder `/path/to/backups/`, which does not exist — and because the config file sets a value, the runtime fallback never applies. The first run aborts at the pre-flight destination check until you point `BACKUP_PATH` at a real directory.
 
 #### BACKUP_PATH Setup
 
@@ -681,15 +686,17 @@ config/
 │   ├── exclude_patterns.conf         # Glob patterns to exclude VMs
 │   ├── fstrim_exclude.conf           # VM patterns to exclude from FSTRIM
 │   ├── email.conf                    # Email notification settings
+│   ├── slack.conf                    # Slack notification settings
 │   ├── replication_local.conf        # Local/NAS replication destinations
 │   └── replication_cloud.conf        # Cloud replication destinations
 │
-├── test/                         # Test environment (isolated from production)
-│   ├── vmbackup.conf
+├── test/                         # EXAMPLE user-created instance (not shipped —
+│   ├── vmbackup.conf             #   create with: cp -r config/template config/test)
 │   ├── vm_overrides.conf
 │   ├── exclude_patterns.conf
 │   ├── fstrim_exclude.conf
 │   ├── email.conf
+│   ├── slack.conf
 │   ├── replication_local.conf
 │   └── replication_cloud.conf
 │
@@ -699,9 +706,12 @@ config/
     ├── exclude_patterns.conf
     ├── fstrim_exclude.conf
     ├── email.conf
+    ├── slack.conf
     ├── replication_local.conf
     └── replication_cloud.conf
 ```
+
+Only `default/` and `template/` ship with the package — any other instance directory is created by you, by copying `template/`.
 
 #### Creating a New Instance
 
@@ -741,6 +751,7 @@ All config files are self-documenting — `config/template/` contains every sett
 | `RETENTION_ORPHAN_MAX_AGE_DAYS` | `90` | Delete orphans older than this |
 | `RETENTION_ORPHAN_MIN_AGE_DAYS` | `7` | Safety buffer before eligible |
 | `RETENTION_ORPHAN_DRY_RUN` | `false` | Log actions but don't delete |
+| `RETENTION_REQUIRE_REPLICATION` | `block` | Automatic retention refuses to delete a period that has not been replicated (`block`, fail-closed — the safe default). `warn` restores the legacy delete-after-warning behaviour. Has no effect when replication is disabled; operator `--prune` is always warn-only regardless of this setting. |
 | `ACCUMULATE_WARN_DEPTH` | `100` | Warn when chain depth exceeds this (template recommends `30`) |
 | `ACCUMULATE_HARD_LIMIT` | `365` | Force archive at this depth (template recommends `60`) |
 | `CHECKPOINT_FORCE_FULL_ON_DAY` | `1` | Day of month to force a full backup (resets chain) |
@@ -817,6 +828,20 @@ One glob pattern per line. `#` comments and blank lines ignored. VMs matching an
 
 Replication summaries and the (future) disk-usage section are rendered automatically when their underlying data is present — there is no per-section toggle.
 
+#### slack.conf — Slack Notifications
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `SLACK_ENABLED` | `no` | Master switch (disabled by default; set to `yes` to enable) |
+| `SLACK_WEBHOOK_URL` | *(required)* | Slack incoming-webhook URL (`https://hooks.slack.com/services/...`) |
+| `SLACK_HOSTNAME` | short hostname | Hostname shown in the message title |
+| `SLACK_TITLE_PREFIX` | `[vmbackup]` | Title prefix |
+| `SLACK_ON_SUCCESS` | `yes` | Post on successful sessions |
+| `SLACK_ON_FAILURE` | `yes` | Post on failed / partial sessions |
+| `SLACK_TIMEOUT` | `10` | `curl --max-time` for the webhook POST (seconds) |
+
+Independent of email — both can be enabled at the same time. Needs only `curl` (install it if not present — the package does not pull it in). See [Slack Notifications](#slack-notifications) for the full behaviour.
+
 #### replication_local.conf — Local/NAS Destinations
 
 Global settings apply to all destinations. Per-destination settings use a numbered `DEST_N_` prefix.
@@ -834,7 +859,7 @@ Per-destination (replace `N` with `1`, `2`, etc.):
 |---------|---------|-------------|
 | `DEST_N_ENABLED` | `no` | Enable this destination |
 | `DEST_N_NAME` | `local-backup` | Human-readable label |
-| `DEST_N_TRANSPORT` | `local` | Transport driver: `local`, `ssh`, `nfs`, `smb` |
+| `DEST_N_TRANSPORT` | `local` | Transport driver: `local`, `ssh`, `smb` (NFS destinations use `local` against the mounted path; `ssh`/`smb` are unimplemented scaffolds — see [Transport Drivers](#transport-drivers-transportssh)) |
 | `DEST_N_PATH` | `/mnt/backups` | Destination path (or `HOST:PATH` for ssh) |
 | `DEST_N_SYNC_MODE` | `mirror` | `mirror` (--delete) / `accumulate` |
 | `DEST_N_BWLIMIT` | `0` | KB/s bandwidth limit (0=unlimited) |
@@ -1192,15 +1217,15 @@ Treated identically to running VMs. The script's pause/resume logic handles back
 
 ### Backup Type Decision Matrix
 
-| Condition | Backup Type | Command Flag |
-|-----------|-------------|--------------|
-| Month boundary (new month) | `full` | `virtnbdbackup --full` |
-| Day 01 AND no existing valid data | `full` | `virtnbdbackup --full` |
-| Day 01 AND existing valid chain | `auto` | `virtnbdbackup --auto` |
-| Recovery flag present | `full` | `virtnbdbackup --full` |
-| Offline VM with changes | `copy` | `virtnbdbackup --copy` |
-| First backup ever | `full` | `virtnbdbackup --full` |
-| Normal daily backup | `auto` | `virtnbdbackup --auto` |
+| Condition | Backup Type | Backup level (`-l`) |
+|-----------|-------------|---------------------|
+| Month boundary (new month) | `full` | `virtnbdbackup -l full` |
+| Day 01 AND no existing valid data | `full` | `virtnbdbackup -l full` |
+| Day 01 AND existing valid chain | `auto` | `virtnbdbackup -l auto` |
+| Recovery flag present | `full` | `virtnbdbackup -l full` |
+| Offline VM with changes | `copy` | `virtnbdbackup -l copy` |
+| First backup ever | `full` | `virtnbdbackup -l full` |
+| Normal daily backup | `auto` | `virtnbdbackup -l auto` |
 
 ### Retry Strategy
 
@@ -1311,14 +1336,18 @@ Within a single `vmbackup` invocation, the same VM can never be archived twice. 
 
 | File Pattern | Description | Archived? |
 |-------------|-------------|-----------|
-| `*.full.data` | Full backup data | Yes |
-| `*.full.data.chksum` | Full backup checksum | Yes |
-| `*.inc.virtnbdbackup.*.data` | Incremental data | Yes |
-| `*.inc.*.data.chksum` | Incremental checksums | Yes |
-| `*.cpt` | Checkpoint name list | Yes |
-| `checkpoints/` | Checkpoint XML directory | Yes |
-| `*.qcow.json` | QCOW metadata | No — Recreated |
-| `vmconfig.*.xml` | VM config snapshots | No — In config/ |
+| `*.full.data` / `*.copy.data` | Full / offline-copy backup data | Yes — moved |
+| `*.data.chksum` | Backup data checksums | Yes — moved |
+| `*.inc.virtnbdbackup.*.data` | Incremental data | Yes — moved |
+| `*.cpt` | Checkpoint name list | Yes — moved |
+| `*.qcow.json` | QCOW metadata | Yes — moved |
+| `vmconfig.virtnbdbackup.*.xml` | VM config snapshots | Yes — moved |
+| `virtnbdbackup.*.xml` | Backup metadata | Yes — moved |
+| `checkpoints/` | Checkpoint XML directory | Yes — moved whole |
+| `config/` | VM libvirt XML snapshots | Yes — moved whole |
+| `tpm-state/` | TPM state (incl. BitLocker keys) | Yes — moved whole |
+| `*_VARS.fd` / `OVMF_CODE*.fd` | NVRAM / firmware images | Yes — moved |
+| `.tpm-backup-marker` | TPM capability marker | Copied — the original stays in the period so the next chain's first backup detects TPM capability |
 
 ### Archive Triggers
 
@@ -1428,13 +1457,19 @@ _remove_period(vm_name, period_id, dry_run)
   │
   ├── [[ ! -d "$period_dir" ]] → return 0       # Already gone
   │
-  ├── dry_run == "true" → log + return 0         # Preview only
+  ├── _is_period_replicated()?                    # Replication gate:
+  │     └── Not replicated → keep period,         #   RETENTION_REQUIRE_REPLICATION=block
+  │         log + audit row, return 0             #   (default, fail-closed); warn = delete
+  │                                               #   after warning; --prune always warn-only
   │
   ├── _is_safe_to_remove()                        # Safety validation:
   │     ├── Path under BACKUP_PATH?               #   Prevent rm -rf /
   │     ├── Not BACKUP_PATH itself?               #   Prevent rm -rf $BACKUP_PATH
   │     ├── Is a directory?                       #   Sanity check
   │     └── Depth ≥ 2 (VM/period)?               #   Prevent rm -rf vm_dir/
+  │
+  ├── dry_run == "true" → log + return 0         # Preview only — runs after all guards,
+  │                                               # so the preview reflects a real run
   │
   ├── sqlite_mark_chain_deleted()                 # DB: chain_status → 'deleted'
   │
@@ -1546,6 +1581,8 @@ list → choose target → --dry-run → execute
 | Guard | Behaviour |
 |-------|-----------|
 | **Keep-last protection** | `period:` target refuses to delete the last remaining period for a VM. Use `all` to explicitly remove everything. |
+| **Selector validation** | `archives:` / `chain:` / `period:` selectors are validated before any deletion path is built — empty selectors, path separators, and `.`/`..` are rejected fail-closed. |
+| **Per-VM lock** | Prune shares the per-VM lock with backup and restore. An explicit prune of a VM whose lock is held by a live process is refused, naming the holder; an all-VMs sweep skips busy VMs and reports a visible `Skipped (locked): N` count. |
 | **Confirmation prompt** | Interactive Y/N prompt before any destructive operation. Bypass with `--yes`. |
 | **`_is_safe_to_remove()`** | Same path safety validation used by automated retention — prevents removal of paths outside `BACKUP_PATH`. |
 | **Dry-run logging** | Dry runs are logged (tagged `DRY RUN`) for audit purposes. |
@@ -1637,6 +1674,8 @@ See [Usage](#usage) for CLI syntax and combination rules.
 | Policies | `--status --policies` | Rotation policy summary (per-VM policy, retention limits, orphans) |
 | Restores | `--status --restores` | Restore sessions logged by `vmrestore` (VM, mode, status, exit code, dry-run, duration, target path) |
 
+The outcomes recorded here inherit vmrestore's verified reporting: each ✓ in vmrestore's own summary is confirmed against the actual restored state before it is reported, so a partial or failed restore cannot show up all-green. Details — including the one narrow exception when a backup's configuration is unusable — in [vmrestore.md](vmrestore.md).
+
 #### Options
 
 `--days N` sets the time window in days (default: 1 = today). Applies to sessions, VM history, failures, replication and restore reports. Storage, chains and policies report across all history regardless of `--days`.
@@ -1652,7 +1691,7 @@ Terminal output is pipe-delimited and passed through `column -t` for aligned col
 The policies report prints a preamble before the table showing the instance-level defaults:
 
 ```
-Instance default policy: monthly (RETENTION_MONTHLYS=3)
+Instance default policy: monthly (RETENTION_MONTHS=3)
 Orphan retention: enabled, max_age=90 days, min_age=7 days
 ```
 
@@ -1705,10 +1744,10 @@ Three files, strict separation:
 | File | Layer | Responsibility |
 |------|-------|---------------|
 | `vmbackup.sh` | CLI | Flag parsing, conflict validation, dispatch |
-| `lib/sqlite_module.sh` | Data | Query functions returning pipe-delimited or CSV rows |
+| `lib/sqlite_ro.sh` | Data | Read-only query functions returning pipe-delimited or CSV rows |
 | `modules/status_module.sh` | Presentation | Formatting, column alignment, human-readable conversion |
 
-Adding a new report requires one query function in `sqlite_module.sh`, one `_status_*` function in `status_module.sh`, and one case in the dispatch. No changes to vmbackup.sh flag parsing unless a new sub-mode flag is needed.
+Adding a new report requires one query function in `sqlite_ro.sh`, one `_status_*` function in `status_module.sh`, and one case in the dispatch. No changes to vmbackup.sh flag parsing unless a new sub-mode flag is needed.
 
 ---
 
@@ -1718,7 +1757,7 @@ Adding a new report requires one query function in `sqlite_module.sh`, one `_sta
 
 Failure detection runs at four stages:
 
-1. **Session startup** — `check_dependencies()` aborts on missing tools, `check_backup_destination()` aborts if the backup path is unwritable, `check_disk_space()` aborts when free space drops below the configured thresholds (`DISK_ABORT_PCT` / `DISK_ABORT_GB`, defaults 20% / 10 GB) and warns at the warn thresholds (`DISK_WARN_PCT` / `DISK_WARN_GB`, defaults 30% / 50 GB), and `cleanup_stale_locks()` removes orphaned lock files. Pre-flight failures (unwritable destination, missing scratch dir, low disk) trigger an email report when notifications are enabled.
+1. **Session startup** — `check_dependencies()` aborts on missing tools, `check_backup_destination()` aborts if the backup path is unwritable, `check_disk_space()` aborts when free space drops below the configured thresholds (`DISK_ABORT_PCT` / `DISK_ABORT_GB`, defaults 20% / 10 GB) and warns at the warn thresholds (`DISK_WARN_PCT` / `DISK_WARN_GB`, defaults 30% / 50 GB), and `cleanup_system_checkpoints_and_locks()` removes stale per-VM lock files whose holding process is dead. Pre-flight failures (unwritable destination, missing scratch dir, low disk) trigger an email report when notifications are enabled.
 2. **Per-VM validation** — `pre_backup_hook()` excludes VMs with `policy=never`, `validate_backup_state()` runs 5-phase state analysis, and `prepare_backup_directory()` cleans stale state.
 3. **Backup execution** — `perform_backup()` retries with AUTO→FULL conversion on failure, archives broken chains, re-validates, and retries.
 4. **Signal handling** — SIGTERM/SIGINT release locks and log recovery guidance. The next run auto-recovers any stale state left behind.
@@ -1846,7 +1885,7 @@ No modules or library files call `set_backup_permissions()`. All file/directory 
 | `$BACKUP_PATH/` | `root:backup` | `2750` | Backup data root (SGID) |
 | `$BACKUP_PATH/<vm>/` | `root:backup` | `2750` | Per-VM backup dirs (SGID inherited) |
 | `$BACKUP_PATH/<vm>/config/` | `root:backup` | `2750` | VM libvirt XML snapshots |
-| `$BACKUP_PATH/<vm>/.chain-*/` | `root:backup` | `2750` | Archived chain dirs |
+| `$BACKUP_PATH/<vm>/<period>/.archives/chain-*/` | `root:backup` | `2750` | Archived chain dirs (SGID inherited) |
 | `$BACKUP_PATH/<vm>/tpm-state/` | `root:root` | `750` | TPM state root (SGID stripped) |
 | `$BACKUP_PATH/<vm>/tpm-state/tpm2/` | `root:root` | `600` | TPM private keys |
 | `$BACKUP_PATH/<vm>/tpm-state/BACKUP_METADATA.txt` | `root:root` | `640` | TPM backup metadata |
@@ -1878,6 +1917,7 @@ The following files are declared as `conffiles` in the `.deb` package. dpkg will
 - `/opt/vmbackup/config/default/vmbackup.conf`
 - `/opt/vmbackup/config/default/vm_overrides.conf`
 - `/opt/vmbackup/config/default/email.conf`
+- `/opt/vmbackup/config/default/slack.conf`
 - `/opt/vmbackup/config/default/exclude_patterns.conf`
 - `/opt/vmbackup/config/default/fstrim_exclude.conf`
 - `/opt/vmbackup/config/default/replication_cloud.conf`
@@ -1924,11 +1964,15 @@ The following paths within `BACKUP_PATH` are intentionally excluded from the `ba
 flowchart TD
     A["backup_vm() calls<br/>backup_vm_tpm()"] --> B{"Has TPM?<br/>(virsh dumpxml)"}
     B -->|No| C["Return<br/>(non-fatal)"]
-    B -->|Yes| D["Copy from<br/>/var/lib/libvirt/swtpm/uuid/"]
-    D --> E["Create tpm-state/<br/>+ BACKUP_METADATA.txt"]
-    E --> F{"Deduplication<br/>check"}
-    F -->|Changed| G["Keep full copy"]
-    F -->|Unchanged| H["Create symlink<br/>to previous"]
+    B -->|Yes| D{"TPM_BACKUP_METHOD"}
+    D -->|"full (default)"| E["Full copy from<br/>/var/lib/libvirt/swtpm/uuid/"]
+    D -->|incremental| F["rsync --delete<br/>against previous copy"]
+    D -->|consistent| G["Atomic tar snapshot,<br/>then extract"]
+    E --> H["Create tpm-state/<br/>+ BACKUP_METADATA.txt"]
+    F --> H
+    G --> H
+    H --> I["Validate backup"]
+    I --> J["BitLocker key extraction<br/>(Windows guests)"]
 ```
 
 ### Files Created
@@ -2031,7 +2075,28 @@ All timestamps stored in the database use **UTC** (`YYYY-MM-DD HH:MM:SS`). Log o
 | Log timestamps (`log_msg`) | `date '+%Y-%m-%d %H:%M:%S %Z'` (local + TZ) | `2026-02-16 19:30:00 AEDT` |
 | Rotation `period_id` | `date '+%Y%m%d'` etc. (local, intentional) | `20260216` |
 
-Databases are migrated automatically to the current schema (v2.2) on first write; very old (pre-1.6) databases written in local time are converted to UTC as part of that migration. Downgrade is not supported.
+Databases are migrated automatically to the current schema (v2.2) on first write; migrations adjust the schema in place and never rewrite stored timestamp values. Downgrade is not supported.
+
+### Primary-Key (`id`) Semantics
+
+> ⚠️ **`datetime(id,'unixepoch')` is valid only for the `sessions` table.** The `id` column does *not* carry the same meaning in every table. `sessions.id` is a Unix **epoch** (`date +%s`); every other table's `id` is a plain **serial** (`AUTOINCREMENT` / rowid). Running `datetime(id,'unixepoch')` against any non-`sessions` table silently returns `1970-01-01` (a serial such as `42` decodes to the epoch + 42 s), with **no error**. Read time from the dedicated `*_time` / `created_at` / `timestamp` column instead.
+
+| Table | `id` semantics | How assigned | Authoritative time column |
+|-------|---------------|--------------|---------------------------|
+| `sessions` | **Unix epoch** | `date +%s` (explicit) | `id` (epoch) — but prefer `start_time` (UTC) for display |
+| `vm_backups` | serial | `AUTOINCREMENT` | `created_at`; join `sessions.start_time` |
+| `replication_runs` | serial | `AUTOINCREMENT` | `start_time` / `end_time` |
+| `replication_vms` | serial | `AUTOINCREMENT` | via `run_id` → `replication_runs` |
+| `chain_health` | serial | `AUTOINCREMENT` | `first_backup` / `last_backup` (+ `created_at` / `updated_at`) |
+| `chain_events` | serial | `AUTOINCREMENT` | `timestamp` |
+| `config_events` | serial | `AUTOINCREMENT` | `timestamp` |
+| `file_operations` | serial | `AUTOINCREMENT` | `timestamp` |
+| `period_events` | serial | `AUTOINCREMENT` | `timestamp` (+ `period_start` / `period_end`) |
+| `retention_events` | serial | `AUTOINCREMENT` | `timestamp` |
+| `restore_sessions` | serial | rowid via `last_insert_rowid()` | `start_time` (+ `created_at`) |
+| `schema_info` | — (key/value) | n/a | `value` where `key='created'` |
+
+**Rule of thumb:** treat `id` as a surrogate key everywhere. Only `sessions` may be time-decoded from `id`, and even there `start_time` is preferred for display. A preventive lint (`tests/schema01-id-semantics-guard.sh`) fails the build if a `datetime(<table>.id,'unixepoch')` is introduced against any serial-id table.
 
 ### Module Loading
 
@@ -2275,14 +2340,14 @@ The session summary accurately tracks VMs in four categories:
 |----------|--------|---------|
 | **Backed Up** | ✓ | VM was actually backed up |
 | **Excluded** | ○ | VM excluded by policy (never) or pattern |
-| **Skipped** | ◇ | Offline VM with unchanged disks |
+| **Skipped** | ◇ | Offline VM with unchanged disks, or a VM whose backup was skipped because a backup/restore of it was already in progress (lock held; reported once, not counted as failed) |
 | **Failed** | ✗ | Backup attempt failed |
 
 ### Return Codes
 
 | Code | Meaning |
 |------|---------|
-| `0` | Backup completed successfully (or offline unchanged skip) |
+| `0` | Backup completed successfully (or skip: offline unchanged / already in progress) |
 | `1` | Backup failed with error |
 | `2` | VM excluded by policy (`BACKUP_RC_EXCLUDED` — the only named constant) |
 
@@ -2404,6 +2469,55 @@ When running in `--replicate-only` mode, the email report uses a different subje
 
 ---
 
+## Slack Notifications
+
+### Overview
+
+vmbackup can post a short session summary to a Slack channel after each run, in addition to (or instead of) the email report. The Slack notification module (`slack_notification_module.sh`) mirrors the call sites of the email report module, so email and Slack are fully independent — either, both, or neither can be enabled. Disabled by default; the only transport dependency is `curl` — install it if not present, as the vmbackup package does not pull it in.
+
+The message is a single colour-coded attachment — green for success, amber for partial, red for failed — with the host and status in the title, a one-line VM count summary (ok / failed / skipped / excluded), and a footer with total size, duration, and config instance. Session totals are pulled from the SQLite catalogue when available; if the catalogue cannot be queried, the notification is still sent with zeroed counts.
+
+### Setup
+
+**Prerequisites:** a [Slack incoming webhook](https://api.slack.com/messaging/webhooks) for the target channel.
+
+```bash
+sudo nano /opt/vmbackup/config/default/slack.conf
+```
+
+1. Set `SLACK_ENABLED="yes"`
+2. Paste the webhook URL into `SLACK_WEBHOOK_URL`
+
+### Configuration
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `SLACK_ENABLED` | `no` | Master switch |
+| `SLACK_WEBHOOK_URL` | *(required)* | Slack incoming-webhook URL |
+| `SLACK_HOSTNAME` | short hostname | Hostname shown in the message title |
+| `SLACK_TITLE_PREFIX` | `[vmbackup]` | Title prefix |
+| `SLACK_ON_SUCCESS` | `yes` | Post on successful sessions |
+| `SLACK_ON_FAILURE` | `yes` | Post on failed / partial sessions |
+| `SLACK_TIMEOUT` | `10` | `curl --max-time` for the webhook POST (seconds) |
+
+### Conditional Posting
+
+`SLACK_ON_SUCCESS` and `SLACK_ON_FAILURE` filter which session outcomes are posted. Successful sessions are gated by `SLACK_ON_SUCCESS`; partial, failed, and unknown outcomes are gated by `SLACK_ON_FAILURE`. Set `SLACK_ON_SUCCESS="no"` to hear from vmbackup only when something went wrong.
+
+### Failure Behaviour (Fails Soft)
+
+Slack notification problems never affect the backup itself:
+
+- A missing or unreadable `slack.conf` disables the module for the run.
+- `SLACK_ENABLED="yes"` without a `SLACK_WEBHOOK_URL` logs an error and disables the module.
+- A webhook POST that times out or returns a non-2xx HTTP status is logged as an error — the session result is unchanged.
+
+### Notification Points
+
+A notification is posted at the same points where an email report would be sent: after a backup session, after a replicate-only session, after a pre-flight abort (unwritable destination, missing scratch dir, low disk space), and when a run is interrupted (SIGTERM).
+
+---
+
 ## Interrupt Recovery
 
 ### Interrupt Causes
@@ -2426,9 +2540,9 @@ When running in `--replicate-only` mode, the email report uses a different subje
 
 SIGINT/SIGTERM during fstrim or VSS pauses previously triggered the interrupt handler, which would falsely mark the backup chain as broken even though no backup was in progress. A `_BACKUP_IN_PROGRESS` flag now guards against this:
 
-- Set to `1` when `perform_backup()` begins
-- Cleared to `0` when `perform_backup()` completes
-- `_log_interrupted_chain()` only marks chain broken when `_BACKUP_IN_PROGRESS=1`
+- Set to `"true"` when `perform_backup()` begins
+- Reset to `"false"` when `perform_backup()` completes
+- `_log_interrupted_chain()` only marks the chain broken when `_BACKUP_IN_PROGRESS` is `"true"`
 
 ### Paused VMs on Interrupt
 
@@ -2437,11 +2551,10 @@ VMs without a QEMU agent are paused before backup and resumed after. If the proc
 ### Automatic Recovery
 
 On next run:
-1. `cleanup_stale_locks()` - Remove locks with dead PIDs
-2. `cleanup_orphaned_checkpoints()` - Remove checkpoints without data
-3. `validate_backup_state()` - Detect incomplete state
-4. `prepare_backup_directory()` - Clean partial files
-5. Proceed with FULL backup
+1. `cleanup_system_checkpoints_and_locks()` - Sweeps per-VM lock files older than 12 hours and removes those whose holding process is dead. A lock held by a live vmbackup, vmrestore, or virtnbdbackup process is always kept. Checkpoint cleanup at session level is deliberately a no-op — orphaned checkpoints are assessed per VM by `validate_backup_state()` inside `backup_vm()` and remediated by `prepare_backup_directory()`, after the backup directory exists.
+2. `validate_backup_state()` - Detect incomplete state
+3. `prepare_backup_directory()` - Clean partial files
+4. Proceed with FULL backup
 
 ---
 
@@ -2453,20 +2566,22 @@ All paths below are relative to `$BACKUP_PATH/` (instance-specific backup direct
 
 | File | Location | Purpose |
 |------|----------|---------|
-| `vda.full.data` | `<vm>/` | Full backup image |
-| `vda.copy.data` | `<vm>/` | Offline copy backup |
-| `vda.inc.virtnbdbackup.N.data` | `<vm>/` | Incremental N |
-| `<vm>.cpt` | `<vm>/` | Checkpoint list (JSON) |
-| `virtnbdbackup.N.xml` | `<vm>/checkpoints/` | Checkpoint metadata |
+| `vda.full.data` | `<vm>/<period>/` | Full backup image |
+| `vda.copy.data` | `<vm>/<period>/` | Offline copy backup |
+| `vda.inc.virtnbdbackup.N.data` | `<vm>/<period>/` | Incremental N |
+| `<vm>.cpt` | `<vm>/<period>/` | Checkpoint list (JSON) |
+| `virtnbdbackup.N.xml` | `<vm>/<period>/checkpoints/` | Checkpoint metadata |
+
+`accumulate`-policy VMs have no period level — their files sit directly under `<vm>/`.
 
 ### State Files
 
 | File | Location | Purpose |
 |------|----------|---------|
-| `.agent-status` | `<vm>/` | Cached agent availability |
-| `.full-backup-month` | `<vm>/` | Month of last full |
+| `.agent-status` | `<vm>/<period>/` | Cached agent availability |
+| `.full-backup-month` | `<vm>/<period>/` | Month of last full |
 | `vmbackup.db` | `_state/` | SQLite logging database |
-| `.last_month` | `_state/` | Month boundary detection file |
+| `.last_rotation` | `_state/` | Daily log-rotation sentinel (gates `cleanup_old_logs()` to once per day) |
 | `cloud_replication_state.txt` | `_state/` | Cloud replication tracking (invalidated at session start, regenerated when cloud replication runs) |
 | `local_replication_state.txt` | `_state/` | Local replication tracking (invalidated at session start, regenerated when local replication runs) |
 | `vmbackup-<vm>.lock` | `_state/locks/` | Per-VM lock file |
@@ -2511,8 +2626,7 @@ Debug output from email report generation:
 
 | Pattern | Location | Purpose |
 |---------|----------|---------|
-| `debug_<epoch>.log` | `_state/email/` | Email report generation debug |
-| `db_query_<epoch>.log` | `_state/email/` | Database query debug output |
+| `email-<date>_<HHMMSS>.txt` | `_state/email/` | Debug copy of each generated email report |
 
 ### State Backups
 
@@ -2523,16 +2637,15 @@ Daily state snapshots provide disaster recovery for the `_state/` directory:
 | `state-<YYYYMMDD>.tar.gz` | `_state/backups/` | Daily snapshot of critical state files | `STATE_BACKUP_KEEP_DAYS` (default: 90) |
 
 **Contents of state backups:**
-- `vmbackup.db` — SQLite database
-- `.last_month` — Month boundary file
+- `vmbackup.db` — SQLite database (captured as a consistent snapshot where possible; if the snapshot cannot be taken, the live file is copied raw with a warning)
+- `.last_rotation` — Daily log-rotation sentinel
 - `cloud_replication_state.txt` — Cloud tracking
 - `local_replication_state.txt` — Local tracking
-- `locks/` — Lock files (usually empty at backup time)
 - `logs/` — All log files (vmbackup.log + per-VM logs)
 - `replication_logs/` — Cloud and local replication logs
 - `email/` — Email debug logs
 
-**Exclusions:** `backups/` directory and `*.lock` files are excluded from the archive.
+**Exclusions:** the `backups/` directory, the `locks/` directory, and `*.lock` files are excluded from the archive.
 
 **Cleanup:** State backups older than `STATE_BACKUP_KEEP_DAYS` are automatically purged.
 
@@ -2613,6 +2726,8 @@ Syncs backups to secondary local/NAS storage via rsync.
 
 **Space check behaviour:** For `mirror` mode, the space check calculates the effective delta (source size minus existing destination data) rather than the total source size, since mirror only transfers changes. For `accumulate` mode, the full source size is used.
 
+**Verification behaviour:** With `DEST_N_VERIFY` set to `size` or `checksum`, each sync is re-checked after it completes. A destination whose verification fails is recorded as FAILED for the session, so retention's replication safeguard (`RETENTION_REQUIRE_REPLICATION`) never treats an unverified copy as a replica. The check fails closed — if the sizes (or the checksum comparison) cannot be established, verification fails rather than silently passing.
+
 **Key Functions:**
 
 | Function | Purpose | Returns |
@@ -2647,7 +2762,7 @@ Uploads backups to cloud storage via rclone.
 |---------|---------|
 | `CLOUD_DEST_N_ENABLED` | Enable this destination |
 | `CLOUD_DEST_N_NAME` | Human-readable name |
-| `CLOUD_DEST_N_PROVIDER` | sharepoint/backblaze/wasabi |
+| `CLOUD_DEST_N_PROVIDER` | `sharepoint` — selects `cloud_transports/cloud_transport_<provider>.sh`; SharePoint is the only shipped driver (see the driver table below) |
 | `CLOUD_DEST_N_REMOTE` | rclone remote name |
 | `CLOUD_DEST_N_PATH` | Path within remote |
 | `CLOUD_DEST_N_SCOPE` | Override global scope |
@@ -2656,6 +2771,8 @@ Uploads backups to cloud storage via rclone.
 | `CLOUD_DEST_N_VERIFY` | Override global verification |
 | `CLOUD_DEST_N_MAX_SIZE` | Provider's max file size limit |
 | `CLOUD_DEST_N_SECRET_EXPIRY` | Credential expiry date (YYYY-MM-DD) |
+
+**Post-upload verification behaviour:** Verification checks exactly the files the upload sent — same scope, same filters, upload direction only — so scope settings and VM excludes never cause false mismatches. A failed post-upload verification records the destination as FAILED for the session, and retention's replication safeguard (`RETENTION_REQUIRE_REPLICATION`) will not treat an unverified copy as a replica.
 
 ### Transport Drivers (transports/*.sh)
 

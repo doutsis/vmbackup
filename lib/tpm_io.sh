@@ -116,15 +116,19 @@ validate_tpm_backup() {
         [[ ! -s "$f" ]] && return 1
     done
 
-    # Structural floor: if the canonical permall blob is present it must
-    # meet a minimum size. swtpm's smallest valid permall is well above
-    # 256 bytes; anything below indicates truncation.
+    # Structural floor: the canonical permall blob MUST be present and meet a
+    # minimum size. It is swtpm's persistent NV/state blob — a TPM backup
+    # without it cannot be restored, so its absence is fail-closed (satisfying
+    # the documented contract above: "rejects if the canonical tpm2-00.permall
+    # is missing"). Previously the size floor was only checked when the blob was
+    # present, so a partial backup with a sibling tpm2* file but no permall
+    # passed (F-tpm119). swtpm's smallest valid permall is well above 256 bytes;
+    # anything below indicates truncation. [[ -s ]] subsumes the empty check.
     local permall="$state_dir/tpm2-00.permall"
-    if [[ -e "$permall" ]]; then
-        local sz
-        sz=$(stat -c %s "$permall" 2>/dev/null || echo 0)
-        (( sz < 256 )) && return 1
-    fi
+    [[ -s "$permall" ]] || return 1
+    local sz
+    sz=$(stat -c %s "$permall" 2>/dev/null || echo 0)
+    (( sz < 256 )) && return 1
 
     return 0
 }

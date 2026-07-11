@@ -60,13 +60,20 @@ get_vm_periods() {
 
     # Match all known periodic formats with a single find command.
     # Note: no `| sort` — R2: callers sort if they want order.
-    # shellcheck disable=SC2038  # period IDs are strict [0-9W-]+; no whitespace possible by construction
-    find "$vm_dir" -maxdepth 1 -type d \( \
+    # NUL-safe enumeration: -print0 + read -d '' emits each dir's basename with
+    # no word-splitting, so a vm_dir path containing spaces/quotes cannot leak
+    # path fragments as phantom period ids (FF-2). ${_dir##*/} == basename here
+    # because find never appends a trailing slash; the output/order contract is
+    # unchanged (unsorted, one id per line).
+    find "$vm_dir" -maxdepth 1 -mindepth 1 -type d \( \
         -regextype posix-extended \
         -regex '.*/[0-9]{8}$' -o \
         -regex '.*/[0-9]{4}-W[0-9]{2}$' -o \
         -regex '.*/[0-9]{6}$' \
-    \) 2>/dev/null | xargs -r -n1 basename
+    \) -print0 2>/dev/null \
+        | while IFS= read -r -d '' _dir; do
+            printf '%s\n' "${_dir##*/}"
+        done
 }
 
 # Policy-driven filter on top of get_vm_periods.
@@ -80,19 +87,31 @@ get_vm_periods_for_policy() {
 
     [[ ! -d "$vm_dir" ]] && return 0
 
-    # shellcheck disable=SC2038  # period IDs are strict [0-9W-]+; no whitespace possible by construction
+    # NUL-safe enumeration (FF-2b): -print0 + read -d '' emits each matched
+    # dir's basename with no word-splitting, so a vm_dir path containing spaces
+    # cannot leak path fragments as phantom period ids. Mirrors get_vm_periods;
+    # output/order contract unchanged (unsorted, one id per line).
     case "$policy" in
         daily)
-            find "$vm_dir" -maxdepth 1 -type d -regextype posix-extended \
-                -regex '.*/[0-9]{8}$' 2>/dev/null | xargs -r -n1 basename
+            find "$vm_dir" -maxdepth 1 -mindepth 1 -type d -regextype posix-extended \
+                -regex '.*/[0-9]{8}$' -print0 2>/dev/null \
+                | while IFS= read -r -d '' _dir; do
+                    printf '%s\n' "${_dir##*/}"
+                done
             ;;
         weekly)
-            find "$vm_dir" -maxdepth 1 -type d -regextype posix-extended \
-                -regex '.*/[0-9]{4}-W[0-9]{2}$' 2>/dev/null | xargs -r -n1 basename
+            find "$vm_dir" -maxdepth 1 -mindepth 1 -type d -regextype posix-extended \
+                -regex '.*/[0-9]{4}-W[0-9]{2}$' -print0 2>/dev/null \
+                | while IFS= read -r -d '' _dir; do
+                    printf '%s\n' "${_dir##*/}"
+                done
             ;;
         monthly)
-            find "$vm_dir" -maxdepth 1 -type d -regextype posix-extended \
-                -regex '.*/[0-9]{6}$' 2>/dev/null | xargs -r -n1 basename
+            find "$vm_dir" -maxdepth 1 -mindepth 1 -type d -regextype posix-extended \
+                -regex '.*/[0-9]{6}$' -print0 2>/dev/null \
+                | while IFS= read -r -d '' _dir; do
+                    printf '%s\n' "${_dir##*/}"
+                done
             ;;
         *)
             # accumulate / unknown: not this lib's concern (D1).
@@ -157,7 +176,11 @@ calculate_any_period_age() {
             # rotation_module.sh). U2 / spec §6 risk row 1.
             local year="${period_id:0:4}"
             local week="${period_id:6:2}"
-            period_date=$(date -u -d "${year}-01-04 +$((week - 1)) weeks" +%s 2>/dev/null) || {
+            # 10# forces base-10: a zero-padded ISO week ("08"/"09") is an invalid
+            # octal literal, so un-prefixed arithmetic errors and falls through to
+            # age 0 (F-period158). date parses the string form fine — only the
+            # arithmetic offset needs the guard.
+            period_date=$(date -u -d "${year}-01-04 +$((10#$week - 1)) weeks" +%s 2>/dev/null) || {
                 echo "0"; return 1
             }
             ;;

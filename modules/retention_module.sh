@@ -50,7 +50,7 @@ readonly RETENTION_MODULE_VERSION="2.1"
 _is_period_protected() {
     local vm_name="$1"
     local period_id="$2"
-    local db_path="${VMBACKUP_DB:-${BACKUP_PATH}_state/vmbackup.db}"
+    local db_path="${VMBACKUP_DB:-${BACKUP_PATH%/}/_state/vmbackup.db}"
 
     # If DB unavailable, allow deletion (backward compatible)
     [[ ! -f "$db_path" ]] && return 1
@@ -72,16 +72,28 @@ _is_period_protected() {
 _is_period_replicated() {
     local vm_name="$1"
     local period_id="$2"
-    local db_path="${VMBACKUP_DB:-${BACKUP_PATH}_state/vmbackup.db}"
+    local db_path="${VMBACKUP_DB:-${BACKUP_PATH%/}/_state/vmbackup.db}"
 
-    # If no DB or no replication configured, consider replicated (don't block)
-    [[ ! -f "$db_path" ]] && return 0
+    # F-571 (R2): configured-guard FIRST — if replication is not configured on
+    # this instance there is nothing to wait for, so allow deletion (this keeps
+    # every disabled-replication install pruning normally). MUST precede the
+    # DB-absent return below, else block would stall all retention on DB-less /
+    # never-replicated installs.
+    [[ "${REPLICATION_ENABLED:-no}" != "yes" && "${CLOUD_REPLICATION_ENABLED:-no}" != "yes" ]] && return 0
 
-    # Phase 4 commit 4a: typed reads via lib/sqlite_ro.sh.
-    local has_replication
-    has_replication=$(sqlite_get_successful_replication_count "$db_path")
-    [[ "${has_replication:-0}" -eq 0 ]] && return 0
+    # F-571 (R2): replication IS configured but the catalogue is absent → we
+    # cannot prove this period was replicated → fail-CLOSED (keep it). Deliberate
+    # inversion of _is_period_protected's return-1-means-allow convention; safe
+    # because the configured-guard above already released never-replicated
+    # instances before this line is reached.
+    [[ ! -f "$db_path" ]] && return 1
 
+    # Phase 4 commit 4a: typed read via lib/sqlite_ro.sh.
+    # F-571 (R2): reaching here means replication IS configured; the old global
+    # "zero successful replication_runs → treat as replicated" short-circuit is
+    # removed — a global zero proves NOTHING is replicated yet, so fall through to
+    # the per-VM+period check, which returns 1 (not proven) for a never-shipped
+    # period.
     # Check if this VM+period has been replicated at least once
     local replicated
     replicated=$(sqlite_get_vm_period_replication_count "$db_path" "$vm_name" "$period_id")
@@ -124,7 +136,7 @@ _is_period_replicated() {
 count_vm_periods() {
     local vm_name="$1"
     local safe_name vm_dir policy
-    safe_name=$(sanitize_vm_name "$vm_name")
+    safe_name=$(vm_fs_name "$vm_name") || return $?
     vm_dir="${BACKUP_PATH}${safe_name}"
     policy=$(get_vm_rotation_policy "$vm_name")
     get_vm_periods_for_policy "$vm_dir" "$policy" | grep -c . || true
@@ -138,7 +150,7 @@ count_vm_periods() {
 get_orphaned_periods() {
     local vm_name="$1"
     local safe_name vm_dir policy
-    safe_name=$(sanitize_vm_name "$vm_name")
+    safe_name=$(vm_fs_name "$vm_name") || return $?
     vm_dir="${BACKUP_PATH}${safe_name}"
     policy=$(get_vm_rotation_policy "$vm_name")
     local all_periods=$(get_vm_periods "$vm_dir")
@@ -159,7 +171,7 @@ get_orphaned_periods() {
 calculate_orphan_age() {
     local vm_name="$1"
     local period_id="$2"
-    local db_path="${VMBACKUP_DB:-${BACKUP_PATH}_state/vmbackup.db}"
+    local db_path="${VMBACKUP_DB:-${BACKUP_PATH%/}/_state/vmbackup.db}"
     
     # Check DB exists
     [[ ! -f "$db_path" ]] && {
@@ -174,8 +186,18 @@ calculate_orphan_age() {
     # Match on backup_path (contains actual directory name), not on created_at.
     # See DATETIME_BUGS.md H2.
     # Phase 4 commit 4a: typed read via lib/sqlite_ro.sh.
+    # FF-116 fail-closed: capture the helper's rc. It returns non-zero (rc 2,
+    # empty stdout) on a sqlite3 QUERY FAILURE — indistinguishable from the
+    # legitimate rc-0 empty result for a genuinely-unbacked period. On failure,
+    # fall back to period age (KEEP), exactly as the DB-absent branch above,
+    # instead of echoing 9999 (delete-eligible).
     local last_success
-    last_success=$(sqlite_get_last_successful_backup_at "$db_path" "$vm_name" "$period_id")
+    if ! last_success=$(sqlite_get_last_successful_backup_at "$db_path" "$vm_name" "$period_id"); then
+        log_warn "retention_module.sh" "calculate_orphan_age" \
+            "Query failed for $vm_name/$period_id - falling back to period age (fail-closed)"
+        calculate_any_period_age "$period_id"
+        return $?
+    fi
     
     # No successful backup found - return very high age (eligible for deletion)
     if [[ -z "$last_success" || "$last_success" == "" ]]; then
@@ -218,7 +240,8 @@ run_retention_for_vm() {
     local vm_name="$1"
     local dry_run="${2:-false}"
     local trigger="${3:-post_backup}"
-    local safe_name=$(sanitize_vm_name "$vm_name")
+    local safe_name
+    safe_name=$(vm_fs_name "$vm_name") || return $?
     local vm_dir="${BACKUP_PATH}${safe_name}"
     local policy=$(get_vm_rotation_policy "$vm_name")
     
@@ -236,6 +259,22 @@ run_retention_for_vm() {
     }
     
     local retention_limit=$(get_retention_limit "$policy")
+    # FF-5: retention_limit drives the deletion arithmetic below. A blank,
+    # whitespace, negative, or non-numeric value (e.g. an operator writing
+    # RETENTION_WEEKS= as an "unlimited" guess) resolves to 0 in the -le test
+    # and in $((period_count - retention_limit)), making to_remove ==
+    # period_count so `head -n` selects EVERY period and all but the
+    # keep-last-guarded newest are deleted silently, rc 0, every run. Fail
+    # closed: reject non-numeric limits and skip retention for this VM. "0"
+    # and positive integers are valid and behave exactly as before.
+    if [[ ! "$retention_limit" =~ ^[0-9]+$ ]]; then
+        log_error "retention_module.sh" "run_retention_for_vm" \
+            "Invalid retention limit '$retention_limit' for policy '$policy' (check RETENTION_DAYS/RETENTION_WEEKS/RETENTION_MONTHS in vmbackup.conf) - SKIPPING retention for $vm_name (fail-closed, no periods removed)"
+        log_retention_action "error" "$vm_name" "vm_retention" \
+            "$vm_dir" "" "$policy" "0" "0" \
+            "" "0" "invalid_limit" "$trigger" "false" "retention_module"
+        return 1
+    fi
     # UNI-007 (Phase 3): consumes lib/period.sh::get_vm_periods_for_policy.
     # vm_dir + policy already resolved at function top.
     # Sort chronologically (period IDs sort lexically == chronologically for
@@ -324,7 +363,8 @@ run_orphan_retention_for_vm() {
     # Find orphaned periods
     local orphans=$(get_orphaned_periods "$vm_name")
     if [[ -z "$orphans" ]]; then
-        local safe_name=$(sanitize_vm_name "$vm_name")
+        local safe_name
+        safe_name=$(vm_fs_name "$vm_name") || return $?
         log_retention_action "evaluate" "$vm_name" "orphan_retention" \
             "${BACKUP_PATH}${safe_name}" "" "$policy" "" "0" \
             "" "0" "no_orphans" "$trigger" "true" "retention_module"
@@ -391,7 +431,8 @@ _remove_orphan_period() {
     local original_policy="$3"
     local dry_run="$4"
     local trigger="${5:-orphan_retention}"
-    local safe_name=$(sanitize_vm_name "$vm_name")
+    local safe_name
+    safe_name=$(vm_fs_name "$vm_name") || return $?
     local period_dir="${BACKUP_PATH}${safe_name}/${period_id}"
     
     # Skip if not exists
@@ -400,20 +441,6 @@ _remove_orphan_period() {
     local age_days=$(calculate_any_period_age "$period_id")
     local freed_bytes=$(du -sb "$period_dir" 2>/dev/null | cut -f1 || echo 0)
     local max_age="${RETENTION_ORPHAN_MAX_AGE_DAYS:-90}"
-    
-    # Dry run mode
-    if [[ "$dry_run" == "true" ]]; then  # [DRY-RUN-KEEPER: local-param polarity preserved, see 109-phase7-spec.md §1.3.3]
-        log_info "retention_module.sh" "_remove_orphan_period" \
-            "[DRY RUN] Would remove orphan: $period_dir (policy=$original_policy, ${freed_bytes} bytes, ${age_days} days old)"
-        
-        # Log to retention action if available
-        if declare -f log_retention_action >/dev/null 2>&1; then
-            log_retention_action "delete" "$vm_name" "orphan_period" "$period_dir" "$period_id" \
-                "$original_policy" "$max_age" "1" "$age_days" "$freed_bytes" \
-                "" "$trigger" "dry_run" "orphan_retention"
-        fi
-        return 0
-    fi
     
     # Protection check: refuse to delete if any chain in this period is protected
     if _is_period_protected "$vm_name" "$period_id"; then
@@ -428,8 +455,11 @@ _remove_orphan_period() {
     fi
     
     # Keep-last guard: refuse to delete the last period for a VM
+    # FF-117 fail-closed: count VALID period dirs via get_vm_periods (see
+    # _remove_period), not every subdir, so a stray non-period dir cannot mask the
+    # last real period. get_vm_periods failure -> 0 -> refuse (fail-closed).
     local total_periods_orphan
-    total_periods_orphan=$(find "${BACKUP_PATH}${safe_name}" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l)
+    total_periods_orphan=$(get_vm_periods "${BACKUP_PATH}${safe_name}" | grep -c . || true)
     if [[ "${total_periods_orphan:-0}" -le 1 ]]; then
         log_warn "retention_module.sh" "_remove_orphan_period" \
             "Refusing to delete last period for $vm_name: $period_id"
@@ -443,7 +473,7 @@ _remove_orphan_period() {
     
     # Replication-awareness check: warn or block if period has not been replicated
     if ! _is_period_replicated "$vm_name" "$period_id"; then
-        local repl_action="${RETENTION_REQUIRE_REPLICATION:-warn}"
+        local repl_action="${RETENTION_REQUIRE_REPLICATION:-block}"
         if [[ "$repl_action" == "block" ]]; then
             log_warn "retention_module.sh" "_remove_orphan_period" \
                 "Blocking deletion of un-replicated orphan period: $vm_name/$period_id"
@@ -466,6 +496,19 @@ _remove_orphan_period() {
                 "Safety check failed for orphan: $period_dir"
             return 1
         fi
+    fi
+    
+    # FF-185: dry-run mode — AFTER all guards, so the preview reflects what a real
+    # run would actually delete (a guarded orphan never reaches here).
+    if [[ "$dry_run" == "true" ]]; then  # [DRY-RUN-KEEPER: local-param polarity preserved, see 109-phase7-spec.md §1.3.3]
+        log_info "retention_module.sh" "_remove_orphan_period" \
+            "[DRY RUN] Would remove orphan: $period_dir (policy=$original_policy, ${freed_bytes} bytes, ${age_days} days old)"
+        if declare -f log_retention_action >/dev/null 2>&1; then
+            log_retention_action "delete" "$vm_name" "orphan_period" "$period_dir" "$period_id" \
+                "$original_policy" "$max_age" "1" "$age_days" "$freed_bytes" \
+                "" "$trigger" "dry_run" "orphan_retention"
+        fi
+        return 0
     fi
     
     # Mark chains as deleted in SQLite BEFORE removal
@@ -524,7 +567,8 @@ _remove_period() {
     local skip_keep_last="${4:-false}"
     local caller="${5:-retention}"
     local trigger="${6:-post_backup}"
-    local safe_name=$(sanitize_vm_name "$vm_name")
+    local safe_name
+    safe_name=$(vm_fs_name "$vm_name") || return $?
     local period_dir="${BACKUP_PATH}${safe_name}/${period_id}"
     
     # Skip if not exists
@@ -549,8 +593,12 @@ _remove_period() {
     # Keep-last guard: refuse to delete the last period for a VM
     # Can be overridden by skip_keep_last (--prune all)
     if [[ "$skip_keep_last" != "true" ]]; then
+        # FF-117 fail-closed: count VALID period dirs (strict format) via
+        # get_vm_periods, not every subdir — a stray non-period dir (lost+found,
+        # hidden artefact) must not inflate the count past 1 and let the last REAL
+        # period be deleted. get_vm_periods failure -> empty -> 0 -> <=1 -> refuse.
         local total_periods
-        total_periods=$(find "${BACKUP_PATH}${safe_name}" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l)
+        total_periods=$(get_vm_periods "${BACKUP_PATH}${safe_name}" | grep -c . || true)
         if [[ "${total_periods:-0}" -le 1 ]]; then
             log_warn "retention_module.sh" "_remove_period" \
                 "Refusing to delete last period for $vm_name: $period_id"
@@ -569,7 +617,7 @@ _remove_period() {
             log_warn "retention_module.sh" "_remove_period" \
                 "Pruning un-replicated period: $vm_name/$period_id (operator-initiated)"
         else
-            local repl_action="${RETENTION_REQUIRE_REPLICATION:-warn}"
+            local repl_action="${RETENTION_REQUIRE_REPLICATION:-block}"
             if [[ "$repl_action" == "block" ]]; then
                 log_warn "retention_module.sh" "_remove_period" \
                     "Blocking deletion of un-replicated period: $vm_name/$period_id"
@@ -702,7 +750,7 @@ _remove_empty_period_dirs() {
     local vm_name="$1"
     local trigger="$2"
     local safe_name vm_dir
-    safe_name=$(sanitize_vm_name "$vm_name")
+    safe_name=$(vm_fs_name "$vm_name") || return $?
     vm_dir="${BACKUP_PATH:?BACKUP_PATH must be set}${safe_name}"
     [[ -d "$vm_dir" ]] || return 0
 
@@ -722,9 +770,44 @@ _remove_empty_period_dirs() {
         [[ "$period_dir" == "${BACKUP_PATH}"* ]] || continue
         [[ "$period_id" =~ ^[0-9]{4}-W[0-9]{2}$|^[0-9]{6}$|^[0-9]{8}$ ]] || continue
 
+        # B4/CLEAN-01 self-heal: reap empty .chain-* markers minted by the old
+        # broken archiver. They sit INSIDE populated periods (the period still
+        # holds .copy.data), so the stub check below never reaches them -- hook
+        # here, before it. Content-test: reap a .chain-* dir only if it holds no
+        # *.data and no *.xml anywhere beneath; never touch .archives/ or a
+        # non-empty marker. Honour dry-run.
+        local _b4_marker
+        while IFS= read -r _b4_marker; do
+            [[ -z "$_b4_marker" ]] && continue
+            # FF-118 fail-closed: keep the marker on a find ERROR too — a failed
+            # find must never be read as "nothing beneath" and reap a populated
+            # marker on storage error. (`if !` tests the rc directly.)
+            local _mk_out
+            if ! _mk_out=$(find "$_b4_marker" -type f \( -name '*.data' -o -name '*.xml' \) -print -quit 2>/dev/null); then
+                continue
+            fi
+            [[ -n "$_mk_out" ]] && continue
+            if is_dry_run; then
+                log_info "retention_module.sh" "_remove_empty_period_dirs" \
+                    "[DRY-RUN] Would reap empty chain marker: $_b4_marker (trigger=$trigger)"
+            else
+                log_info "retention_module.sh" "_remove_empty_period_dirs" \
+                    "Reaping empty chain marker: $_b4_marker (trigger=$trigger)"
+                rm -rf "$_b4_marker" 2>/dev/null || true
+            fi
+        done < <(find "$period_dir" -maxdepth 1 -type d -name '.chain-*' 2>/dev/null)
+
         # Stub criterion: zero top-level *.data files AND no .archives/ subdir
         # (chain history under .archives/ must be preserved).
-        data_count=$(find "$period_dir" -maxdepth 1 -type f -name '*.data' 2>/dev/null | wc -l)
+        # FF-118 fail-closed: a find ERROR (I/O error / permission loss on a
+        # degrading mount) must NOT read as "empty" and rm -rf a populated period.
+        local _data_out
+        if ! _data_out=$(find "$period_dir" -maxdepth 1 -type f -name '*.data' 2>/dev/null); then
+            log_warn "retention_module.sh" "_remove_empty_period_dirs" \
+                "find failed on $period_dir — keeping period (fail-closed)"
+            continue
+        fi
+        data_count=$(printf '%s\n' "$_data_out" | grep -c . || true)
         [[ "${data_count:-0}" -gt 0 ]] && continue
         [[ -d "${period_dir}/.archives" ]] && continue
 
@@ -827,7 +910,8 @@ _remove_archive_chain() {
     local dry_run="${4:-false}"
     local caller="${5:-prune}"
     local trigger="${6:-prune}"
-    local safe_name=$(sanitize_vm_name "$vm_name")
+    local safe_name
+    safe_name=$(vm_fs_name "$vm_name") || return $?
     local chain_dir="${BACKUP_PATH}${safe_name}/${period_id}/.archives/${chain_name}"
     
     if [[ ! -d "$chain_dir" ]]; then
@@ -840,18 +924,20 @@ _remove_archive_chain() {
     freed_bytes=$(du -sb "$chain_dir" 2>/dev/null | cut -f1 || echo 0)
     local policy=$(get_vm_rotation_policy "$vm_name")
     
-    if [[ "$dry_run" == "true" ]]; then  # [DRY-RUN-KEEPER: local-param polarity preserved, see 109-phase7-spec.md §1.3.3]
-        log_info "retention_module.sh" "_remove_archive_chain" \
-            "[DRY RUN] Would remove archive chain: $chain_dir (${freed_bytes} bytes)"
-        echo "$freed_bytes"
-        return 0
-    fi
-    
     # Safety check
     if ! _is_safe_to_remove "$chain_dir"; then
         log_error "retention_module.sh" "_remove_archive_chain" \
             "Safety check failed: $chain_dir"
         return 1
+    fi
+    
+    # FF-185: dry-run report AFTER the safety check (mirrors _remove_period) so a
+    # preview never overstates a chain the real run would refuse.
+    if [[ "$dry_run" == "true" ]]; then  # [DRY-RUN-KEEPER: local-param polarity preserved, see 109-phase7-spec.md §1.3.3]
+        log_info "retention_module.sh" "_remove_archive_chain" \
+            "[DRY RUN] Would remove archive chain: $chain_dir (${freed_bytes} bytes)"
+        echo "$freed_bytes"
+        return 0
     fi
     
     # Log chain event BEFORE removal — event name derived from caller
@@ -895,7 +981,8 @@ _remove_archives_in_period() {
     local dry_run="${3:-false}"
     local caller="${4:-prune}"
     local trigger="${5:-prune}"
-    local safe_name=$(sanitize_vm_name "$vm_name")
+    local safe_name
+    safe_name=$(vm_fs_name "$vm_name") || return $?
     local archives_dir="${BACKUP_PATH}${safe_name}/${period_id}/.archives"
     
     if [[ ! -d "$archives_dir" ]]; then
@@ -951,7 +1038,8 @@ _remove_vm_all() {
     local dry_run="${2:-false}"
     local caller="${3:-prune}"
     local trigger="${4:-prune}"
-    local safe_name=$(sanitize_vm_name "$vm_name")
+    local safe_name
+    safe_name=$(vm_fs_name "$vm_name") || return $?
     local vm_dir="${BACKUP_PATH}${safe_name}"
     
     if [[ ! -d "$vm_dir" ]]; then
@@ -1058,7 +1146,7 @@ archive_active_chains() {
     local old_period_id="$2"
     local archive_reason="${3:-period_boundary}"
     local safe_name
-    safe_name=$(sanitize_vm_name "$vm_name")
+    safe_name=$(vm_fs_name "$vm_name") || return $?
     local period_dir="${BACKUP_PATH}${safe_name}/${old_period_id}"
     
     if [[ ! -d "$period_dir" ]]; then
@@ -1097,80 +1185,64 @@ archive_active_chains() {
         return 0
     fi
     
-    log_debug "retention_module.sh" "archive_active_chains" \
-        "Found $restore_point_count restore points in period $old_period_id"
-    
+    # B4/CLEAN-01: archive via the shared canonical mover. The previous body
+    # wrote to <period>/.chain-<ts> (invisible to vmrestore; later reaped as a
+    # stub) and moved nothing (dead backup-<name>* pattern). Delegate to
+    # _archive_chain_files so the period-boundary path produces the SAME canonical
+    # .archives/chain-<date> layout (incl. NVRAM/TPM) as the in-backup archiver,
+    # and honour dry-run (previously absent here).
+    if is_dry_run; then
+        log_info "retention_module.sh" "archive_active_chains" \
+            "[DRY-RUN] Would archive chain $active_chain (period $old_period_id, $restore_point_count restore points) into .archives/"
+        return 0
+    fi
+
+    if ! declare -f _archive_chain_files >/dev/null 2>&1; then
+        log_error "retention_module.sh" "archive_active_chains" \
+            "Shared archiver _archive_chain_files unavailable - refusing to archive (avoids mis-filing the chain)"
+        return 1
+    fi
+
     log_info "retention_module.sh" "archive_active_chains" \
         "Archiving chain: $active_chain (period: $old_period_id)"
-    
-    # Create archive directory (within period directory)
-    local archive_dir
-    archive_dir=$(get_chain_archive_dir "${period_dir}/")
-    
-    mkdir -p "$archive_dir" || {
+
+    _archive_chain_files "$vm_name" "$period_dir"
+    local _acf_rc=$?
+    local archive_dir="$_ARCHIVE_LAST_PATH"
+    if (( _acf_rc == 2 )); then
+        log_debug "retention_module.sh" "archive_active_chains" \
+            "Nothing to archive for $vm_name in period $old_period_id"
+        return 0
+    elif (( _acf_rc != 0 )); then
         log_error "retention_module.sh" "archive_active_chains" \
-            "Failed to create archive directory: $archive_dir"
+            "Failed to archive chain for $vm_name (shared mover rc=$_acf_rc)"
         return 1
-    }
-    
-    # Find files to archive
-    local archive_pattern="backup-${safe_name}*"
-    local files_moved=0
-    local total_bytes=0
-    
-    while IFS= read -r -d '' file; do
-        local filename
-        filename=$(basename "$file")
-        local dest="${archive_dir}/${filename}"
-        
-        local file_size
-        file_size=$(stat -c %s "$file" 2>/dev/null || echo 0)
-        
-        if mv "$file" "$dest"; then
-            ((files_moved++)) || true
-            total_bytes=$((total_bytes + file_size))
-            
-            log_file_operation "move" "$vm_name" "$file" "$dest" \
-                "backup" "Chain archive" "archive_active_chains" "true"
-        else
-            log_error "retention_module.sh" "archive_active_chains" \
-                "Failed to move: $file -> $dest"
-        fi
-    done < <(find "$period_dir" -maxdepth 1 -type f -name "$archive_pattern" -print0 2>/dev/null)
-    
-    # Also move checkpoint XML files
-    while IFS= read -r -d '' file; do
-        local filename
-        filename=$(basename "$file")
-        local dest="${archive_dir}/${filename}"
-        
-        mv "$file" "$dest" 2>/dev/null
-        log_file_operation "move" "$vm_name" "$file" "$dest" \
-            "checkpoint_xml" "Chain archive" "archive_active_chains" "true"
-    done < <(find "$period_dir" -maxdepth 1 -type f -name "*.checkpoint-*.xml" -print0 2>/dev/null)
-    
-    # DUP-10: archive_chain_in_manifest call removed (writer to dead file).
-    # active_chain retained for use by sqlite_archive_chain / log_chain_lifecycle below.
-    
-    # Update SQLite chain_health to mark as archived
-    # INT-20 (2026-05-23): pass archive_path="" (preserves existing
-    # chain_location semantics in sqlite_archive_chain) + total_bytes so
-    # `archive_size_bytes` is persisted instead of defaulting to 0.
+    fi
+
+    local files_moved=${_ARCHIVE_LAST_TOTAL:-0}
+    local total_bytes
+    total_bytes=$(du -sb "$archive_dir" 2>/dev/null | cut -f1 || echo 0)
+
+    # Update SQLite chain_health to mark as archived (INT-20: archive_path="" keeps
+    # chain_location semantics; total_bytes persists archive_size_bytes).
     if declare -f sqlite_archive_chain >/dev/null 2>&1; then
         sqlite_archive_chain "$vm_name" "$old_period_id" "$archive_dir" "" "$total_bytes"
         log_debug "retention_module.sh" "archive_active_chains" \
             "Marked chain as archived in SQLite: $vm_name/$old_period_id (size=${total_bytes}B)"
     fi
-    
-    # Log chain lifecycle
-    log_chain_lifecycle "chain_archived" "$vm_name" "$active_chain" "$old_period_id" \
-        "${BACKUP_PATH}${safe_name}/${old_period_id}" "$archive_subdir" \
-        "$files_moved" "$total_bytes" "$archive_reason" "period_rotation" \
-        "incremental" "" ""
-    
+
+    # Log chain lifecycle. archive_subdir = basename of the canonical dest (the old
+    # dangling $archive_subdir from the DUP-10 removal is gone).
+    if declare -f log_chain_lifecycle >/dev/null 2>&1; then
+        log_chain_lifecycle "chain_archived" "$vm_name" "$active_chain" "$old_period_id" \
+            "$archive_dir" "$(basename "$archive_dir")" \
+            "$files_moved" "$total_bytes" "$archive_reason" "period_rotation" \
+            "incremental" "" ""
+    fi
+
     log_info "retention_module.sh" "archive_active_chains" \
         "Archived $files_moved files (${total_bytes} bytes) to $archive_dir"
-    
+
     return 0
 }
 
@@ -1188,9 +1260,10 @@ archive_active_chains() {
 reconcile_vm_chain_state() {
     local vm_name="$1"
     local dry_run="${2:-false}"
-    local safe_name=$(sanitize_vm_name "$vm_name")
+    local safe_name
+    safe_name=$(vm_fs_name "$vm_name") || return $?
     local vm_dir="${BACKUP_PATH}${safe_name}"
-    local db_path="${VMBACKUP_DB:-${BACKUP_PATH}_state/vmbackup.db}"
+    local db_path="${VMBACKUP_DB:-${BACKUP_PATH%/}/_state/vmbackup.db}"
 
     [[ ! -d "$vm_dir" ]] && return 0
     [[ ! -f "$db_path" ]] && return 0
@@ -1270,7 +1343,16 @@ reconcile_all_chain_state() {
         [[ "$dir_name" == _* ]] && continue
         [[ "$dir_name" == .* ]] && continue
 
-        reconcile_vm_chain_state "$dir_name" "$dry_run"
+        # FF-186 (RECON-01): the on-disk basename is the vm_fs_name TOKEN
+        # (slug-<sha256>) for spaced/special VM names, but the catalogue is keyed
+        # on the REAL libvirt name. Resolve token -> real (the same mapper PRUNE-01
+        # uses in run_prune_mode) so pass-1 phantom detection and pass-2
+        # registration hit the correct key. Falls back to the basename when the
+        # mapper is absent (name already safe / VM gone from libvirt).
+        local real_name="$dir_name"
+        declare -f _prune_real_name >/dev/null 2>&1 && real_name=$(_prune_real_name "$dir_name")
+
+        reconcile_vm_chain_state "$real_name" "$dry_run"
     done < <(find "$BACKUP_PATH" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort)
 
     log_info "retention_module.sh" "reconcile_all_chain_state" \

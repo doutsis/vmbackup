@@ -55,7 +55,7 @@ build_virtnbdbackup_args() {
     local scratch_dir="$4"
     shift 4
 
-    _VIRTNBD_ARGS=(virtnbdbackup -d "$vm_name" -l "$mode" "--compress=${VIRTNBD_COMPRESS_LEVEL}")
+    _VIRTNBD_ARGS=(virtnbdbackup -d "$vm_name" -l "$mode" "--compress=${VIRTNBD_COMPRESS_LEVEL:-1}")
 
     # Output format: only emitted when not the default "stream".
     if [[ "${VIRTNBD_OUTPUT_FORMAT:-stream}" != "stream" ]]; then

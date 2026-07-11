@@ -116,9 +116,11 @@ load_rotation_config() {
     local overrides="${config_dir}/vm_overrides.conf"
     if [[ -f "$overrides" ]]; then
         # shellcheck source=/dev/null
+        # FF-119: fail closed on an unsourceable overrides file.
         source "$overrides" || {
-            log_warn "rotation_module.sh" "load_rotation_config" \
-                "Failed to source overrides: $overrides"
+            log_error "rotation_module.sh" "load_rotation_config" \
+                "Failed to source overrides: $overrides — refusing to run with a partial VM_POLICY (never/accumulate would silently revert to periodic; fail-closed)"
+            return 1
         }
         local override_count="${#VM_POLICY[@]}"
         log_debug "rotation_module.sh" "load_rotation_config" \
@@ -129,9 +131,11 @@ load_rotation_config() {
     local exclude_file="${config_dir}/exclude_patterns.conf"
     if [[ -f "$exclude_file" ]]; then
         # shellcheck source=/dev/null
+        # FF-119: fail closed on an unsourceable exclusions file.
         source "$exclude_file" || {
-            log_warn "rotation_module.sh" "load_rotation_config" \
-                "Failed to source exclusions: $exclude_file"
+            log_error "rotation_module.sh" "load_rotation_config" \
+                "Failed to source exclusions: $exclude_file — refusing to run with a partial EXCLUDE_PATTERNS (excluded VMs would be backed up; fail-closed)"
+            return 1
         }
         local exclude_count=0
         [[ -n "${EXCLUDE_PATTERNS[*]:-}" ]] && exclude_count="${#EXCLUDE_PATTERNS[@]}"
@@ -197,8 +201,11 @@ get_period_id() {
             date -d "$timestamp" +%Y%m%d
             ;;
         weekly)
-            # ISO 8601 week: YYYY-Www (Monday is first day)
-            date -d "$timestamp" +%Y-W%V
+            # ISO 8601 week: YYYY-Www (Monday is first day). %G (ISO week-numbering
+            # year), NOT %Y (Gregorian) — at the Dec/Jan boundary %Y disagrees with
+            # the %V week it labels (e.g. 2027-01-01 is ISO 2026-W53). Forward-only:
+            # dirs already minted under %Y are not renamed (F-rot199).
+            date -d "$timestamp" +%G-W%V
             ;;
         monthly)
             date -d "$timestamp" +%Y%m
@@ -245,7 +252,8 @@ get_vm_backup_dir() {
         return 1
     fi
     
-    local safe_name=$(sanitize_vm_name "$vm_name")
+    local safe_name
+    safe_name=$(vm_fs_name "$vm_name") || return $?
     
     # Accumulate: flat directory under VM (no period)
     if [[ "$policy" == "accumulate" ]]; then
@@ -263,13 +271,13 @@ get_vm_backup_dir() {
 }
 
 # Sanitize VM name for safe filesystem use
-# Args: $1 - VM name
-# Returns: Sanitized name (preserves a-z, A-Z, 0-9, dot, underscore, hyphen)
-sanitize_vm_name() {
-    local vm_name="$1"
-    # Use bash parameter expansion - faster than sed for simple substitution
-    echo "${vm_name//[^a-zA-Z0-9._-]/_}"
-}
+# R3 (UNI-011 reconcile): the lenient slug sanitize_vm_name() that used to be
+# (re)defined here — 'echo "${vm_name//[^a-zA-Z0-9._-]/_}"' — has been removed.
+# It silently overrode the strict REJECT-not-substitute validator from
+# lib/vm_name_utils.sh whenever this module was loaded, which defeated the
+# UNI-011 silent-retargeting fix. The strict validator (sourced by both
+# binaries before any module) is now the single definition. Do not reintroduce
+# a lenient copy here. See copilot/115-B3.md (R3).
 
 #################################################################################
 # PERIOD BOUNDARY DETECTION
@@ -363,7 +371,8 @@ is_valid_period_dir() {
 # Returns: Newline-separated list of period IDs
 list_vm_periods() {
     local vm_name="$1"
-    local safe_name=$(sanitize_vm_name "$vm_name")
+    local safe_name
+    safe_name=$(vm_fs_name "$vm_name") || return $?
     local vm_dir="${BACKUP_PATH}${safe_name}"
     local policy=$(get_vm_rotation_policy "$vm_name")
     
@@ -409,26 +418,12 @@ generate_restore_point_id() {
 # CHAIN ARCHIVE DIRECTORY
 #################################################################################
 
-# Generate chain archive directory name (within period)
-# Args: $1 - backup directory
-#       $2 - timestamp (optional)
-# Returns: Full path to chain archive directory
-get_chain_archive_dir() {
-    local backup_dir="$1"
-    local timestamp="${2:-now}"
-    
-    local archive_name=".chain-$(date -d "$timestamp" +%Y%m%d-%H%M%S)"
-    local archive_path="${backup_dir}${archive_name}"
-    
-    # Handle sub-second collisions with counter suffix
-    local counter=0
-    while [[ -d "$archive_path" ]]; do
-        ((counter++))
-        archive_path="${backup_dir}${archive_name}.${counter}"
-    done
-    
-    echo "$archive_path"
-}
+# get_chain_archive_dir() REMOVED (B4/CLEAN-01, Q3). It produced a non-canonical
+# <period>/.chain-<ts> destination that vmrestore never searches and the stub
+# reaper deletes. Its only caller (archive_active_chains) now uses the shared
+# canonical mover _archive_chain_files (vmbackup.sh), which writes the correct
+# <period>/.archives/chain-<date>[.N] layout. Do not reintroduce a .chain-<ts>
+# producer.
 
 #################################################################################
 # RETENTION HELPERS
@@ -463,31 +458,34 @@ calculate_period_age() {
             # YYYYMMDD format
             period_date=$(date -u -d "${period:0:4}-${period:4:2}-${period:6:2}" +%s 2>/dev/null) || {
                 log_debug "rotation_module.sh" "calculate_period_age" "Failed to parse daily period: $period"
-                echo "0"; return
+                echo "0"; return 1
             }
             ;;
         weekly)
             # YYYY-Www format - use Thursday of that week (ISO 8601 reference day)
             local year="${period:0:4}"
             local week="${period:6:2}"
-            period_date=$(date -u -d "${year}-01-04 +$((week - 1)) weeks" +%s 2>/dev/null) || {
+            # 10# forces base-10: a zero-padded ISO week ("08"/"09") is an invalid
+            # octal literal, so un-prefixed arithmetic errors (F-period158). Twin of
+            # lib/period.sh::calculate_any_period_age — keep the two in lockstep.
+            period_date=$(date -u -d "${year}-01-04 +$((10#$week - 1)) weeks" +%s 2>/dev/null) || {
                 log_debug "rotation_module.sh" "calculate_period_age" "Failed to parse weekly period: $period"
-                echo "0"; return
+                echo "0"; return 1
             }
             ;;
         monthly)
             # YYYYMM format
             period_date=$(date -u -d "${period:0:4}-${period:4:2}-01" +%s 2>/dev/null) || {
                 log_debug "rotation_module.sh" "calculate_period_age" "Failed to parse monthly period: $period"
-                echo "0"; return
+                echo "0"; return 1
             }
             ;;
         *)
             echo "0"
-            return
+            return 1
             ;;
     esac
-    
+
     echo $(( (today - period_date) / 86400 ))
 }
 

@@ -186,9 +186,17 @@ backup_vm_tpm_consistent() {
     local tar_file="$tpm_backup_dir/tpm-state-$(date +%s).tar.gz"
     
     if timeout "$TPM_BACKUP_TIMEOUT" sudo tar --ignore-failed-read \
-        -czf "$tar_file" -C "$(dirname "$swtpm_dir")" "$(basename "$swtpm_dir")" 2>/dev/null; then
-        
-        # Extract for consistency with other backup methods
+        -czf "$tar_file" -C "$swtpm_dir" . 2>/dev/null; then
+
+        # Extract for consistency with other backup methods. Archiving the
+        # CONTENTS of swtpm_dir (-C "$swtpm_dir" .) means members are
+        # tpm2/tpm2-00.permall with NO leading <uuid>/, so extraction lands
+        # tpm-state/tpm2/... — the canonical layout the full method (:95),
+        # validate_tpm_backup, and restore_tpm's [[ -d "$tpm_dir/tpm2" ]] gate
+        # consume. The old -C dirname basename archived the <uuid> dir itself,
+        # extracting one level too deep (tpm-state/<uuid>/tpm2/...) so restore_tpm
+        # copied nothing and returned 0 (F-tpm188). This create/extract pairing
+        # is load-bearing — do not restore -C dirname basename.
         if sudo tar -xzf "$tar_file" -C "$tpm_backup_dir/" 2>/dev/null; then
             sudo rm -f "$tar_file"
             sudo chown -R "$(id -u):$(id -g)" "$tpm_backup_dir" 2>/dev/null || true
@@ -202,6 +210,11 @@ backup_vm_tpm_consistent() {
         fi
     fi
     
+    # FF-126: creation succeeded but extraction (or the outer tar) failed — remove
+    # the root-owned tpm-state-<epoch>.tar.gz so the full TPM state blob is not
+    # left behind to fail validation, be archived/replicated, and accumulate one
+    # copy per retry. -f: silent if it was never created.
+    sudo rm -f "$tar_file" 2>/dev/null || true
     log_tpm "WARN" "$vm_name: Consistent TPM backup failed"
     return 0  # Non-fatal
 }
@@ -387,9 +400,32 @@ extract_bitlocker_keys() {
         fi
     done <<< "$status_output"
 
-    # Step 2: If no protected volumes, log and return without writing a file
+    # Step 2: The English-label parse ("Volume X:", "Protection On") found no
+    # volumes. FF-127: manage-bde localizes those LABELS, so a non-English guest
+    # with protected volumes parses as zero. The Encryption Method value is
+    # locale-independent (contains 'AES' only when a volume is actually
+    # encrypted/protected), so use it as a fail-safe: preserve the raw -status
+    # verbatim and WARN for manual recovery, instead of silently discarding keys.
     if (( ${#protected_volumes[@]} == 0 )); then
-        log_tpm "INFO" "$vm_name: No BitLocker-protected volumes found"
+        if grep -qi 'AES' <<< "$status_output"; then
+            {
+                echo "BitLocker Recovery Keys (UNPARSED — localized manage-bde output)"
+                echo "VM: $vm_name"
+                echo "Extracted: $timestamp"
+                echo "WARNING: the volume parse found 0 protected volumes but -status"
+                echo "         shows an encrypted (AES) volume — labels are likely localized."
+                echo "         Raw manage-bde -status preserved below for manual recovery."
+                echo "========================================"
+                echo ""
+                echo "=== manage-bde -status ==="
+                echo "$status_output"
+            } > "$output_file"
+            chmod 600 "$output_file"
+            chown root:root "$output_file" 2>/dev/null || true
+            log_tpm "WARN" "$vm_name: BitLocker parse found 0 volumes but -status shows an encrypted volume (localized labels?) — raw status preserved to $output_file"
+        else
+            log_tpm "INFO" "$vm_name: No BitLocker-protected volumes found"
+        fi
         return 0
     fi
 

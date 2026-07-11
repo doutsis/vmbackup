@@ -134,8 +134,21 @@ dry_run_normalise_state() {
 # Idempotency-guarded: readonly assignment errors on re-source.
 [[ -n "${DRY_RUN_GUARD_LOG_PREFIX+x}" ]] || readonly DRY_RUN_GUARD_LOG_PREFIX="[DRY-RUN] WOULD: "
 
-# Export predicates so subshells (e.g. xargs/find -exec wrappers) see them.
+# Export the predicates AND the two flag globals they re-read (DRY_RUN,
+# OPT_DRY_RUN), so a CHILD bash process (bash -c, xargs/find -exec bash) resolves
+# dry-run identically to the parent.
+# FF-74: export -f alone put the predicate in the child but left DRY_RUN/
+# OPT_DRY_RUN unexported, so the child re-normalised to false and if_not_dry_run
+# would RUN a destructive command during --dry-run (a fail-open). _DRY_RUN_STATE
+# is NOT exported: it is a derived cache each predicate recomputes via
+# dry_run_normalise_state from the two flags before any read, so a child
+# re-derives it from DRY_RUN/OPT_DRY_RUN alone.
+# Plain subshells already inherit unexported state; this matters only for a child
+# bash process. Marking DRY_RUN/OPT_DRY_RUN exported is nounset-safe even when
+# unset (export sets the attribute without expanding the value), and only the one
+# each binary actually assigns is placed in the child's environment.
 export -f is_dry_run if_dry_run if_not_dry_run dry_run_normalise_state
+export DRY_RUN OPT_DRY_RUN
 
 # Lib-load-time normalisation. Safe even if --dry-run hasn't been parsed
 # yet — defaults to false and will be re-normalised from the binary's CLI

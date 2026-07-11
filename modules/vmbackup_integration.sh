@@ -43,7 +43,7 @@ load_vmbackup_modules() {
         module_path="${INTEGRATION_SCRIPT_DIR}/${module}"
         if [[ -f "$module_path" ]]; then
             # shellcheck source=/dev/null
-            source "$module_path" 2>/dev/null || {
+            source "$module_path" || {
                 log_error "vmbackup_integration.sh" "load_vmbackup_modules" \
                     "Failed to source: $module (syntax error?)"
                 return 1
@@ -55,8 +55,16 @@ load_vmbackup_modules() {
     done
     
     # Load rotation config if available (use CONFIG_INSTANCE from vmbackup.sh)
+    # FF-119: propagate the rc — a failed policy/exclusion config must fail CLOSED,
+    # not silently revert never/accumulate/exclusion intent to the default policy.
     local instance="${CONFIG_INSTANCE:-default}"
-    declare -f load_rotation_config >/dev/null 2>&1 && load_rotation_config "$instance"
+    if declare -f load_rotation_config >/dev/null 2>&1; then
+        load_rotation_config "$instance" || {
+            log_error "vmbackup_integration.sh" "load_vmbackup_modules" \
+                "load_rotation_config failed for instance '$instance' — refusing to continue with an incomplete rotation/exclusion policy (fail-closed)"
+            return 1
+        }
+    fi
     return 0
 }
 
@@ -78,17 +86,22 @@ get_backup_dir() {
 
 # Check accumulate chain depth and archive + force full if limit exceeded
 # Args: $1 - vm_name
-# Returns: 0 always (sets recovery flag if limit hit)
+# Returns: 0 normally (sets recovery flag if limit hit); non-zero only if
+#          vm_fs_name fails for an unsafe-named VM (NAME-02 fail-closed).
 _check_accumulate_limit_pre_backup() {
     local vm_name="$1"
-    local safe_name=$(sanitize_vm_name "$vm_name")
+    local safe_name
+    safe_name=$(vm_fs_name "$vm_name") || return $?
     local vm_dir="${BACKUP_PATH}${safe_name}"
     
     local hard_limit=${ACCUMULATE_HARD_LIMIT:-365}
     local warn_depth=${ACCUMULATE_WARN_DEPTH:-100}
     
-    # Count checkpoint depth (number of .data files indicates chain length)
-    local chain_depth=$(find "$vm_dir" -maxdepth 1 -type f -name "*.data" 2>/dev/null | wc -l)
+    # Count LOGICAL restore points (a multi-disk VM backed up once = 1), not raw
+    # .data files (one per disk per backup). FF-128: raw counting mis-scales
+    # ACCUMULATE_WARN_DEPTH/HARD_LIMIT by disk count. Split declare/assign.
+    local chain_depth
+    chain_depth=$(get_restore_point_count "$vm_dir")
     
     # Warning threshold - log warning (fires independently of hard limit)
     if [[ "$chain_depth" -ge "$warn_depth" ]]; then
@@ -103,6 +116,11 @@ _check_accumulate_limit_pre_backup() {
     if [[ "$chain_depth" -ge "$hard_limit" ]]; then
         log_warn "vmbackup_integration.sh" "_check_accumulate_limit_pre_backup" \
             "ACCUMULATE chain depth limit reached: $vm_name ($chain_depth >= $hard_limit)"
+
+        if declare -f is_dry_run >/dev/null 2>&1 && is_dry_run; then
+            log_info "vmbackup_integration.sh" "_check_accumulate_limit_pre_backup" "[DRY-RUN] would archive accumulate chain + delete checkpoints/bitmaps + set recovery flag for VM: $vm_name"
+            return 0
+        fi
         
         # Archive the current chain using the comprehensive archive function
         if declare -f archive_existing_checkpoint_chain >/dev/null 2>&1; then
@@ -161,11 +179,14 @@ pre_backup_hook() {
     log_debug "vmbackup_integration.sh" "pre_backup_hook" \
         "Entry: vm='$vm_name' policy='$policy'"
     
-    # Check for exclusion
+    # Check for exclusion. NAME-02 (118-spaces): return the DEDICATED exclusion rc
+    # so backup_vm can tell an intentional policy=never skip apart from a
+    # pre-backup ERROR (e.g. the vm_fs_name hash failure below, which returns its
+    # own non-zero) — the latter must be reported FAILED, not silently EXCLUDED.
     [[ "$policy" == "never" ]] && {
         log_info "vmbackup_integration.sh" "pre_backup_hook" \
             "VM $vm_name excluded by rotation policy (never)"
-        return 1
+        return "${BACKUP_RC_EXCLUDED:-2}"
     }
     
     # Create state backup at start of session
@@ -186,12 +207,17 @@ pre_backup_hook() {
     if [[ "$policy" == "accumulate" ]]; then
         log_debug "vmbackup_integration.sh" "pre_backup_hook" \
             "Accumulate policy for '$vm_name' - checking chain depth limit"
-        _check_accumulate_limit_pre_backup "$vm_name"
+        # FF-129: propagate the rc — _check_accumulate_limit_pre_backup fails
+        # CLOSED (vm_fs_name || return $?) on an unsafe-named VM when sha256sum is
+        # unavailable (NAME-02); the non-accumulate path below already propagates
+        # the same failure. Do not launder it into rc 0 / an empty backup_dir.
+        _check_accumulate_limit_pre_backup "$vm_name" || return $?
         return 0
     fi
     
     local current_period=$(get_period_id "$policy")
-    local safe_name=$(sanitize_vm_name "$vm_name")
+    local safe_name
+    safe_name=$(vm_fs_name "$vm_name") || return $?
     local vm_dir="${BACKUP_PATH}${safe_name}"
     
     # Use list_vm_periods (sorted newest-first) to find last period
@@ -204,14 +230,27 @@ pre_backup_hook() {
         log_info "vmbackup_integration.sh" "pre_backup_hook" \
             "Period boundary detected: $last_period -> $current_period (vm: $vm_name)"
         
-        # Archive active chains from previous period
-        declare -f archive_active_chains >/dev/null 2>&1 && \
+        # Archive active chains from previous period. FF-187: capture the rc —
+        # archive_active_chains returns 1 when the shared mover fails, leaving the
+        # closing period's chain OUTSIDE the canonical .archives/ layout.
+        local _archive_rc=0
+        if declare -f archive_active_chains >/dev/null 2>&1; then
             archive_active_chains "$vm_name" "$last_period" "period_boundary"
+            _archive_rc=$?
+        fi
         
-        # Log period lifecycle
+        # Log period lifecycle. FF-187: only record a CLEAN period_closed when the
+        # boundary archive actually succeeded — a failed archive must be logged as
+        # an error, not misrepresented as a clean close. period_created still fires
+        # so the new period is tracked.
         if declare -f log_period_lifecycle >/dev/null 2>&1; then
-            log_period_lifecycle "period_closed" "$vm_name" "$last_period" "$policy" \
-                "${vm_dir}/${last_period}" "" "" "0" "0" "0" "" "" ""
+            if (( _archive_rc == 0 )); then
+                log_period_lifecycle "period_closed" "$vm_name" "$last_period" "$policy" \
+                    "${vm_dir}/${last_period}" "" "" "0" "0" "0" "" "" ""
+            else
+                log_error "vmbackup_integration.sh" "pre_backup_hook" \
+                    "Boundary archive FAILED for $vm_name period $last_period (rc=$_archive_rc) — chain left outside .archives/; NOT recording a clean period_closed"
+            fi
             log_period_lifecycle "period_created" "$vm_name" "$current_period" "$policy" \
                 "${vm_dir}/${current_period}" "" "" "0" "0" "0" "$last_period" "" ""
         fi
@@ -273,11 +312,25 @@ post_backup_hook() {
         restore_point_id=$(generate_restore_point_id "$vm_name" "$period_id" "$chain_id" "$checkpoint")
         # DUP-10: add_restore_point call removed (writer to dead file).
         
-        # Log chain lifecycle for new chains
-        if [[ "$checkpoint" -eq 0 ]] && declare -f log_chain_lifecycle >/dev/null 2>&1; then
-            log_chain_lifecycle "chain_created" "$vm_name" "$chain_id" "$period_id" \
-                "$backup_dir" "." "1" "$backup_size_bytes" "" "" "$backup_type" \
-                "$(date -u '+%Y-%m-%d %H:%M:%S')" ""
+        # Log chain lifecycle exactly once per logical chain (FF-130). The old
+        # `-eq 0` gate was dead: get_restore_point_count is read AFTER the backup,
+        # so $checkpoint is always >=1 on success; and for copy-mode it is a
+        # presence count (always 1), so no post-backup disk value marks a chain's
+        # birth. Dedup on chain_id — the canonical logical-chain identity — by
+        # asking the catalogue whether a chain_created was already recorded for it.
+        # Fail-closed against duplicates: fire only on a CONFIRMED zero prior count;
+        # an unknown/unavailable catalogue means no fire (matches the pre-fix state).
+        if declare -f log_chain_lifecycle >/dev/null 2>&1; then
+            local prior_chain_created=1
+            if declare -f sqlite_get_chain_created_count >/dev/null 2>&1; then
+                prior_chain_created=$(sqlite_get_chain_created_count \
+                    "${SQLITE_DB_PATH:-}" "$vm_name" "$chain_id" 2>/dev/null) || prior_chain_created=1
+            fi
+            if [[ "${prior_chain_created:-1}" == "0" ]]; then
+                log_chain_lifecycle "chain_created" "$vm_name" "$chain_id" "$period_id" \
+                    "$backup_dir" "." "1" "$backup_size_bytes" "" "" "$backup_type" \
+                    "$(date -u '+%Y-%m-%d %H:%M:%S')" ""
+            fi
         fi
         
         # G2/G7: Update chain health in SQLite (success)
@@ -348,8 +401,12 @@ _init_vmbackup_integration() {
     declare -f log_warn >/dev/null 2>&1 || log_warn() { echo "[WARN] $3" >&2; }
     declare -f log_error >/dev/null 2>&1 || log_error() { echo "[ERROR] $3" >&2; }
     
-    # Load modules
-    load_vmbackup_modules
+    # Load modules. FF-131: propagate the rc — a submodule that fails to source
+    # (partial/corrupt install) or a failed rotation-config load (FF-119) must
+    # reach vmbackup.sh's die path (source "$integration_module" ... else die,
+    # vmbackup.sh:7136-7139), not be swallowed and run without rotation/logging/
+    # retention functions (backup_dir='' -> silent mis-writes under nounset-off).
+    load_vmbackup_modules || return 1
     
     log_info "vmbackup_integration.sh" "init" \
         "Integration module v${VMBACKUP_INTEGRATION_VERSION} loaded (VM-first)"

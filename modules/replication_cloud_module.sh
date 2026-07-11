@@ -51,6 +51,7 @@ declare -ga CLOUD_REPLICATION_DEST_STATUS=()
 declare -ga CLOUD_REPLICATION_CREDENTIAL_WARNINGS=()
 declare -gA CLOUD_REPLICATION_DEST_PROVIDER=()   # Provider: sharepoint/backblaze/etc
 declare -gA CLOUD_REPLICATION_DEST_REMOTE=()     # Remote name in rclone config
+declare -gA CLOUD_REPLICATION_DEST_SYNC_MODE=()  # Configured sync mode per destination
 
 # Per-destination transport metrics (for DB logging, metrics contract v1.0)
 declare -gA CLOUD_REPLICATION_DEST_THROTTLE=()   # Throttle events (0 = none occurred)
@@ -237,8 +238,10 @@ _log_cloud_replication_config() {
     local enabled_state="$1"
     local config_file="${CLOUD_REPLICATION_CONF:-}"
     
-    # Skip DB writes in dry-run mode (matches sqlite session policy)
-    is_dry_run && return 0
+    # Skip DB writes in dry-run mode (matches sqlite session policy). Guard the
+    # call — is_dry_run is undefined in standalone CLI mode (module never sources
+    # lib/dry_run.sh), matching the type-guard convention used just below.
+    type is_dry_run &>/dev/null && is_dry_run && return 0
     
     # Bail if sqlite not available
     if ! type sqlite_log_config_event &>/dev/null; then
@@ -348,33 +351,39 @@ cloud_replication_acquire_lock() {
     local lockfile="${CLOUD_REPLICATION_LOCKFILE:-/var/run/cloud_replication.lock}"
     local timeout="${CLOUD_REPLICATION_LOCK_TIMEOUT:-3600}"
     
-    # Check if lockfile exists
-    if [[ -f "$lockfile" ]]; then
+    # Atomically create the lock (noclobber: create fails if the file already
+    # exists, closing the check-then-write TOCTOU). $$ is the parent-shell PID
+    # even inside the subshell, matching the release check.
+    if ( set -o noclobber; echo $$ > "$lockfile" ) 2>/dev/null; then
+        cloud_log_debug "Acquired lock file: $lockfile (PID $$)"
+    else
+        # Lock file exists (or is unwritable) — inspect the current owner.
         local lock_pid
         lock_pid=$(cat "$lockfile" 2>/dev/null)
         
-        # Check if process is still running
+        # PRESERVE the observable contract: a LIVE owner is never broken.
         if [[ -n "$lock_pid" ]] && kill -0 "$lock_pid" 2>/dev/null; then
             cloud_log_error "Cloud replication already running (PID $lock_pid)"
             return 1
         fi
         
-        # Check lock age
+        # Owner not alive — only break by AGE, then re-acquire atomically.
         local lock_age
         lock_age=$(( $(date +%s) - $(stat -c %Y "$lockfile" 2>/dev/null || echo 0) ))
         
         if [[ $lock_age -gt $timeout ]]; then
             cloud_log_warn "Breaking stale lock (PID $lock_pid not running, lock age ${lock_age}s > ${timeout}s timeout)"
             rm -f "$lockfile"
+            if ! ( set -o noclobber; echo $$ > "$lockfile" ) 2>/dev/null; then
+                cloud_log_error "Lost race acquiring lock after breaking stale lock (or lock dir unwritable)"
+                return 1
+            fi
+            cloud_log_debug "Acquired lock file after breaking stale lock: $lockfile (PID $$)"
         else
             cloud_log_error "Lock file exists but process not found. Lock age: ${lock_age}s"
             return 1
         fi
     fi
-    
-    # Create lock file
-    echo $$ > "$lockfile"
-    cloud_log_debug "Acquired lock file: $lockfile (PID $$)"
     
     # Save parent EXIT trap, then set compound trap that does both:
     # release our lock AND run the parent's cleanup (session end, lock removal, etc.)
@@ -527,9 +536,10 @@ cloud_replication_process_destination() {
     eval "bwlimit=\${CLOUD_DEST_${dest_num}_BWLIMIT:-$CLOUD_REPLICATION_DEFAULT_BWLIMIT}"
     eval "verify=\${CLOUD_DEST_${dest_num}_VERIFY:-$CLOUD_REPLICATION_POST_VERIFY}"
     
-    # Track provider and remote for email reporting (Option B format)
+    # Track provider, remote and sync mode for email reporting / DB logging
     CLOUD_REPLICATION_DEST_PROVIDER["$name"]="$provider"
     CLOUD_REPLICATION_DEST_REMOTE["$name"]="$remote"
+    CLOUD_REPLICATION_DEST_SYNC_MODE["$name"]="$sync_mode"
     
     # Check if enabled
     if [[ "$enabled" != "yes" ]]; then
@@ -629,21 +639,18 @@ cloud_replication_dry_run() {
         return 1
     fi
     
-    # Test write permissions
-    cloud_log_info "[DRY-RUN] Testing write permissions..."
-    local test_file="/tmp/cloud_replication_test_$$"
-    echo "test" > "$test_file"
-    
+    # Test destination path — READ-ONLY probe (dry-run must never write to cloud;
+    # the former rclone copy/delete test-file upload was a real remote write that
+    # created the destination tree, violating the dry-run-must-be-read-only posture).
+    cloud_log_info "[DRY-RUN] Testing destination path (read-only)..."
     local remote_path
     eval "remote_path=\${CLOUD_DEST_${dest_num}_PATH}"
     
-    if rclone copy "$test_file" "${remote}${remote_path}/" &>/dev/null; then
-        rclone delete "${remote}${remote_path}/$(basename "$test_file")" &>/dev/null
-        cloud_log_info "[DRY-RUN] $name: Write permissions OK"
+    if rclone lsd "${remote}${remote_path}/" &>/dev/null; then
+        cloud_log_info "[DRY-RUN] $name: Destination path reachable"
     else
-        cloud_log_warn "[DRY-RUN] $name: Write permissions check failed (may be OK)"
+        cloud_log_warn "[DRY-RUN] $name: Destination path check failed (may be OK — path may not exist yet)"
     fi
-    rm -f "$test_file"
     
     # Check quota if available
     cloud_log_info "[DRY-RUN] Checking quota..."
@@ -786,7 +793,11 @@ run_cloud_replication_batch() {
     
     # Write state to file for parent shell to read (needed when running in subshell)
     # Values MUST be quoted to handle spaces in timestamps
-    local state_file="${STATE_DIR}/cloud_replication_state.txt"
+    # FF-107: STATE_DIR is unset in standalone CLI mode, where an unguarded
+    # ${STATE_DIR}/... would write a stray file at filesystem root; fall back.
+    local state_dir="${STATE_DIR:-${BACKUP_PATH:-/tmp/vmbackup}/_state}"
+    mkdir -p "$state_dir" 2>/dev/null
+    local state_file="${state_dir}/cloud_replication_state.txt"
     {
         echo "CLOUD_REPLICATION_START_TIME=\"$CLOUD_REPLICATION_START_TIME\""
         echo "CLOUD_REPLICATION_END_TIME=\"$CLOUD_REPLICATION_END_TIME\""
@@ -824,7 +835,7 @@ run_cloud_replication_batch() {
                 "$dest_name" \
                 "cloud" \
                 "$provider" \
-                "accumulate" \
+                "${CLOUD_REPLICATION_DEST_SYNC_MODE[$dest_name]:-${CLOUD_REPLICATION_SYNC_MODE:-mirror}}" \
                 "$remote" \
                 "$CLOUD_REPLICATION_START_TIME" \
                 "$CLOUD_REPLICATION_END_TIME" \
@@ -870,7 +881,7 @@ run_cloud_replication_batch() {
 # Get formatted summary for email reports
 # Returns a formatted text block suitable for email body
 get_cloud_replication_summary() {
-    local state_file="${STATE_DIR}/cloud_replication_state.txt"
+    local state_file="${STATE_DIR:-${BACKUP_PATH:-/tmp/vmbackup}/_state}/cloud_replication_state.txt"
     
     # Try to load state from file if variables are empty (subshell isolation fix)
     if [[ -z "$CLOUD_REPLICATION_START_TIME" ]]; then
@@ -915,8 +926,8 @@ get_cloud_replication_summary() {
     
     # Calculate duration
     local start_epoch end_epoch duration duration_fmt
-    start_epoch=$(date -d "${CLOUD_REPLICATION_START_TIME} UTC" '+%s' 2>/dev/null) || start_epoch=0
-    end_epoch=$(date -d "${CLOUD_REPLICATION_END_TIME} UTC" '+%s' 2>/dev/null) || end_epoch=0
+    start_epoch=$(date -d "${CLOUD_REPLICATION_START_TIME}" '+%s' 2>/dev/null) || start_epoch=0
+    end_epoch=$(date -d "${CLOUD_REPLICATION_END_TIME}" '+%s' 2>/dev/null) || end_epoch=0
     duration=$((end_epoch - start_epoch))
     
     if [[ $duration -ge 3600 ]]; then
@@ -974,7 +985,7 @@ get_cloud_replication_summary() {
 # Used in the SUMMARY section of the email.
 #################################################################################
 get_cloud_replication_stats() {
-    local state_file="${STATE_DIR}/cloud_replication_state.txt"
+    local state_file="${STATE_DIR:-${BACKUP_PATH:-/tmp/vmbackup}/_state}/cloud_replication_state.txt"
     
     # Try to load state from file if variables are empty (subshell isolation fix)
     if [[ -z "$CLOUD_REPLICATION_START_TIME" ]] || [[ ${#CLOUD_REPLICATION_DEST_STATUS[@]} -eq 0 ]]; then
@@ -1082,7 +1093,7 @@ get_cloud_replication_stats() {
 #   Prints formatted lines to stdout
 #################################################################################
 get_cloud_replication_details() {
-    local state_file="${STATE_DIR}/cloud_replication_state.txt"
+    local state_file="${STATE_DIR:-${BACKUP_PATH:-/tmp/vmbackup}/_state}/cloud_replication_state.txt"
     
     # Try to load state from file if variables are empty (subshell isolation fix)
     if [[ -z "$CLOUD_REPLICATION_START_TIME" ]] || [[ ${#CLOUD_REPLICATION_DEST_STATUS[@]} -eq 0 ]]; then

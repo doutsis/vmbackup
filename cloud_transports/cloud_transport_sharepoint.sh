@@ -64,13 +64,13 @@ declare -g SHAREPOINT_429_BW_REDUCE_PERCENT=${SHAREPOINT_429_BW_REDUCE_PERCENT:-
 
 #=============================================================================
 # LOGGING WRAPPERS
-# Format: [timestamp] [LEVEL] [cloud_transport_sharepoint.sh] [function] message
-# Uses FUNCNAME[1] to get the calling function name
+# FF-59: do NOT redefine cloud_log_debug/info/warn/error here. The loader module
+# modules/replication_cloud_module.sh already defines level-filtered versions
+# (honouring CLOUD_REPLICATION_LOG_LEVEL) and sources this transport AFTER them,
+# so redefining them here clobbered the level filter for the rest of the run.
+# The module's single-arg versions are used; the calling function is still
+# captured (cloud_log -> FUNCNAME[2]).
 #=============================================================================
-cloud_log_debug() { log_debug "cloud_transport_sharepoint.sh" "${FUNCNAME[1]}" "$*"; }
-cloud_log_info()  { log_info  "cloud_transport_sharepoint.sh" "${FUNCNAME[1]}" "$*"; }
-cloud_log_warn()  { log_warn  "cloud_transport_sharepoint.sh" "${FUNCNAME[1]}" "$*"; }
-cloud_log_error() { log_error "cloud_transport_sharepoint.sh" "${FUNCNAME[1]}" "$*"; }
 
 #=============================================================================
 # 429 THROTTLING HANDLERS
@@ -299,15 +299,21 @@ cloud_transport_sharepoint_upload() {
     
     # Build filters based on scope
     local filter_args=""
+    local -a include_arr=()  # FF-1: scope --include as an array (like exclude_arr); a re-split string keeps the quotes on the pattern -> rclone matches nothing -> zero files, rc 0, false success
     local -a exclude_arr=()  # Use array for proper escaping
-    
+
     case "$scope" in
         archives-only)
-            filter_args="--include '**/.archives/**'"
+            include_arr+=(--include "**/.archives/**")
             cloud_log_info "Scope: archives-only"
             ;;
-        *)
+        everything|"")
             cloud_log_info "Scope: everything"
+            ;;
+        *)
+            cloud_log_warn "Unhandled scope '$scope' - failing closed (valid scopes: everything, archives-only)"
+            CLOUD_REPLICATION_DEST_STATUS+=("$name|failed|0|0|0|Unsupported scope '$scope'")
+            return 1
             ;;
     esac
     
@@ -322,9 +328,22 @@ cloud_transport_sharepoint_upload() {
     if [[ -n "$vm_exclude" ]]; then
         IFS=',' read -ra excluded_vms <<< "$vm_exclude"
         for vm in "${excluded_vms[@]}"; do
-            vm=$(echo "$vm" | xargs)
-            exclude_arr+=(--exclude "${vm}/**")
-            cloud_log_info "Excluding VM: $vm"
+            # CLOUD-01 (118-spaces): trim without `xargs` (which collapses internal
+            # whitespace and strips quotes — mangling multi-space names), then
+            # exclude by the on-disk vm_fs_name TOKEN folder (and the legacy
+            # folder, for the migration window), NOT the raw name. The replica
+            # folder is the token, so a raw-name --exclude would not match and an
+            # excluded spaced-name VM would be replicated anyway (fail-open).
+            vm="${vm#"${vm%%[![:space:]]*}"}"; vm="${vm%"${vm##*[![:space:]]}"}"
+            [[ -z "$vm" ]] && continue
+            local _tok="$vm" _leg="$vm"
+            if declare -f vm_fs_name >/dev/null 2>&1; then
+                _tok=$(vm_fs_name "$vm" 2>/dev/null) || _tok="$vm"
+                _leg=$(vm_fs_name_legacy "$vm" 2>/dev/null) || _leg="$vm"
+            fi
+            exclude_arr+=(--exclude "${_tok}/**")
+            [[ -n "$_leg" && "$_leg" != "$_tok" ]] && exclude_arr+=(--exclude "${_leg}/**")
+            cloud_log_info "Excluding VM: $vm (folder: $_tok)"
         done
     fi
     
@@ -344,7 +363,11 @@ cloud_transport_sharepoint_upload() {
         file_count=$(echo "$files_to_upload" | wc -l)
         cloud_log_info "Found $file_count valid backup files"
         
-        include_filter_file="/tmp/cloud_valid_files_$$.txt"
+        include_filter_file=$(mktemp "${TMPDIR:-/tmp}/cloud_valid_files.XXXXXX") || {
+            cloud_log_error "Cannot create secure temp file for valid-files list - aborting"
+            CLOUD_REPLICATION_DEST_STATUS+=("$name|failed|0|0|0|temp file creation failed")
+            return 1
+        }
         echo "$files_to_upload" > "$include_filter_file"
         filter_args="--files-from=$include_filter_file"
     fi
@@ -363,11 +386,18 @@ cloud_transport_sharepoint_upload() {
     
     # Note: rclone log is already excluded by _state/replication_logs/** pattern
     
-    # Calculate source size
-    local source_bytes
-    source_bytes=$(tu_get_dir_size "$source_path")
+    # FF-61: source size is intentionally NOT computed here. Its only consumer was
+    # arg 3 of _cloud_monitor_rclone_progress, which discards it (local _unused="$3";
+    # progress is parsed from rclone's own --stats), so a du -sb over the whole
+    # backup store was pure wasted I/O.
     
-    local start_time output_file="/tmp/cloud_replication_$$.log"
+    local start_time output_file
+    output_file=$(mktemp "${TMPDIR:-/tmp}/cloud_replication.XXXXXX") || {
+        cloud_log_error "Cannot create secure temp file for rclone output - aborting"
+        [[ -n "$include_filter_file" ]] && rm -f "$include_filter_file"
+        CLOUD_REPLICATION_DEST_STATUS+=("$name|failed|0|0|0|temp file creation failed")
+        return 1
+    }
     start_time=$(date '+%s')
     
     #=========================================================================
@@ -385,7 +415,14 @@ cloud_transport_sharepoint_upload() {
         local -a rclone_cmd_arr=(rclone "$rclone_command" "--log-file=$rclone_log_file" "--log-level=INFO")
         read -ra args_arr <<< "$rclone_args"
         rclone_cmd_arr+=("${args_arr[@]}")
-        [[ -n "$filter_args" ]] && { read -ra filter_arr <<< "$filter_args"; rclone_cmd_arr+=("${filter_arr[@]}"); }
+        # FF-1: emit the scope include filter from its array so the glob reaches
+        # rclone unquoted. --files-from (accumulate-valid) still clobbers the scope
+        # include, preserving prior semantics (filter_args is set only in that mode).
+        if [[ -n "$filter_args" ]]; then
+            read -ra filter_arr <<< "$filter_args"; rclone_cmd_arr+=("${filter_arr[@]}")
+        elif [[ ${#include_arr[@]} -gt 0 ]]; then
+            rclone_cmd_arr+=("${include_arr[@]}")
+        fi
         # Add exclude array (properly handles spaces/special chars)
         [[ ${#exclude_arr[@]} -gt 0 ]] && rclone_cmd_arr+=("${exclude_arr[@]}")
         rclone_cmd_arr+=("$source_path" "${remote}${path}/")
@@ -398,8 +435,8 @@ cloud_transport_sharepoint_upload() {
         local rclone_pid=$!
         cloud_log_info "Rclone started (PID: $rclone_pid)"
         
-        # Monitor progress
-        _cloud_monitor_rclone_progress "$rclone_pid" "$rclone_log_file" "$source_bytes" 30 &
+        # Monitor progress (arg 3 is the historical source_bytes slot, now unused)
+        _cloud_monitor_rclone_progress "$rclone_pid" "$rclone_log_file" 0 30 &
         local monitor_pid=$!
         
         # Wait for completion
@@ -450,8 +487,11 @@ cloud_transport_sharepoint_upload() {
     # Parse transfer statistics from rclone log
     local transferred_bytes=0 transferred_files=0
     if [[ -f "$rclone_log_file" ]]; then
-        # Count completed transfers
-        transferred_files=$(grep -c "Copied (new\|Copied (replaced" "$rclone_log_file" 2>/dev/null || echo 0)
+        # Count completed transfers. grep -c prints a count (incl. "0") and exits 1
+        # on zero matches; `|| echo 0` would append a SECOND "0" line -> "0\n0",
+        # which later syntax-errors the $(( ... + transferred_files )) arithmetic.
+        transferred_files=$(grep -c "Copied (new\|Copied (replaced" "$rclone_log_file" 2>/dev/null || true)
+        [[ "$transferred_files" =~ ^[0-9]+$ ]] || transferred_files=0
         
         # Get transferred bytes from the LAST 100% progress line
         # rclone progress lines are cumulative, so each line shows the running total.
@@ -466,8 +506,11 @@ cloud_transport_sharepoint_upload() {
     fi
     
     # Cleanup temp files
+    # FF-4/V-2: do NOT remove $include_filter_file here. The post-upload verify
+    # REUSES it to reproduce the upload's exact --files-from selection; the
+    # success/verify-fail arm (below) and the upload-failure arm each remove it
+    # after the verify decision (caller owns its lifetime; the callee only reads).
     rm -f "$output_file"
-    [[ -n "$include_filter_file" ]] && rm -f "$include_filter_file"
     
     # Security: ensure rclone log file is accessible to backup group
     if [[ -f "$rclone_log_file" ]]; then
@@ -489,8 +532,18 @@ cloud_transport_sharepoint_upload() {
         CLOUD_TRANSPORT_DEST_TOTAL_BYTES=0
         CLOUD_TRANSPORT_DEST_SPACE_KNOWN=0
         
-        # Post-upload verification
-        _cloud_verify_upload "$dest_num" "$source_path" "$verify" "$sync_mode" "$exclude_args"
+        # Post-upload verification (FF-4: ENFORCING — a failed verify fails the dest)
+        # Caller owns $include_filter_file lifetime: the verify REUSES it (V-2) to
+        # reproduce the upload's exact --files-from selection, so it is removed only
+        # AFTER the verify decision, on every path below.
+        _cloud_verify_upload "$dest_num" "$source_path" "$verify" "$sync_mode" "$scope" "$include_filter_file"
+        local verify_rc=$?
+        [[ -n "$include_filter_file" ]] && rm -f "$include_filter_file"
+        if [[ $verify_rc -ne 0 ]]; then
+            cloud_log_error "Post-upload verification FAILED for $name (rc=$verify_rc) - marking dest failed"
+            CLOUD_REPLICATION_DEST_STATUS+=("$name|failed|$transferred_bytes|$transferred_files|$duration|Post-upload verification failed")
+            return 1
+        fi
         
         # Update globals
         CLOUD_REPLICATION_TOTAL_BYTES=$((CLOUD_REPLICATION_TOTAL_BYTES + transferred_bytes))
@@ -510,6 +563,10 @@ cloud_transport_sharepoint_upload() {
         CLOUD_TRANSPORT_DEST_SPACE_KNOWN=0
         
         CLOUD_REPLICATION_DEST_STATUS+=("$name|failed|0|0|$duration|Upload failed")
+        # FF-4/V-2: the shared cleanup block above no longer removes the filter
+        # file (it is preserved for verify on the success path); the upload-failure
+        # path never verifies, so remove it here.
+        [[ -n "$include_filter_file" ]] && rm -f "$include_filter_file"
         return 1
     fi
 }
@@ -523,7 +580,8 @@ _cloud_verify_upload() {
     local source_path="$2"
     local verify="$3"
     local sync_mode="$4"
-    local exclude_args="$5"
+    local scope="$5"
+    local filter_file="$6"
     
     [[ "$verify" != "checksum" && "$verify" != "size" ]] && return 0
     
@@ -534,13 +592,40 @@ _cloud_verify_upload() {
     local verify_flag="--size-only"
     [[ "$verify" == "checksum" ]] && verify_flag="--checksum"
     
-    local one_way_flag=""
-    [[ "$sync_mode" == "mirror" ]] && one_way_flag="--one-way"
+    cloud_log_info "[VERIFY] Starting $verify verification (scope=$scope mode=$sync_mode)"
     
-    cloud_log_info "[VERIFY] Starting $verify verification"
+    # FF-4/V-2: reproduce the upload's EXACT selection so the check asserts
+    # "everything I uploaded arrived intact" against precisely that set. Precedence
+    # mirrors the upload (accumulate-valid --files-from clobbers the scope include).
+    # The accumulate-valid arm REUSES the upload's own filter file rather than
+    # rebuilding it: a rebuild would diverge from what was actually uploaded (files
+    # added/removed between upload and verify), and a rebuilt-empty set would
+    # silently widen the check to the full tree -> deterministic false FAILED.
+    # Missing/empty here is near-unreachable in-process (upload early-returns on an
+    # empty valid set and the caller keeps the file alive); fail closed regardless.
+    local -a select_arr=()
+    if [[ "$sync_mode" == "accumulate-valid" ]]; then
+        if [[ -s "$filter_file" ]]; then
+            select_arr+=(--files-from="$filter_file")
+        else
+            cloud_log_error "[VERIFY] cannot reconstruct verify scope (filter file missing/empty) - failing dest"
+            return 1
+        fi
+    elif [[ "$scope" == "archives-only" ]]; then
+        select_arr+=(--include "**/.archives/**")
+    fi
     
-    # Build verify command with exclusions (use array passed from upload function scope)
-    local -a verify_cmd=(rclone check $verify_flag $one_way_flag --stats 5m --stats-one-line)
+    # FF-4/V-3: --one-way is UNCONDITIONAL. A post-upload integrity check asserts
+    # "everything I uploaded arrived", not "source and dest are identical". Under
+    # non-deleting modes (copy/accumulate-*) local retention legitimately leaves
+    # dest orphans that a two-way check would misreport as a difference; under
+    # mirror (which deletes dest extras) one-way is behaviourally identical to
+    # two-way. Mid-run source mutations (INT-21) are still caught: a changed source
+    # file present on both sides size/hash-differs and is reported one-way.
+    # Excludes still come from the upload function's exclude_arr (visible via
+    # dynamic scope, as before), applied AFTER select_arr to match the upload.
+    local -a verify_cmd=(rclone check "$verify_flag" --one-way --stats 5m --stats-one-line)
+    [[ ${#select_arr[@]} -gt 0 ]] && verify_cmd+=("${select_arr[@]}")
     [[ ${#exclude_arr[@]} -gt 0 ]] && verify_cmd+=("${exclude_arr[@]}")
     verify_cmd+=("$source_path" "${remote}${path}/")
     
@@ -560,14 +645,16 @@ _cloud_verify_upload() {
     # was also fragile against rclone output-format variation.
     if (( verify_result == 0 )); then
         cloud_log_info "[VERIFY] ✓ Passed in $(tu_format_elapsed "$verify_duration")"
+        return 0
     else
-        cloud_log_warn "[VERIFY] rclone check exit=$verify_result after $(tu_format_elapsed "$verify_duration")"
+        cloud_log_error "[VERIFY] rclone check exit=$verify_result after $(tu_format_elapsed "$verify_duration") — replica integrity NOT confirmed"
         # Surface the relevant rclone summary/diff lines so the operator
         # can tell whether this is a small benign race or a real fault.
         local diag_line
         while IFS= read -r diag_line; do
             [[ -n "$diag_line" ]] && cloud_log_warn "[VERIFY]   $diag_line"
         done < <(printf '%s\n' "$verify_output" | grep -E 'differences found|errors while checking|sizes differ|hashes differ|files missing|not in|ERROR' | head -20)
+        return "$verify_result"
     fi
 }
 

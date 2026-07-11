@@ -182,6 +182,10 @@ install:
 	# --- Ownership and permissions ---
 	chown -R root:backup $(INSTALL_DIR)
 	chmod 750 $(INSTALL_DIR)
+	# SEC-02: strip group/other-write recursively (mirror package-target's L107) so a
+	# backup-group member can't replace code the root nightly sources; self-heals
+	# umask-002 dir drift + world-readable config files. Capital X keeps exec bits.
+	chmod -R u=rwX,g=rX,o= $(INSTALL_DIR)
 	mkdir -p /var/log/vmbackup /run/vmbackup
 	chown root:backup /var/log/vmbackup /run/vmbackup
 	chmod 750 /var/log/vmbackup /run/vmbackup
@@ -261,6 +265,7 @@ lint-baseline:
 	     -not -path './vmbackup-manager/*' \
 	     -not -path './build/*' \
 	     -not -path './archive/*' \
+	     -not -path './tests/soak/*' \
 	  | LC_ALL=C sort \
 	  | xargs shellcheck -f gcc 2>&1 \
 	  | LC_ALL=C sort -u \
@@ -276,6 +281,7 @@ lint:
 	     -not -path './vmbackup-manager/*' \
 	     -not -path './build/*' \
 	     -not -path './archive/*' \
+	     -not -path './tests/soak/*' \
 	  | LC_ALL=C sort \
 	  | xargs shellcheck -f gcc 2>&1 \
 	  | LC_ALL=C sort -u \

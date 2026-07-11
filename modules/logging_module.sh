@@ -198,7 +198,12 @@ log_file_operation() {
             verification_data="size:${file_size_bytes}:mtime:${mtime}"
         fi
     elif [[ -d "$source_path" ]]; then
-        file_size_bytes=$(du -sb "$source_path" 2>/dev/null | cut -f1 || echo 0)
+        # FF-101: capture du|cut then default on empty/non-numeric. `|| echo 0`
+        # under pipefail APPENDS a second line on a partial du (a file vanishing
+        # mid-scan) -> "NNN\n0", which breaks the UNQUOTED audit INSERT and drops
+        # the file_operations row. A single-line numeric value can never do that.
+        file_size_bytes=$(du -sb "$source_path" 2>/dev/null | cut -f1)
+        [[ "$file_size_bytes" =~ ^[0-9]+$ ]] || file_size_bytes=0
         verification_data="directory"
     fi
     
@@ -306,8 +311,13 @@ log_config_event() {
 # STATE BACKUP & RECOVERY
 #################################################################################
 
-# Cleanup old log files
-# Called after state backup to ensure logs are archived before deletion
+# Cleanup old log files.
+# FF-102: logs are NOT guaranteed to be captured in a state backup before
+# deletion. This runs both from backup_state_files (after a snapshot) AND, per
+# OPS-01, directly from pre_backup_hook on a daily .last_rotation sentinel that is
+# independent of state-backup success (backup_state_files also returns early when
+# vmbackup.db is absent). Treat state-*.tar.gz as best-effort, not authoritative,
+# for recovering deleted logs.
 cleanup_old_logs() {
     local keep_days="${LOG_KEEP_DAYS:-30}"
     local max_bytes="${LOG_MAX_BYTES:-52428800}"
@@ -396,29 +406,98 @@ backup_state_files() {
         return 0
     fi
     
-    # Check if there's anything to backup
-    if [[ ! -d "${STATE_DIR}/manifests" ]]; then
+    # The catalogue DB is the state-of-record; gate on it. (Was ${STATE_DIR}/manifests,
+    # a directory the retired manifest subsystem no longer creates on ANY install, so
+    # the old skip was permanent and the snapshot was never written. STATE-DR-01.)
+    local db_path="${SQLITE_DB_PATH:-${STATE_DIR}/vmbackup.db}"
+    if [[ ! -f "$db_path" ]]; then
         log_debug "logging_module.sh" "backup_state_files" \
-            "No state files to backup yet"
+            "No catalogue DB yet ($db_path) — nothing to snapshot"
         return 0
     fi
     
-    # Create backup
-    tar -czf "$backup_file" \
-        -C "$STATE_DIR" \
-        --exclude='backups' \
-        --exclude='*.lock' \
-        . 2>/dev/null || {
-            log_warn "logging_module.sh" "backup_state_files" \
-                "State backup failed (non-fatal)"
-            return 0
-        }
+    # FF-180/FF-181: stage into a private scratch dir, then tar that. The catalogue
+    # is WAL-mode SQLite; tarring the live db+wal+shm risks a torn DB in the DR
+    # archive, so we place a consistent sqlite3 .backup snapshot into staging and
+    # never tar the live files. Staging is a quiescent private tree, so tar cannot
+    # hit "file changed as we read it" — any nonzero tar rc is therefore a real
+    # failure and is discarded, never published to $backup_file.
+    local staging
+    staging=$(mktemp -d "${backup_dir}/.staging.XXXXXX" 2>/dev/null)
+    if [[ -z "$staging" || ! -d "$staging" ]]; then
+        log_warn "logging_module.sh" "backup_state_files" \
+            "Could not create staging dir under ${backup_dir} (non-fatal)"
+        return 0
+    fi
+    
+    # Populate staging with every _state entry EXCEPT the backups/ dir, the locks/
+    # dir, lock files, and the live catalogue trio (the consistent snapshot is added
+    # separately below). Real copies (cp -a) keep staging quiescent so the tar-rc
+    # simplification holds.
+    local _sf _base
+    while IFS= read -r -d '' _sf; do
+        _base=$(basename "$_sf")
+        case "$_base" in
+            backups|locks|*.lock|vmbackup.db|vmbackup.db-wal|vmbackup.db-shm)
+                continue
+                ;;
+        esac
+        cp -a "$_sf" "$staging/" 2>/dev/null
+    done < <(find "$STATE_DIR" -maxdepth 1 -mindepth 1 -print0 2>/dev/null)
+    
+    # Place a consistent catalogue snapshot named vmbackup.db into staging. An empty
+    # file is a valid zero-page SQLite db, so .backup may succeed with an empty result;
+    # the [[ -s ]] guard routes an empty-or-failed snapshot to the raw-copy fallback,
+    # so a vmbackup.db member always ends up in staging (both arms produce the member).
+    local snap_ok=0
+    if command -v sqlite3 >/dev/null 2>&1; then
+        if sqlite3 "$db_path" ".backup '${staging}/vmbackup.db'" 2>/dev/null \
+           && [[ -s "${staging}/vmbackup.db" ]]; then
+            snap_ok=1
+        fi
+    fi
+    if [[ "$snap_ok" -ne 1 ]]; then
+        log_warn "logging_module.sh" "backup_state_files" \
+            "sqlite3 .backup unavailable or empty — raw-copying live catalogue (torn-DB risk)"
+        cp -a "$db_path" "${staging}/vmbackup.db" 2>/dev/null
+        local _dbside
+        for _dbside in "${db_path}-wal" "${db_path}-shm"; do
+            if [[ -e "$_dbside" ]]; then
+                cp -a "$_dbside" "${staging}/$(basename "$_dbside")" 2>/dev/null
+            fi
+        done
+    fi
+    
+    # Archive the quiescent staging tree to a tmp file, then atomically publish it.
+    # FF-181: a partial archive must never sit at $backup_file — the daily day-gate
+    # accepts whatever is there and locks it in for the day — so we mv only on success.
+    local tmp_file="${backup_file}.partial.$$"
+    local tar_rc
+    tar -czf "$tmp_file" -C "$staging" . 2>/dev/null
+    tar_rc=$?
+    if [[ "$tar_rc" -ne 0 ]]; then
+        log_warn "logging_module.sh" "backup_state_files" \
+            "State backup tar failed (rc=$tar_rc) — discarding partial (non-fatal)"
+        rm -f "$tmp_file" 2>/dev/null
+        rm -rf "$staging" 2>/dev/null
+        return 0
+    fi
+    if ! mv -f "$tmp_file" "$backup_file" 2>/dev/null; then
+        log_warn "logging_module.sh" "backup_state_files" \
+            "State backup publish (mv) failed — discarding partial (non-fatal)"
+        rm -f "$tmp_file" 2>/dev/null
+        rm -rf "$staging" 2>/dev/null
+        return 0
+    fi
+    rm -rf "$staging" 2>/dev/null
     
     log_info "logging_module.sh" "backup_state_files" \
         "Created state backup: $backup_file"
     
-    # Cleanup old backups
+    # Cleanup old backups + stale crash residue (aged staging/partial artifacts;
+    # >1 day so a live concurrent staging is never reaped)
     find "$backup_dir" -name "state-*.tar.gz" -mtime +"${STATE_BACKUP_KEEP_DAYS}" -delete 2>/dev/null
+    find "$backup_dir" -maxdepth 1 \( -name '.staging.*' -o -name '*.partial.*' \) -mtime +1 -exec rm -rf {} + 2>/dev/null
     
     # Cleanup old log files (after they've been captured in tar)
     cleanup_old_logs

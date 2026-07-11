@@ -21,8 +21,8 @@
 # already set (covers test harnesses and modules that source this twice).
 
 # UNI-321: idempotency guard — readonly assignment would error on re-source.
-# Constant-only lib (no functions); use variable-presence guard.
-[[ -n "${EXIT_OK+x}" ]] && return 0
+# Constant-only lib; FF-75: guard on FIRST and LAST constant so a leaked env EXIT_OK alone can't skip EXIT_ERROR..EXIT_DEPENDENCY.
+[[ -n "${EXIT_OK+x}" && -n "${EXIT_DEPENDENCY+x}" ]] && return 0
 readonly EXIT_OK=0
 readonly EXIT_ERROR=1
 readonly EXIT_CONFIG=2

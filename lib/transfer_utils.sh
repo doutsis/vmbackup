@@ -65,9 +65,9 @@ tu_parse_bytes() {
         return
     fi
     
-    # Remove 'iB' suffix and spaces: "489.967 MiB" -> "489.967M"
+    # FF-91: strip 'iB', comma separators, spaces, and a bare trailing 'B' (so "512 B" and "1,234,567" parse to bytes, not 0)
     local clean
-    clean=$(echo "$str" | sed 's/iB//g; s/ //g')
+    clean=$(echo "$str" | sed 's/iB//g; s/,//g; s/ //g; s/B$//')
     
     numfmt --from=iec "$clean" 2>/dev/null || echo 0
 }
@@ -289,7 +289,7 @@ tu_get_replication_log_path() {
     local endpoint="$2"
     local timestamp="${3:-$(date '+%Y-%m-%d_%H%M%S')}"
     
-    local state_dir="${STATE_DIR:-${BACKUP_PATH}_state}"
+    local state_dir="${STATE_DIR:-${BACKUP_PATH%/}/_state}"
     local log_dir="${state_dir}/replication_logs/${type}"
     
     mkdir -p "$log_dir" 2>/dev/null

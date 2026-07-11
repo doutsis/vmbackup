@@ -33,7 +33,10 @@ declare -F pu_normalise_path >/dev/null 2>&1 && return 0
 #   "/foo/" → "/foo"   "/foo" → "/foo"   ""     → ""
 pu_strip_trailing_slash() {
   local p="${1:-}"
-  printf '%s\n' "${p%/}"
+  # FF-78: strip ALL trailing slashes, not just one — the single ${p%/} left
+  # 'base//' as 'base/', so pu_join_paths still emitted a double slash.
+  while [[ "$p" == */ ]]; do p="${p%/}"; done
+  printf '%s\n' "$p"
 }
 
 # pu_ensure_trailing_slash <path> — idempotent add.
@@ -82,6 +85,10 @@ pu_normalise_path() {
 # segment, then joins with single `/`. Prevents double-slashes.
 pu_join_paths() {
   local base="${1:-}"
+  # FF-78: fail closed on an empty base. An unset/empty base would otherwise make
+  # the first segment absolute ('/seg'), retargeting a delete/retention join at the
+  # filesystem root; reject rather than emit a root-anchored path.
+  [[ -z "$base" ]] && return 1
   shift || true
   local out
   out=$(pu_strip_trailing_slash "$base")

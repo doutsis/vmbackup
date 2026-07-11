@@ -227,6 +227,11 @@ _RESTORE_SESSION_ID=""
 # interrupted runs).
 _VMRESTORE_LOCK_VM=""
 declare -a _VMRESTORE_STAGING_DIRS=()
+# F-vmr2514: a vmconfig.virtnbdbackup.0.xml provisioned INTO the backup/archive
+# dir for archived chains (restore_vm) must not survive a die/signal before the
+# success-path rm — the backup tree is read-only. Trap-tracked so any exit
+# restores it. Empty unless restore_vm provisioned one this run.
+_VMRESTORE_PROVISIONED_VMCONFIG=""
 
 _vmrestore_cleanup() {
     local rc=$?
@@ -239,6 +244,17 @@ _vmrestore_cleanup() {
             rm -rf "$d" 2>/dev/null || true
         done
         _VMRESTORE_STAGING_DIRS=()
+    fi
+    # F-vmr2514: remove a provisioned vmconfig left in the backup/archive dir by
+    # an interrupted/failed restore_vm (the backup tree is read-only). The happy
+    # path already rm's it at the end of the else-block and clears this global,
+    # so on success this is a no-op. The -f guard + the "this-run-only" creation
+    # invariant (provisioning runs only when no vmconfig.virtnbdbackup.*.xml
+    # pre-existed) ensure we never delete a genuine backup artefact.
+    if [[ -n "${_VMRESTORE_PROVISIONED_VMCONFIG:-}" && -f "$_VMRESTORE_PROVISIONED_VMCONFIG" ]]; then
+        log_warn "vmrestore.sh" "_vmrestore_cleanup" "Removing provisioned vmconfig on exit (rc=$rc): $_VMRESTORE_PROVISIONED_VMCONFIG"
+        rm -f "$_VMRESTORE_PROVISIONED_VMCONFIG" 2>/dev/null || true
+        _VMRESTORE_PROVISIONED_VMCONFIG=""
     fi
     # Release lock if still held
     if [[ -n "$_VMRESTORE_LOCK_VM" && -n "${LOCK_DIR:-}" ]]; then
@@ -412,13 +428,22 @@ resolve_backup_path() {
     local instance
     instance=$(resolve_config_instance "${OPT_CONFIG_INSTANCE:-}" "${VMBACKUP_INSTANCE:-}")
     local conf
-    conf=$(get_config_file "$instance")
+    # R1: get_config_file validates the instance name; a non-zero return means
+    # an invalid/unsafe --config-instance and must be a hard failure (it would
+    # otherwise feed an attacker-influenced path to the resolver below).
+    if ! conf=$(get_config_file "$instance"); then
+        die "Invalid config instance '$instance' (allowed: letters, digits, . _ - ; no path separators)" "resolve_backup_path" "$EXIT_CONFIG"
+    fi
     if [[ ! -f "$conf" && "$instance" != "default" ]]; then
         die "Config instance '$instance' not found: $conf" "resolve_backup_path" "$EXIT_CONFIG"
     fi
     if [[ -f "$conf" ]]; then
+        # VMR3/X1: resolve BACKUP_PATH with the same shell semantics vmbackup
+        # uses (it sources the conf), not a regex scrape, so variable refs and
+        # spaces agree between backup and restore. $conf is the validated,
+        # in-tree conf (see get_config_file above).
         local val
-        val=$(grep -oP '^\s*BACKUP_PATH\s*=\s*["'\''"]?\K[^"'\''"\s]+' "$conf" 2>/dev/null || true)
+        val=$(resolve_backup_path_shell "$conf" 2>/dev/null || true)
         if [[ -n "$val" ]]; then
             echo "$val"
             return
@@ -569,18 +594,51 @@ is_accumulate() { has_backup_data "$1"; }
 
 # ── Path Resolution ─────────────────────────────────────────────────────────
 
-# List period subdirectories (newest first).
-# UNI-007 (Phase 3 commit 2): delegates enumeration to lib/period.sh.
-# Periodic-only by design (D1) — accumulate VMs are handled upstream by
-# is_accumulate() / has_backup_data() and never reach this function for
-# period iteration. Caller sorts (R2).
+# List period subdirectories, newest first, sorted by actual *.data recency (see body).
+# Delegates enumeration to lib/period.sh. Periodic-only by design — accumulate VMs are
+# handled upstream by is_accumulate() / has_backup_data() and never reach this function.
 list_periods() {
     local vm_dir="$1"
-    get_vm_periods "$vm_dir" | sort -rV
+    # "Newest first" by ACTUAL RECENCY (newest *.data mtime within each period),
+    # NOT a lexical `sort -rV` on the period-id string. When rotation formats
+    # coexist — daily YYYYMMDD / monthly YYYYMM alongside weekly YYYY-Www, e.g.
+    # after a rotation-policy change or a normal rollover — version-sort ranks a
+    # same-year numeric id ABOVE the weekly id (a digit run outranks the "-W"),
+    # so `sort -rV` would elect a STALE numeric period over a newer weekly one and
+    # restore-latest would silently resolve to a wrong (older) restore point.
+    # Recency is format-agnostic and correct. Out-of-policy periods are left for
+    # retention / orphan-retention to age out — the restore path must NOT depend
+    # on their absence. Periods with no *.data get mtime 0 (sorted last); callers
+    # that require data still skip them via has_backup_data().
+    local _p _mt
+    while IFS= read -r _p; do
+        [[ -n "$_p" ]] || continue
+        _mt=$(find "$vm_dir/$_p" -maxdepth 1 -type f -name '*.data' -printf '%T@\n' 2>/dev/null \
+                | sort -rn | head -1)
+        printf '%s %s\n' "${_mt:-0}" "$_p"
+    done < <(get_vm_periods "$vm_dir") \
+        | sort -k1,1nr -k2,2Vr \
+        | awk '{print $2}'
 }
 
 # Resolve the directory containing .data files for a VM
 # Accumulate: VM root. Period-based: specified or latest period.
+# 118-spaces: resolve a VM's backup folder from its REAL libvirt name. Prefer the
+# slug+hash token (vm_fs_name); fall back to the pre-118 legacy slug
+# (vm_fs_name_legacy) for a folder that MIG-01 has not migrated yet (the rc3
+# transition window). Echoes the existing dir (rc 0), or nothing (rc 1). -u-clean.
+resolve_vm_backup_dir() {
+    local real="${1:-}" base="${2:-}"
+    local d tok
+    if tok=$(vm_fs_name "$real" 2>/dev/null); then
+        d="$base/$tok"
+        [[ -d "$d" ]] && { printf '%s' "$d"; return 0; }
+    fi
+    d="$base/$(vm_fs_name_legacy "$real")"
+    [[ -d "$d" ]] && { printf '%s' "$d"; return 0; }
+    return 1
+}
+
 resolve_data_dir() {
     local vm_dir="$1" period="${2:-}"
 
@@ -596,29 +654,63 @@ resolve_data_dir() {
         return
     fi
 
-    # No period specified — accumulate uses VM root
-    if is_accumulate "$vm_dir"; then
+    # No period specified.
+    # FF-192: a VM switched from accumulate to periodic keeps its VM-root *.data
+    # (rotation writes accumulate data at the root; migrate_layout renames folders
+    # only — nothing migrates root data), so testing is_accumulate FIRST let the
+    # stale root chain win forever and silently ignored newer period chains.
+    # Resolve by DATA RECENCY instead (consistent with list_periods): find the
+    # newest period that has data, then pick whichever of {VM root, that period}
+    # carries the newest *.data. Warn when both coexist so --period can override.
+    local _root_acc=false
+    is_accumulate "$vm_dir" && _root_acc=true
+
+    # Compute the recency-ordered period list ONCE (list_periods forks a find(1)
+    # per period) and reuse it for the no-data fallback below.
+    local -a _periods
+    mapfile -t _periods < <(list_periods "$vm_dir")
+    local _p _newest_period=""
+    for _p in "${_periods[@]}"; do
+        [[ -n "$_p" ]] || continue
+        if has_backup_data "$vm_dir/$_p"; then
+            _newest_period="$vm_dir/$_p"
+            break
+        fi
+    done
+
+    if [[ "$_root_acc" == true && -n "$_newest_period" ]]; then
+        # Mixed layout — pick newest by *.data mtime, warn either way.
+        local _root_mt _per_mt
+        _root_mt=$(find "$vm_dir" -maxdepth 1 -type f -name '*.data' -printf '%T@\n' 2>/dev/null | sort -rn | head -1)
+        _per_mt=$(find "$_newest_period" -maxdepth 1 -type f -name '*.data' -printf '%T@\n' 2>/dev/null | sort -rn | head -1)
+        _root_mt="${_root_mt%%.*}"; _root_mt="${_root_mt:-0}"
+        _per_mt="${_per_mt%%.*}"; _per_mt="${_per_mt:-0}"
+        if (( _per_mt > _root_mt )); then
+            log_warn "vmrestore.sh" "resolve_data_dir" "Mixed layout for '$(basename "$vm_dir")': VM-root accumulate data AND newer period data both present; restoring newest period '$(basename "$_newest_period")' (use --period to override)"
+            echo "$_newest_period"
+        else
+            log_warn "vmrestore.sh" "resolve_data_dir" "Mixed layout for '$(basename "$vm_dir")': VM-root accumulate data AND period subdirectories both present; restoring newest VM-root data (use --period to select a period)"
+            echo "$vm_dir"
+        fi
+        return
+    fi
+
+    # Pure accumulate — VM root.
+    if [[ "$_root_acc" == true ]]; then
         echo "$vm_dir"
         return
     fi
 
-    # Pick the newest period that has backup data.
-    # Empty period dirs (created by rotation before first backup) are skipped.
-    local _p
-    while IFS= read -r _p; do
-        [[ -n "$_p" ]] || continue
-        if has_backup_data "$vm_dir/$_p"; then
-            echo "$vm_dir/$_p"
-            return
-        fi
-    done < <(list_periods "$vm_dir")
+    # Pure periodic — newest period with data.
+    if [[ -n "$_newest_period" ]]; then
+        echo "$_newest_period"
+        return
+    fi
 
-    # Fallback: no period has data — return the newest dir anyway
-    # so the caller gets a meaningful error path
-    local latest
-    latest=$(list_periods "$vm_dir" | head -1)
-    if [[ -n "$latest" ]]; then
-        echo "$vm_dir/$latest"
+    # Fallback: no period has data — return the newest dir anyway so the caller
+    # gets a meaningful error path.
+    if [[ -n "${_periods[0]:-}" ]]; then
+        echo "$vm_dir/${_periods[0]}"
     else
         log_error "vmrestore.sh" "resolve_data_dir" "No period directories in: $vm_dir"
         return 1
@@ -665,9 +757,17 @@ list_vms() {
                 local _ch_line _ch_vm _ch_active _ch_archived _ch_purged _ch_chk _ch_rest _ch_brk _ch_sz _ch_first _ch_last
                 while IFS='|' read -r _ch_vm _ch_active _ch_archived _ch_purged _ch_chk _ch_rest _ch_brk _ch_sz _ch_first _ch_last; do
                     [[ -z "$_ch_vm" || "$_ch_vm" == "vm_name" ]] && continue
-                    _VMRESTORE_CH_ACTIVE["$_ch_vm"]="${_ch_active:-0}"
-                    _VMRESTORE_CH_BROKEN["$_ch_vm"]="${_ch_brk:-0}"
-                    _VMRESTORE_CH_LAST["$_ch_vm"]="${_ch_last:-(never)}"
+                    # FF-165: the walker keys the row callback by the on-disk folder
+                    # TOKEN (vm_fs_name slug+hash for any spaced/special-char name),
+                    # but chain_health.vm_name is the REAL libvirt name. Key the map
+                    # by vm_fs_name(real) so the $vm lookup at the "Chains:" line hits
+                    # for spaced VMs (vm_fs_name is identity for fs-safe names).
+                    local _ch_key
+                    _ch_key=$(vm_fs_name "$_ch_vm" 2>/dev/null) || _ch_key="$_ch_vm"
+                    [[ -n "$_ch_key" ]] || _ch_key="$_ch_vm"
+                    _VMRESTORE_CH_ACTIVE["$_ch_key"]="${_ch_active:-0}"
+                    _VMRESTORE_CH_BROKEN["$_ch_key"]="${_ch_brk:-0}"
+                    _VMRESTORE_CH_LAST["$_ch_key"]="${_ch_last:-(never)}"
                 done < <(sqlite_query_chain_health "" pipe 2>/dev/null)
             else
                 log_warn "vmrestore.sh" "list_vms" \
@@ -704,30 +804,56 @@ _list_vms_vm_cb() {
     local periods=()
     local is_acc=false
 
-    if is_accumulate "$vm_dir"; then
+    # FF-192 (twin of resolve_data_dir): enumerate periods even when the VM root
+    # carries accumulate *.data, so a mixed layout (an accumulate→periodic switch
+    # leaves stale VM-root data behind) still surfaces the newer periods here
+    # instead of hiding them, and the displayed source tracks resolve_data_dir's
+    # data-recency choice.
+    local _root_acc=false
+    is_accumulate "$vm_dir" && _root_acc=true
+    mapfile -t periods < <(list_periods "$vm_dir")
+
+    # FF-164: pick the FIRST period that has data from the recency-sorted
+    # list_periods output — NOT a `stat -c %Y` max over period DIRECTORY mtimes,
+    # which any later write in an OLDER period (retention prune / archive collapse
+    # / checkpoint cleanup) skews, making --list render from the wrong period.
+    local _newest_period="" _p
+    for _p in "${periods[@]}"; do
+        [[ -n "$_p" ]] || continue
+        if has_backup_data "$vm_dir/$_p"; then
+            _newest_period="$vm_dir/$_p"
+            break
+        fi
+    done
+
+    if [[ "$_root_acc" == true && -n "$_newest_period" ]]; then
+        # Mixed layout: choose newest by *.data mtime (matches resolve_data_dir),
+        # keep periods populated so the "Periods:" line still lists them.
+        local _root_mt _per_mt
+        _root_mt=$(find "$vm_dir" -maxdepth 1 -type f -name '*.data' -printf '%T@\n' 2>/dev/null | sort -rn | head -1)
+        _per_mt=$(find "$_newest_period" -maxdepth 1 -type f -name '*.data' -printf '%T@\n' 2>/dev/null | sort -rn | head -1)
+        _root_mt="${_root_mt%%.*}"; _root_mt="${_root_mt:-0}"
+        _per_mt="${_per_mt%%.*}"; _per_mt="${_per_mt:-0}"
+        if (( _per_mt > _root_mt )); then
+            data_dir="$_newest_period"
+        else
+            data_dir="$vm_dir"
+            is_acc=true
+        fi
+    elif [[ "$_root_acc" == true ]]; then
+        # Pure accumulate — VM root; no data-bearing periods to list.
         data_dir="$vm_dir"
         is_acc=true
+        periods=()
+    elif [[ -n "$_newest_period" ]]; then
+        # Pure periodic — newest period with data.
+        data_dir="$_newest_period"
+    elif [[ ${#periods[@]} -gt 0 ]]; then
+        # Periods exist but none has data yet (rotation before first backup);
+        # show the newest so the block still renders (unchanged from prior).
+        data_dir="$vm_dir/${periods[0]:-}"
     else
-        mapfile -t periods < <(list_periods "$vm_dir")
-        if [[ ${#periods[@]} -gt 0 ]]; then
-            # Pick the most recently modified period that has backup data.
-            # Empty period dirs (created by rotation before first backup) are skipped.
-            local _latest_mt=0
-            local _p
-            for _p in "${periods[@]}"; do
-                local _pdir="$vm_dir/$_p"
-                has_backup_data "$_pdir" || continue
-                local _mt
-                _mt=$(stat -c '%Y' "$_pdir" 2>/dev/null) || continue
-                if (( _mt > _latest_mt )); then
-                    _latest_mt=$_mt
-                    data_dir="$_pdir"
-                fi
-            done
-            [[ -z "$data_dir" ]] && data_dir="$vm_dir/${periods[0]}"
-        else
-            return 1
-        fi
+        return 1
     fi
 
     local btype size tpm_tag="" disk_tag=""
@@ -1059,17 +1185,25 @@ create_pit_staging() {
     local data_dir="$1" target_cp="$2"
     local staging=""
 
-    # Prefer TMPDIR, fall back to a subdir of the backup parent
+    # Prefer TMPDIR, fall back to a subdir of the backup parent.
+    # FF-166: rc-check mktemp -d. On failure staging='' and the ln/cp below would
+    # symlink backup .data files and copy vmconfig into '/' as root, then return 0
+    # (defeating the caller's `|| die`). Fail closed instead.
     if [[ -d "${TMPDIR:-/tmp}" && -w "${TMPDIR:-/tmp}" ]]; then
-        staging=$(mktemp -d "${TMPDIR:-/tmp}/vmrestore-pit-XXXXXX")
+        staging=$(mktemp -d "${TMPDIR:-/tmp}/vmrestore-pit-XXXXXX") || staging=""
     else
-        staging=$(mktemp -d "$(dirname "$data_dir")/.vmrestore-pit-XXXXXX")
+        staging=$(mktemp -d "$(dirname "$data_dir")/.vmrestore-pit-XXXXXX") || staging=""
+    fi
+    if [[ -z "$staging" || ! -d "$staging" ]]; then
+        log_error "vmrestore.sh" "create_pit_staging" "Could not create PIT staging directory (mktemp failed) — refusing to stage into '/'"
+        return 1
     fi
 
-    # UNI-010: Track this dir so the EXIT/SIGINT trap removes it on
-    # interrupt. Success-path callers still call cleanup_pit_staging
-    # directly (and may un-track via cleanup_pit_staging's wrapper).
-    _VMRESTORE_STAGING_DIRS+=("$staging")
+    # UNI-010 / FF-193: the EXIT/SIGINT trap consumes _VMRESTORE_STAGING_DIRS from
+    # the PARENT shell, but create_pit_staging runs inside the caller's $() command
+    # substitution — an append here lands in the subshell and never reaches the
+    # trap. The two call sites append $pit_input_dir after capture (mirroring the
+    # clone-staging append), so staging tracking is done there, not here.
 
     # Symlink .data files
     local f
@@ -1085,23 +1219,21 @@ create_pit_staging() {
     if [[ -f "$target_vmconfig" ]]; then
         cp "$target_vmconfig" "$staging/"
     else
-        # Fallback: find vmconfig by checkpoint number from config/ dir.
-        # Config files sorted oldest-first by name = checkpoint order (0, 1, 2, ...).
-        local _fallback="" _cfg_dir=""
-        for _search in "$data_dir/config" "$(dirname "$data_dir")/config"; do
-            [[ -d "$_search" ]] && _cfg_dir="$_search" && break
-        done
-        if [[ -n "$_cfg_dir" ]]; then
-            _fallback=$(ls -1 "$_cfg_dir"/*.xml 2>/dev/null | sort | sed -n "$((target_cp + 1))p")
-        fi
-        if [[ -n "$_fallback" && -f "$_fallback" ]]; then
-            cp "$_fallback" "$staging/vmconfig.virtnbdbackup.${target_cp}.xml"
-            log_warn "vmrestore.sh" "create_pit_staging" "vmconfig.virtnbdbackup.${target_cp}.xml not found; using fallback: $(basename "$_fallback")"
-        else
-            log_error "vmrestore.sh" "create_pit_staging" "No vmconfig found for checkpoint $target_cp"
-            rm -rf "$staging"
-            return 1
-        fi
+        # FF-194: the per-checkpoint vmconfig.virtnbdbackup.<cp>.xml is the only
+        # domain XML that reliably describes THIS checkpoint's disk topology. The
+        # former fallback picked a substitute from config/*.xml by checkpoint
+        # ORDINAL (`sort | sed -n "$((cp+1))p"`), assuming config files are one
+        # per checkpoint, oldest-first. That contract is false: vmbackup's
+        # backup_vm_config writes change-triggered ${vm}_config_<ts>.xml plus a
+        # ${vm}_config_<YYYYMM>_FIRST marker ('_FIRST' sorts AFTER same-month
+        # timestamps), so the ordinal selects an arbitrary, wrong-vintage XML.
+        # PIT staging is entered precisely BECAUSE this checkpoint's disk set
+        # differs from latest, so a wrong-topology config would hand
+        # virtnbdrestore a mismatched disk set — a silent wrong/partial restore.
+        # No sound checkpoint->config map exists here, so fail closed.
+        log_error "vmrestore.sh" "create_pit_staging" "No per-checkpoint vmconfig (vmconfig.virtnbdbackup.${target_cp}.xml) for checkpoint ${target_cp}; refusing to guess a substitute domain XML from config/ (topology may differ)"
+        rm -rf "$staging"
+        return 1
     fi
 
     echo "$staging"
@@ -1112,6 +1244,54 @@ cleanup_pit_staging() {
     if [[ -n "$staging_dir" && -d "$staging_dir" && "$staging_dir" == *vmrestore-pit-* ]]; then
         rm -rf "$staging_dir"
     fi
+}
+
+# P1: scan a chain dir's *.data files ONCE and group disks by checkpoint number,
+# so show_restore_points() can look a checkpoint's disk set up from memory
+# instead of calling enumerate_disks_at_checkpoint() (a fresh find over the whole
+# dir) once PER checkpoint. That per-checkpoint rescan is the O(checkpoints^2)
+# cost behind a slow `--list-restore-points` on busy VMs (~102s measured for a
+# 110-checkpoint VM). Populates the global _RP_DISKS_BY_CP: cp_num -> the same
+# sorted, comma-separated disk string enumerate_disks_at_checkpoint() returns,
+# so the listing output is byte-identical.
+#
+# This is a PRIVATE helper for show_restore_points() only. The shared
+# enumerate_disks_at_checkpoint() (11 call sites incl. PIT staging, --disk
+# validation, latest-cp detection) is deliberately left untouched.
+#
+# Reset at the top of every call: show_restore_points() runs once per period AND
+# once per archived chain, so a stale map must never leak between chains.
+declare -gA _RP_DISKS_BY_CP=()
+_rp_index_disks_by_cp() {
+    local data_dir="$1"
+    _RP_DISKS_BY_CP=()
+    local f fname dev cp
+    local -A _seen=()
+    while IFS= read -r -d '' f; do
+        fname=$(basename "$f")
+        dev=""; cp=""
+        case "$fname" in
+            # CP0 is satisfied by either the full base or an offline copy
+            # (mirrors enumerate_disks_at_checkpoint's cp_num==0 handling).
+            *.full.data)                dev="${fname%.full.data}"; cp="0" ;;
+            *.copy.data)                dev="${fname%.copy.data}"; cp="0" ;;
+            *.inc.virtnbdbackup.*.data) dev="${fname%%.*}"; cp="${fname%.data}"; cp="${cp##*.virtnbdbackup.}" ;;
+        esac
+        [[ -z "$dev" || -z "$cp" ]] && continue
+        [[ -n "${_seen[$cp:$dev]+x}" ]] && continue
+        _seen[$cp:$dev]=1
+        if [[ -n "${_RP_DISKS_BY_CP[$cp]+x}" ]]; then
+            _RP_DISKS_BY_CP[$cp]+=$'\n'"$dev"
+        else
+            _RP_DISKS_BY_CP[$cp]="$dev"
+        fi
+    done < <(find "$data_dir" -maxdepth 1 -type f -name '*.data' -print0 2>/dev/null)
+    # Normalise each checkpoint's disk list to the exact "sorted, comma+space"
+    # form enumerate_disks_at_checkpoint() emits.
+    local k
+    for k in "${!_RP_DISKS_BY_CP[@]}"; do
+        _RP_DISKS_BY_CP[$k]=$(printf '%s\n' "${_RP_DISKS_BY_CP[$k]}" | sort | paste -sd, | sed 's/,/, /g')
+    done
 }
 
 show_restore_points() {
@@ -1126,6 +1306,9 @@ show_restore_points() {
     case "$btype" in
         incremental)
             if [[ -d "$data_dir/checkpoints" ]]; then
+                # P1: one scan up front, then O(1) lookups per checkpoint
+                # instead of a fresh find per checkpoint.
+                _rp_index_disks_by_cp "$data_dir"
                 while IFS= read -r -d '' f; do
                     [[ -f "$f" ]] || continue
                     local name num ftime ptype disks
@@ -1134,7 +1317,7 @@ show_restore_points() {
                     ftime=$(stat -c '%y' "$f" 2>/dev/null | cut -d. -f1)
                     ptype="Incremental"
                     [[ "$num" == "0" ]] && ptype="FULL (base)"
-                    disks=$(enumerate_disks_at_checkpoint "$data_dir" "$num")
+                    disks="${_RP_DISKS_BY_CP[$num]:-}"
                     printf "  %-15s   %-19s  %-15s %s\n" "$num" "$ftime" "$ptype" "$disks"
                     ((count++))
                 done < <(find "$data_dir/checkpoints" -maxdepth 1 -name "virtnbdbackup.*.xml" -print0 2>/dev/null | sort -zV)
@@ -1202,6 +1385,108 @@ refresh_storage_pool() {
     fi
 }
 
+# ── Post-Restore Integrity Check (race-tolerant) ─────────────────────────────
+# Classifies a single `qemu-img check` of a restored qcow2 into one of three
+# verdicts so callers never collapse "structurally corrupt" and "could not be
+# checked" into the same failure. The restore engine (virtnbdrestore) has just
+# written and closed this qcow2, and its qcow2 "write" lock is not released
+# instantaneously — a helper fd lingers ~1-2s. A `qemu-img check` fired in that
+# same second loses the race and fails rc=1 with `Failed to get shared "write"
+# lock / Is another process using the image?` — a verdict on the LOCK, not the
+# image (reproduced 5/5 at product level; the image checks clean ~1-2s later).
+# A bare `qemu-img check ... && ok || corrupt` would flag that perfectly good
+# image as corrupt, so rc=1 with lock text is RETRIED (bounded) rather than
+# trusted; only rc=2 is CORRUPT.
+#
+# Fail-closed contract: anything we cannot positively read as clean — internal
+# errors, unexpected rcs, an exhausted lock-settle budget, or an empty path — is
+# UNVERIFIABLE (return 1), never a silent PASS. The one deliberate exception is
+# rc=63 (format does not support checking): "not checkable" is not evidence of
+# corruption, so it PASSes with a logged warning rather than failing closed.
+# rc=63 is unreachable for qcow2 restores (always checkable); the arm exists
+# only to keep the contract honest for a non-qcow2 format.
+#
+# Sets global _QIMG_VERDICT ∈ {PASS,CORRUPT,UNVERIFIABLE} for the caller.
+# Args:    $1 = qcow2 image path
+# Returns: 0 = PASS (structurally sound), 1 = CORRUPT or UNVERIFIABLE
+_qcow_check_classified() {
+    local _f="${1:-}"
+    local _out _rc _flat _last
+    local _attempt=0
+    local _max_attempts=8
+    local _settle_secs=1
+    local _cap=2000
+    local _tailcap=200
+    _QIMG_VERDICT=""
+
+    # Fail closed on an empty path BEFORE probing: an argless future caller must
+    # fail this check gracefully, not abort the whole restore binary (rc 127) on
+    # a bare `local _f="$1"` under `set -uo pipefail`. Today's three callers all
+    # pass proven-non-empty paths; this guards the contract, not those callers.
+    if [[ -z "$_f" ]]; then
+        log_error "vmrestore.sh" "_qcow_check_classified" "integrity check called with empty image path; integrity COULD NOT BE VERIFIED"
+        _QIMG_VERDICT="UNVERIFIABLE"
+        return 1
+    fi
+
+    while (( _attempt < _max_attempts )); do
+        _attempt=$(( _attempt + 1 ))
+        _out=$(qemu-img check "$_f" 2>&1)
+        _rc=$?
+        # Log-safe diagnostic: one bounded line. When truncating keep the head
+        # (where the ERROR body starts) AND the final line, both capped, so
+        # total stays bounded.
+        _flat="${_out//$'\n'/ | }"
+        if (( ${#_flat} > _cap )); then
+            _last="${_out##*$'\n'}"
+            (( ${#_last} > _tailcap )) && _last="...${_last: -_tailcap}"
+            _flat="${_flat:0:$_cap} [output truncated: $(( ${#_flat} - _cap )) more chars] | tail: ${_last}"
+        fi
+        case "$_rc" in
+            0)
+                _QIMG_VERDICT="PASS"
+                return 0
+                ;;
+            3)
+                log_info "vmrestore.sh" "_qcow_check_classified" "Integrity OK with leaked clusters (non-fatal): $_f"
+                _QIMG_VERDICT="PASS"
+                return 0
+                ;;
+            63)
+                log_warn "vmrestore.sh" "_qcow_check_classified" "Integrity check unsupported for this image format; structural verification skipped: $_f"
+                _QIMG_VERDICT="PASS"
+                return 0
+                ;;
+            2)
+                log_error "vmrestore.sh" "_qcow_check_classified" "qemu-img check rc=2 CORRUPT: $_f :: $_flat"
+                _QIMG_VERDICT="CORRUPT"
+                return 1
+                ;;
+            1)
+                if [[ "$_out" == *lock* || "$_out" == *"Is another process using the image"* ]]; then
+                    log_info "vmrestore.sh" "_qcow_check_classified" "qemu-img write-lock contention (attempt $_attempt/$_max_attempts), settling: $_f :: $_flat"
+                    (( _attempt < _max_attempts )) && sleep "$_settle_secs"
+                    continue
+                fi
+                log_error "vmrestore.sh" "_qcow_check_classified" "qemu-img check rc=1 internal error, integrity UNVERIFIABLE: $_f :: $_flat"
+                _QIMG_VERDICT="UNVERIFIABLE"
+                return 1
+                ;;
+            *)
+                log_error "vmrestore.sh" "_qcow_check_classified" "qemu-img check unexpected rc=$_rc, integrity UNVERIFIABLE: $_f :: $_flat"
+                _QIMG_VERDICT="UNVERIFIABLE"
+                return 1
+                ;;
+        esac
+    done
+
+    # Lock never released within the settle window (max_attempts-1 sleeps ×
+    # settle_secs — the final attempt skips its sleep).
+    log_error "vmrestore.sh" "_qcow_check_classified" "qemu-img write-lock did not release after ~$(( (_max_attempts - 1) * _settle_secs ))s (rc=1, lock); integrity COULD NOT BE VERIFIED: $_f :: $_flat"
+    _QIMG_VERDICT="UNVERIFIABLE"
+    return 1
+}
+
 # ── TPM Restore ──────────────────────────────────────────────────────────────
 
 restore_tpm() {
@@ -1239,36 +1524,67 @@ restore_tpm() {
         return 0
     fi
 
+    # FF-10: validate the SOURCE before mutating the target. A legacy flat
+    # layout (tpm-state/ with no tpm2/ subdir) cannot be restored by the copy
+    # block below; the pre-fix code moved the working state aside, created an
+    # empty target and still logged success. Fail closed so the caller renders
+    # ACTION-REQUIRED + "TPM ✗" and existing state is left untouched.
+    if [[ ! -d "$tpm_dir/tpm2" ]]; then
+        log_error "vmrestore.sh" "restore_tpm" \
+            "TPM backup at $tpm_dir has no tpm2/ subdirectory (unsupported/legacy layout) — TPM NOT restored; existing state untouched"
+        return 1
+    fi
+
+    # UNI-006: validate the source state before copying — guards against a
+    # half-written backup (no tpm2* files, or empty tpm2* files) silently
+    # restoring to a broken state. Runs BEFORE any target mutation (FF-10).
+    if ! validate_tpm_backup "$tpm_dir"; then
+        log_error "vmrestore.sh" "restore_tpm" \
+            "TPM backup at $tpm_dir failed validation (missing or empty tpm2* files)"
+        return 1
+    fi
+
     log_info "vmrestore.sh" "restore_tpm" "Restoring TPM for $vm_name (UUID: $vm_uuid)"
 
-    # Preserve existing state
+    # Preserve existing state. bak stays empty unless we actually move state
+    # aside, so the error paths below can name it only when it exists (set -u).
+    local bak=""
     if [[ -d "$target" && -n "$(ls -A "$target" 2>/dev/null)" ]]; then
-        local bak="${target}.pre-restore-$(date +%s)"
+        bak="${target}.pre-restore-$(date +%s)"
         log_warn "vmrestore.sh" "restore_tpm" "Backing up existing TPM to $bak"
-        mv "$target" "$bak"
+        if ! mv "$target" "$bak"; then
+            log_error "vmrestore.sh" "restore_tpm" \
+                "Failed to move existing TPM state $target aside — existing state is unmodified; TPM NOT restored"
+            return 1
+        fi
     fi
 
     # UUID dir: root:root 711 (matches system layout)
-    mkdir -p "$target"
-    chown root:root "$target"
-    chmod 711 "$target"
+    if ! { mkdir -p "$target" && chown root:root "$target" && chmod 711 "$target"; }; then
+        if [[ -n "$bak" ]]; then
+            log_error "vmrestore.sh" "restore_tpm" \
+                "Failed to create/prepare $target — previous TPM state preserved at $bak (restore it manually); TPM NOT restored"
+        else
+            log_error "vmrestore.sh" "restore_tpm" \
+                "Failed to create/prepare $target — TPM NOT restored"
+        fi
+        return 1
+    fi
 
     # tpm2/ subdir: tss:tss 700 (matches system layout).
-    # UNI-006: validate the source state before copying — guards against a
-    # half-written backup (no tpm2* files, or empty tpm2* files) silently
-    # restoring to a broken state.
-    if [[ -d "$tpm_dir/tpm2" ]]; then
-        if ! validate_tpm_backup "$tpm_dir"; then
+    if ! { cp -a "$tpm_dir/tpm2" "$target/" && chown -R tss:tss "$target/tpm2" && chmod 700 "$target/tpm2"; }; then
+        if [[ -n "$bak" ]]; then
             log_error "vmrestore.sh" "restore_tpm" \
-                "TPM backup at $tpm_dir failed validation (missing or empty tpm2* files)"
-            return 1
+                "Failed to copy TPM state into $target — previous TPM state preserved at $bak (restore it manually); TPM NOT restored"
+        else
+            log_error "vmrestore.sh" "restore_tpm" \
+                "Failed to copy TPM state into $target — TPM NOT restored"
         fi
-        cp -a "$tpm_dir/tpm2" "$target/"
-        chown -R tss:tss "$target/tpm2"
-        chmod 700 "$target/tpm2"
+        return 1
     fi
 
     log_info "vmrestore.sh" "restore_tpm" "TPM state restored: $target"
+    return 0
 }
 
 # ── Chain-Endpoint NVRAM Helpers ──────────────────────────────────────────────
@@ -1370,6 +1686,7 @@ define_new_identity() {
     # Build sed expressions: rename, strip UUID + MACs, update NVRAM path
     local -a sed_args=(
         -e 's|<name>[^<]*</name>|<name>'"${safe_name}"'</name>|'
+        -e 's|<title>[^<]*</title>|<title>'"${safe_name}"'</title>|'
         -e '/<uuid>/d'
         -e '/<mac address=/d'
     )
@@ -1429,8 +1746,14 @@ define_new_identity() {
 # after restore so filenames reflect the clone name.
 
 # Predict output filenames virtnbdrestore will write.
-# With -c:  original source basename from config XML (e.g. my-server.qcow2)
-# Without -c (--skip-config): device target name (e.g. vda.qcow2)
+# virtnbdrestore ALWAYS reads a vmconfig and names each output by that disk's
+# <source file> basename (restore/files.py:target; disk.restore runs for every
+# vmrestore invocation -- vmrestore never passes --sequence). -c only controls
+# whether the WRITTEN config is rewritten, NOT the output filenames. So BOTH
+# arms predict the source basename from the config the engine selects:
+# With -c:  source basename for every config disk (e.g. my-server.qcow2)
+# Without -c (--skip-config): same, restricted to config disks that have a .data
+#   file present (a config disk with none is skipped by the engine)
 #
 # Populates global arrays:
 #   _PREDICTED_BASENAMES  — what virtnbdrestore writes (e.g. my-server.qcow2)
@@ -1493,26 +1816,107 @@ predict_output_files() {
             fi
         done < "$cfg_xml"
     else
-        # Without -c (--skip-config): output = {device}.qcow2
-        local -A seen_devices=()
-        local f
+        # virtnbdrestore names every output by basename(<source file>) even
+        # without -c (restore/files.py:target; disk.restore runs for every
+        # vmrestore invocation -- never --sequence). So predict source basenames
+        # from the SAME config the engine will select, restricted to disks that
+        # actually have a .data file (a config disk with none is skipped:
+        # restore/disk.py:68-77).
+
+        # -- Step 1: device targets that have a .data file (engine writes only these) --
+        local -A data_devices=()
+        local f fname dev
         while IFS= read -r -d '' f; do
-            local fname
             fname=$(basename "$f")
-            local dev=""
+            dev=""
             case "$fname" in
                 *.full.data)               dev="${fname%.full.data}" ;;
                 *.inc.virtnbdbackup.*.data) dev="${fname%%.*}" ;;
                 *.copy.data)               dev="${fname%.copy.data}" ;;
             esac
-            if [[ -n "$dev" && -z "${seen_devices[$dev]:-}" ]]; then
-                if [[ -z "$disk_filter" || "$dev" == "$disk_filter" ]]; then
-                    _PREDICTED_BASENAMES+=("${dev}.qcow2")
-                    _PREDICTED_DEVICE_MAP+=("${dev}.qcow2|${dev}")
-                    seen_devices[$dev]=1
+            [[ -n "$dev" ]] && data_devices[$dev]=1
+        done < <(find "$data_dir" -maxdepth 1 -type f -name '*.data' -print0 2>/dev/null)
+
+        # -- Step 2: pick the config EXACTLY as virtnbdrestore will (mutate nothing) --
+        # Mirror the engine pipeline: restore_vm's provisioning block (the
+        # "Provision vmconfig XML for archived chains" gate + plain-cp with a
+        # fresh mtime, below the predict call site) -> getLatest("vmconfig*.xml",
+        # -1) = newest-by-mtime over the WIDE glob (virtnbdrestore:259;
+        # common.getLatest L174-192). This block is prediction only -- it reads,
+        # never writes; the real provisioning in restore_vm is mirrored, not edited.
+        local cfg_xml=""
+        if [[ -n "$cfg_override" && -f "$cfg_override" ]]; then
+            # (1) Caller/PIT override -- the engine runs against this exact config.
+            cfg_xml="$cfg_override"
+        elif ls "$data_dir"/vmconfig.virtnbdbackup.*.xml &>/dev/null; then
+            # (2) Narrow inline config present -> restore_vm's provisioning gate does NOT
+            # fire; the dir is unchanged, so getLatest picks the newest file over
+            # the WIDE glob -- a newer vmconfig.copy.xml would win over the narrow
+            # one, so predict from the WIDE-glob newest, not the narrow file.
+            cfg_xml=$(ls -1t "$data_dir"/vmconfig*.xml 2>/dev/null | head -1 || true)
+        else
+            # No narrow inline config -> provisioning WILL run. Reproduce its search.
+            local search_dir
+            for search_dir in "$data_dir/config" "$(dirname "$data_dir")/config"; do
+                [[ -d "$search_dir" ]] || continue
+                cfg_xml=$(ls -1t "$search_dir"/*.xml 2>/dev/null | head -1 || true)
+                [[ -n "$cfg_xml" ]] && break
+            done
+            if [[ -n "$cfg_xml" && -f "$cfg_xml" ]]; then
+                # (3) Provisioning copies this config/ file to
+                # vmconfig.virtnbdbackup.0.xml with a FRESH mtime (plain cp,
+                # no -p) -> it becomes the newest vmconfig*.xml, so getLatest
+                # selects it. cp preserves basenames, so predicting from this
+                # config/ source is byte-equivalent to what the engine reads.
+                :
+            else
+                # (4) No config/ found -> provisioning attempts and fails (its
+                # own log_warn) but does NOT abort; the dir is unchanged and getLatest
+                # still finds any inline WIDE-glob file (e.g. a lone
+                # vmconfig.copy.xml) and the engine proceeds against it.
+                cfg_xml=$(ls -1t "$data_dir"/vmconfig*.xml 2>/dev/null | head -1 || true)
+            fi
+        fi
+        if [[ -z "$cfg_xml" || ! -f "$cfg_xml" ]]; then
+            # (5) No config anywhere -> virtnbdrestore dies ("No domain config file
+            # found": virtnbdrestore:260-262). Predict nothing; fail closed.
+            log_warn "vmrestore.sh" "predict_output_files" "No config XML found — cannot predict output filenames"
+            return 1
+        fi
+
+        # -- Step 3: predict PRIMARY <source file> basename per disk --
+        # xpath('source')[0] semantics -- the FIRST <source file> wins; a
+        # backingStore adds later <source> lines the engine ignores for naming
+        # (client.py:331 disk.xpath('source')[0]). Only type='file' device='disk';
+        # honor -d (disk_filter); and only disks whose target has a .data file
+        # (Step 1) -- the engine skips the rest.
+        local in_disk=false disk_device="" disk_target="" disk_source=""
+        while IFS= read -r line; do
+            if [[ "$line" =~ \<disk\ .*type=\'file\' ]]; then
+                in_disk=true
+                disk_device="" disk_target="" disk_source=""
+                if [[ "$line" =~ device=\'([^\']+)\' ]]; then
+                    disk_device="${BASH_REMATCH[1]}"
                 fi
             fi
-        done < <(find "$data_dir" -maxdepth 1 -type f -name '*.data' -print0 2>/dev/null)
+            if [[ "$in_disk" == true ]]; then
+                if [[ "$line" =~ \<target\ dev=\'([^\']+)\' ]]; then
+                    disk_target="${BASH_REMATCH[1]}"
+                fi
+                if [[ -z "$disk_source" && "$line" =~ \<source\ file=\'([^\']+)\' ]]; then
+                    disk_source="${BASH_REMATCH[1]}"
+                fi
+                if [[ "$line" =~ \</disk\> ]]; then
+                    if [[ "$disk_device" == "disk" && -n "$disk_source" && -n "$disk_target" && -n "${data_devices[$disk_target]:-}" ]]; then
+                        if [[ -z "$disk_filter" || "$disk_target" == "$disk_filter" ]]; then
+                            _PREDICTED_BASENAMES+=("$(basename "$disk_source")")
+                            _PREDICTED_DEVICE_MAP+=("${disk_source}|${disk_target}")
+                        fi
+                    fi
+                    in_disk=false
+                fi
+            fi
+        done < "$cfg_xml"
     fi
 
     if [[ ${#_PREDICTED_BASENAMES[@]} -eq 0 ]]; then
@@ -1560,17 +1964,20 @@ preflight_disk_safety() {
     local vm_entry
     while IFS= read -r vm_entry; do
         [[ -z "$vm_entry" ]] && continue
-        local blk_line
-        while IFS= read -r blk_line; do
-            # virsh domblklist output: "Target   Source"
-            local blk_src
-            blk_src=$(echo "$blk_line" | awk '{print $2}')
-            if [[ -n "$blk_src" && "$blk_src" != "-" && "$blk_src" != "Source" ]]; then
-                local real_blk
-                real_blk=$(pu_safe_realpath "$blk_src")
-                live_disk_map["$real_blk"]="$vm_entry"
-            fi
-        done < <(virsh domblklist "$vm_entry" 2>/dev/null)  # [LIBVIRT-KEEPER: caller parses raw "Target Source" tabular columns; lv_list_disk_paths drops Target column]
+        # DISK-02 (118-spaces): build the map from lv_list_disk_paths, NOT
+        # `domblklist | awk '{print $2}'`. The old parse truncated any spaced disk
+        # path at its first space, so a running VM with a spaced disk was never
+        # entered in the map — and this overwrite-protection gate then FAILED OPEN
+        # (a restore could clobber the live disk of a running VM). This loop only
+        # consumes the Source, so the (now space-safe) lv_list_disk_paths is a
+        # drop-in; it already skips the header and media-less ("-") entries.
+        local blk_src
+        while IFS= read -r blk_src; do
+            [[ -z "$blk_src" ]] && continue
+            local real_blk
+            real_blk=$(pu_safe_realpath "$blk_src")
+            live_disk_map["$real_blk"]="$vm_entry"
+        done < <(lv_list_disk_paths "$vm_entry")
     done < <(lv_list_all_domains)
 
     local abort=false
@@ -1630,6 +2037,10 @@ preflight_disk_safety() {
 stage_and_rename_clone_disks() {
     local clone_name="$1" staging_dir="$2" restore_path="$3" dry_run="$4"
     _DISK_RENAME_MAP=""
+    # FF-11: count per-disk promotion (mv) failures so an incomplete promotion
+    # returns non-zero and the caller can fail closed instead of defining a
+    # half-populated clone.
+    local _promote_failed=0
 
     if [[ ${#_PREDICTED_BASENAMES[@]} -eq 0 ]]; then
         log_warn "vmrestore.sh" "stage_and_rename" "No predicted files — nothing to rename"
@@ -1656,31 +2067,62 @@ stage_and_rename_clone_disks() {
         local staged_file="$staging_dir/$raw_base"
         local final_file="$restore_path/$new_basename"
 
+        local _do_append=false
         if [[ "$dry_run" == true ]]; then  # [DRY-RUN-KEEPER: local-param polarity preserved, see 109-phase7-spec.md §1.3.3]
             log_info "vmrestore.sh" "stage_and_rename" "[DRY RUN] Would move: staging/$raw_base → $new_basename"
+            # Dry-run parity only: the dry-run caller discards this map. Kept so
+            # preview and real runs build the same structure.
+            _do_append=true
         else
             if [[ -f "$staged_file" ]]; then
-                mv "$staged_file" "$final_file"
-                log_info "vmrestore.sh" "stage_and_rename" "Moved: staging/$raw_base → $new_basename"
+                if mv "$staged_file" "$final_file"; then
+                    log_info "vmrestore.sh" "stage_and_rename" "Moved: staging/$raw_base → $new_basename"
+                    _do_append=true
+                else
+                    log_error "vmrestore.sh" "stage_and_rename" "Failed to promote staged disk to final location: $staged_file → $final_file"
+                    ((_promote_failed++))
+                fi
             else
-                log_warn "vmrestore.sh" "stage_and_rename" "Expected file not found in staging: $staged_file"
+                log_error "vmrestore.sh" "stage_and_rename" "Expected file not found in staging: $staged_file"
+                ((_promote_failed++))
             fi
         fi
 
         # Build rename map for define_new_identity(): staged_path|new_absolute_path
         # Use staged_file (not orig_source_path) because virtnbdrestore rewrites
         # vmconfig.xml <source file="..."> to point at the output directory (staging).
-        if [[ -n "$_DISK_RENAME_MAP" ]]; then
-            _DISK_RENAME_MAP+=$'\n'
+        # FF-11: only map disks that were actually promoted (or dry-run parity); a
+        # failed mv must never seed a define that points at a missing/half path.
+        if [[ "$_do_append" == true ]]; then
+            if [[ -n "$_DISK_RENAME_MAP" ]]; then
+                _DISK_RENAME_MAP+=$'\n'
+            fi
+            _DISK_RENAME_MAP+="${staged_file}|${final_file}"
         fi
-        _DISK_RENAME_MAP+="${staged_file}|${final_file}"
         ((i++))
     done
 
+    (( _promote_failed > 0 )) && return 1
     return 0
 }
 
 # ── Core Restore ─────────────────────────────────────────────────────────────
+
+# FF-11: drop a staging dir from the EXIT-trap cleanup list (_VMRESTORE_STAGING_DIRS)
+# so a subsequent fail-closed die PRESERVES it — it holds the only copy of the
+# un-promoted clone disks, or a restore-written vmconfig.xml that could not be
+# moved. Rebuilds the array WITHOUT the named dir; deliberately never uses the
+# append form other gates anchor on.
+_vmrestore_unregister_staging() {
+    local target="$1" _keep=() _d
+    if (( ${#_VMRESTORE_STAGING_DIRS[@]} > 0 )); then
+        for _d in "${_VMRESTORE_STAGING_DIRS[@]}"; do
+            [[ "$_d" == "$target" ]] && continue
+            _keep+=("$_d")
+        done
+    fi
+    _VMRESTORE_STAGING_DIRS=("${_keep[@]}")
+}
 
 restore_vm() {
     local vm_name="$1"
@@ -1705,7 +2147,7 @@ restore_vm() {
             "${OPT_RESTORE_PATH:-}" \
             "${OPT_BACKUP_PATH:-}" \
             "${OPT_PERIOD:-}" \
-            "${OPT_CHECKPOINT:-}" 2>/dev/null) || \
+            "${OPT_RESTORE_POINT:-}" 2>/dev/null) || \
             log_warn "vmrestore.sh" "restore_vm" "restore session not recorded in catalogue (continuing)"
         if [[ -n "$_rs_id" ]] && [[ "$_rs_id" =~ ^[0-9]+$ ]]; then
             _RESTORE_SESSION_ID="$_rs_id"
@@ -1720,10 +2162,9 @@ restore_vm() {
         data_dir="$OPT_BACKUP_PATH"
         log_info "vmrestore.sh" "restore_vm" "Using direct backup path: $data_dir"
     else
-        local _safe_vm
-        _safe_vm=$(sanitize_vm_name "$vm_name") || exit $?
-        local vm_dir="$OPT_BACKUP_PATH/$_safe_vm"
-        [[ -d "$vm_dir" ]] || die "VM directory not found: $vm_dir" "restore_vm" "$EXIT_VM"
+        local vm_dir
+        vm_dir=$(resolve_vm_backup_dir "$vm_name" "$OPT_BACKUP_PATH") \
+            || die "VM directory not found for '$vm_name' (looked for the token and legacy folders under $OPT_BACKUP_PATH)" "restore_vm" "$EXIT_VM"
         data_dir=$(resolve_data_dir "$vm_dir" "${OPT_PERIOD:-}") || \
             die "Cannot resolve data directory for $vm_name" "restore_vm" "$EXIT_VM"
     fi
@@ -1892,6 +2333,7 @@ restore_vm() {
         local -A _dk_path=()   # disk → original file path (in-place only)
         local -A _dk_dir=()    # disk → restore target directory
         local -A _dk_file=()   # disk → original filename (in-place only)
+        local -A _dk_need=()   # FF-168: disk → bytes needed on its target fs
         local total_data_bytes=0
         local total_prerestore_bytes=0
 
@@ -1921,7 +2363,10 @@ restore_vm() {
                 log_info "vmrestore.sh" "restore_vm" "  $_d → $_opath"
                 # Accumulate .pre-restore space
                 if [[ "$OPT_NO_PRE_RESTORE" == false ]]; then
-                    total_prerestore_bytes=$(( total_prerestore_bytes + $(stat -c%s "$_opath" 2>/dev/null || echo 0) ))
+                    local _prb
+                    _prb=$(stat -c%s "$_opath" 2>/dev/null || echo 0)
+                    total_prerestore_bytes=$(( total_prerestore_bytes + _prb ))
+                    _dk_need[$_d]=$(( ${_dk_need[$_d]:-0} + _prb ))   # FF-168: per-fs need
                 fi
             else
                 _dk_dir[$_d]="$OPT_RESTORE_PATH"
@@ -1936,30 +2381,50 @@ restore_vm() {
                     *.inc.virtnbdbackup.*.data) _ddev="${_dfname%%.*}" ;;
                     *.copy.data)                _ddev="${_dfname%.copy.data}" ;;
                 esac
-                [[ "$_ddev" == "$_d" ]] && total_data_bytes=$(( total_data_bytes + $(stat -c%s "$_dfile" 2>/dev/null || echo 0) ))
+                if [[ "$_ddev" == "$_d" ]]; then
+                    local _dbb
+                    _dbb=$(stat -c%s "$_dfile" 2>/dev/null || echo 0)
+                    total_data_bytes=$(( total_data_bytes + _dbb ))
+                    _dk_need[$_d]=$(( ${_dk_need[$_d]:-0} + _dbb ))   # FF-168: per-fs need
+                fi
             done < <(find "$data_dir" -maxdepth 1 -type f -name '*.data' -print0 2>/dev/null)
         done
 
-        # ── Single space check for all disks ────────────────────────
-        local total_needed=$(( total_data_bytes + total_prerestore_bytes ))
-        local avail_bytes
-        local _space_check_dir
-        if [[ "$_inplace" == true ]]; then
-            _space_check_dir="${_dk_dir[${disk_list[0]}]}"
-        else
-            _space_check_dir="$OPT_RESTORE_PATH"
-        fi
-        while [[ -n "$_space_check_dir" && ! -d "$_space_check_dir" ]]; do
-            _space_check_dir=$(dirname "$_space_check_dir")
+        # ── Space check, grouped per target filesystem (FF-168) ──────
+        # A multi-disk in-place restore can span multiple mounts (OS-on-SSD,
+        # data-on-HDD). The former check summed every disk's need and probed only
+        # disk_list[0]'s filesystem, so it both false-passed (a second fs fills
+        # mid-restore, caught only afterwards by qemu-img) and false-blocked (the
+        # summed need charged to one fs). Group each disk's need by the filesystem
+        # its target dir resolves to, and check every filesystem.
+        local -A _fs_need=()    # fs mountpoint → summed bytes needed there
+        local -A _fs_probe=()   # fs mountpoint → an existing dir on it to df
+        local _sd _cdir _mnt
+        for _sd in "${disk_list[@]}"; do
+            _cdir="${_dk_dir[$_sd]:-$OPT_RESTORE_PATH}"
+            while [[ -n "$_cdir" && ! -d "$_cdir" ]]; do
+                _cdir=$(dirname "$_cdir")
+            done
+            [[ -n "$_cdir" ]] || _cdir="/"
+            _mnt=$(df --output=target "$_cdir" 2>/dev/null | tail -1)
+            [[ -n "$_mnt" ]] || _mnt="$_cdir"
+            _fs_need[$_mnt]=$(( ${_fs_need[$_mnt]:-0} + ${_dk_need[$_sd]:-0} ))
+            _fs_probe[$_mnt]="$_cdir"
         done
-        avail_bytes=$(df --output=avail -B1 "$_space_check_dir" 2>/dev/null | tail -1 | tr -d '[:space:]')
+        local avail_bytes="" _mkey _need_fs _fs_avail
+        for _mkey in "${!_fs_need[@]}"; do
+            _need_fs="${_fs_need[$_mkey]}"
+            _fs_avail=$(df --output=avail -B1 "${_fs_probe[$_mkey]}" 2>/dev/null | tail -1 | tr -d '[:space:]')
+            _fs_avail="${_fs_avail:-0}"
+            if [[ -z "$avail_bytes" ]] || (( _fs_avail < avail_bytes )); then avail_bytes="$_fs_avail"; fi
+            if (( _need_fs > _fs_avail )); then
+                local need_hr avail_hr
+                need_hr=$(_format_size "$_need_fs")
+                avail_hr=$(_format_size "$_fs_avail")
+                die "Insufficient space on ${_mkey}: need $need_hr (restore + .pre-restore) but only $avail_hr available" "restore_vm" "$EXIT_STORAGE"
+            fi
+        done
         avail_bytes="${avail_bytes:-0}"
-        if (( total_needed > avail_bytes )); then
-            local need_hr avail_hr
-            need_hr=$(_format_size "$total_needed")
-            avail_hr=$(_format_size "$avail_bytes")
-            die "Insufficient space: need $need_hr (restore + .pre-restore) but only $avail_hr available" "restore_vm" "$EXIT_STORAGE"
-        fi
         local data_hr
         data_hr=$(_format_size "$total_data_bytes")
         if [[ "$_inplace" == true && "$OPT_NO_PRE_RESTORE" == false && "$total_prerestore_bytes" -gt 0 ]]; then
@@ -1995,6 +2460,10 @@ restore_vm() {
                     if ! is_dry_run; then
                         pit_input_dir=$(create_pit_staging "$data_dir" "$_pit_target_cp") || \
                             die "Failed to create PIT staging directory" "restore_vm" "$EXIT_STORAGE"
+                        # FF-193: track in the PARENT shell (the append inside
+                        # create_pit_staging ran dead in this $() subshell) so the
+                        # EXIT/SIGINT trap removes the staging symlink farm.
+                        _VMRESTORE_STAGING_DIRS+=("$pit_input_dir")
                         log_info "vmrestore.sh" "restore_vm" "PIT staging directory: $pit_input_dir"
                     fi
                 fi
@@ -2114,8 +2583,15 @@ restore_vm() {
                 chmod 600 "$_orig" 2>/dev/null || true
 
                 # Integrity check
-                if qemu-img check "$_orig" &>/dev/null; then
+                if _qcow_check_classified "$_orig"; then
                     log_info "vmrestore.sh" "restore_vm" "  $_d: ownership ✓ integrity ✓"
+                elif [[ "${_QIMG_VERDICT:-}" == "UNVERIFIABLE" ]]; then
+                    log_error "vmrestore.sh" "restore_vm" "INTEGRITY COULD NOT BE VERIFIED: $_orig"
+                    if [[ -f "${_orig}.pre-restore" ]]; then
+                        log_error "vmrestore.sh" "restore_vm" "Roll back: mv ${_orig}.pre-restore $_orig"
+                    fi
+                    _failed_disk="$_d"
+                    break
                 else
                     log_error "vmrestore.sh" "restore_vm" "INTEGRITY CHECK FAILED: $_orig"
                     if [[ -f "${_orig}.pre-restore" ]]; then
@@ -2137,8 +2613,10 @@ restore_vm() {
                     ls -lh "$_stage_file" 2>/dev/null | while IFS= read -r line; do
                         log_info "vmrestore.sh" "restore_vm" "  $line"
                     done
-                    if qemu-img check "$_stage_file" &>/dev/null; then
+                    if _qcow_check_classified "$_stage_file"; then
                         log_info "vmrestore.sh" "restore_vm" "  $_d: integrity ✓"
+                    elif [[ "${_QIMG_VERDICT:-}" == "UNVERIFIABLE" ]]; then
+                        log_error "vmrestore.sh" "restore_vm" "INTEGRITY COULD NOT BE VERIFIED: $_stage_file"
                     else
                         log_error "vmrestore.sh" "restore_vm" "INTEGRITY CHECK FAILED: $_stage_file"
                     fi
@@ -2333,6 +2811,10 @@ restore_vm() {
                 if ! is_dry_run; then
                     pit_input_dir=$(create_pit_staging "$data_dir" "$_pit_target_cp") || \
                         die "Failed to create PIT staging directory" "restore_vm" "$EXIT_STORAGE"
+                    # FF-193: track in the PARENT shell (the append inside
+                    # create_pit_staging ran dead in this $() subshell) so the
+                    # EXIT/SIGINT trap removes the staging symlink farm.
+                    _VMRESTORE_STAGING_DIRS+=("$pit_input_dir")
                     log_info "vmrestore.sh" "restore_vm" "PIT staging directory: $pit_input_dir"
                     # Replace -i in cmd array: element 0=virtnbdrestore, 1=-i, 2=data_dir
                     cmd[2]="$pit_input_dir"
@@ -2355,22 +2837,38 @@ restore_vm() {
         # Real run: use vmconfig from the PIT staging dir
         _predict_cfg_override=$(ls -1 "$pit_input_dir"/vmconfig.virtnbdbackup.*.xml 2>/dev/null | head -1)
     elif [[ -n "${_pit_target_cp:-}" && "${_pit_target_disks:-}" != "${_pit_latest_disks:-}" ]]; then
-        # Dry run: use vmconfig from backup dir directly
+        # Dry run: predict from the target checkpoint's per-checkpoint vmconfig.
         _predict_cfg_override="$data_dir/vmconfig.virtnbdbackup.${_pit_target_cp}.xml"
         if [[ ! -f "$_predict_cfg_override" ]]; then
-            # Fallback to config/ dir by ordinal
-            local _cfg_dir=""
-            for _search in "$data_dir/config" "$(dirname "$data_dir")/config"; do
-                [[ -d "$_search" ]] && _cfg_dir="$_search" && break
-            done
-            if [[ -n "$_cfg_dir" ]]; then
-                _predict_cfg_override=$(ls -1 "$_cfg_dir"/*.xml 2>/dev/null | sort | sed -n "$((_pit_target_cp + 1))p")
-            fi
+            # FF-195: the former fallback picked config/*.xml by checkpoint ORDINAL
+            # (`sort | sed -n "$((cp+1))p"`) — the same unsound mapping fixed in
+            # create_pit_staging (FF-194). vmbackup's backup_vm_config writes
+            # change-triggered timestamped configs plus a _FIRST marker, not one
+            # per checkpoint, so the ordinal selects a wrong-vintage XML and
+            # predict_output_files then mis-predicts output topology / the clone
+            # rename map. Do NOT guess: without the target checkpoint's own
+            # vmconfig the target topology cannot be reconstructed, and a real PIT
+            # restore now fails closed there (create_pit_staging). Leave the
+            # override empty (best-effort preview from the latest config) and warn.
+            # Dry-run only: log + assignment, no mutation.
+            _predict_cfg_override=""
+            log_warn "vmrestore.sh" "restore_vm" "[DRY RUN] No per-checkpoint vmconfig (vmconfig.virtnbdbackup.${_pit_target_cp}.xml) for checkpoint ${_pit_target_cp}; a real PIT restore would fail closed here — output-topology preview may reflect the latest checkpoint, not ${_pit_target_cp}"
         fi
     fi
     if predict_output_files "$data_dir" "$OPT_RESTORE_PATH" "$use_c_flag" "${OPT_DISK:-}" "${OPT_NAME:-}" "$_predict_cfg_override"; then
         preflight_disk_safety "$vm_name" "$OPT_DRY_RUN" "$OPT_FORCE"
     else
+        # VMR1: a clone whose output files cannot be predicted has no rename map
+        # (which raw file -> which clone-<dev>.qcow2). Promotion and the post-
+        # restore qemu-img check are both gated on a successful prediction, so a
+        # clone would otherwise restore into the staging dir, skip promotion, and
+        # the EXIT trap would then delete the only copy just made -- all while the
+        # summary printed "defined ✓". Fail closed BEFORE the destructive engine
+        # runs rather than restore-then-delete. DR / in-place overwrite predicted
+        # paths and don't depend on staging promotion, so they may still proceed.
+        if [[ "$new_identity" == true ]] && ! is_dry_run; then
+            die "Cannot predict clone output files for '$OPT_NAME' (no usable config/disks in backup) — refusing a clone that cannot be safely promoted or validated" "restore_vm" "$EXIT_VM"
+        fi
         log_warn "vmrestore.sh" "restore_vm" "Could not predict output files — skipping disk safety checks"
         _predicted_ok=false
     fi
@@ -2431,6 +2929,9 @@ restore_vm() {
             if [[ -n "$_cfg_xml" && -f "$_cfg_xml" ]]; then
                 cp "$_cfg_xml" "$data_dir/vmconfig.virtnbdbackup.0.xml"
                 _provisioned_vmconfig="$data_dir/vmconfig.virtnbdbackup.0.xml"
+                # F-vmr2514: mirror to the trap global so any die/signal before
+                # the success-path rm restores the read-only backup/archive tree.
+                _VMRESTORE_PROVISIONED_VMCONFIG="$_provisioned_vmconfig"
                 log_info "vmrestore.sh" "restore_vm" "Provisioned vmconfig from: $_cfg_xml"
             else
                 log_warn "vmrestore.sh" "restore_vm" "No vmconfig XML found — virtnbdrestore may fail"
@@ -2466,12 +2967,28 @@ restore_vm() {
         # Move + rename clone disks from staging to final location
         local disk_rename_map=""
         if [[ "$new_identity" == true && "$_predicted_ok" == true && "$restore_ok" == true ]]; then
-            stage_and_rename_clone_disks "$OPT_NAME" "$staging_dir" "$OPT_RESTORE_PATH" false
+            # FF-11: promotion is the point of no return for a clone. If any disk
+            # mv fails, PRESERVE staging (it holds the only copy of the un-promoted
+            # disks) and fail closed rather than define a clone over missing paths.
+            # Un-register staging first so the die's EXIT trap does not rm -rf the
+            # very disks the operator is told to recover.
+            if ! stage_and_rename_clone_disks "$OPT_NAME" "$staging_dir" "$OPT_RESTORE_PATH" false; then
+                _vmrestore_unregister_staging "$staging_dir"
+                die "Clone disk promotion FAILED: one or more disks could not be moved from staging to '$OPT_RESTORE_PATH'. The staging dir '$staging_dir' is PRESERVED and holds the ONLY copy of any un-promoted disks (do NOT delete it); already-promoted disks are in '$OPT_RESTORE_PATH'. NO clone was defined. Finish manually: move the remaining staged disks into '$OPT_RESTORE_PATH' with the clone-named filenames, define from the config XML after adjusting <source file> paths, then remove the staging dir." "restore_vm" "$EXIT_TOOL"
+            fi
             disk_rename_map="$_DISK_RENAME_MAP"
-            # Clean up staging dir (should be empty now except vmconfig.xml etc.)
-            # Move vmconfig.xml to restore path if present
+            # All disks promoted. Move the restore-written vmconfig.xml (whose
+            # <source file> paths were rewritten to the STAGING paths that key
+            # _DISK_RENAME_MAP) to the restore path so define_new_identity() reads
+            # it. FF-11: if this move fails, do NOT fall through to define — the
+            # fallback config XML is the BACKUP config whose <source file> still
+            # points at the SOURCE VM's live disks, and the staging-keyed map
+            # would rewrite nothing, defining the clone onto the source disks.
             if [[ -f "$staging_dir/vmconfig.xml" ]]; then
-                mv "$staging_dir/vmconfig.xml" "$OPT_RESTORE_PATH/vmconfig.xml"
+                if ! mv "$staging_dir/vmconfig.xml" "$OPT_RESTORE_PATH/vmconfig.xml"; then
+                    _vmrestore_unregister_staging "$staging_dir"
+                    die "All clone disks were promoted to '$OPT_RESTORE_PATH', but the restore-written vmconfig.xml could not be moved and is PRESERVED in '$staging_dir'. NO clone was defined. Define manually from the config XML (the staging copy at '$staging_dir/vmconfig.xml', or $data_dir/config/*.xml) after adjusting <source file> paths to the final disk locations; do NOT start any clone whose XML still points at the source VM's disk paths." "restore_vm" "$EXIT_TOOL"
+                fi
             fi
             rm -rf "$staging_dir"
             log_info "vmrestore.sh" "restore_vm" "Staging directory cleaned up"
@@ -2493,10 +3010,18 @@ restore_vm() {
                 # match the restored disk state (prevents "BdsDxe: No mapping"
                 # for SecureBoot guests when the source VM has run since the
                 # backup was taken).
-                local _ni_endpoint _ni_chain_nvram=""
+                local _ni_endpoint _ni_chain_nvram="" _ni_fcn_rc=0
                 _ni_endpoint=$(chain_endpoint_cp "$data_dir" "${OPT_RESTORE_POINT:-}")
                 if [[ -n "$_ni_endpoint" ]]; then
-                    _ni_chain_nvram=$(find_chain_nvram "$data_dir" "$vm_name" "$_ni_endpoint") || _ni_chain_nvram=""
+                    # VMR4: tell ambiguous (rc 2) apart from not-found (rc 1). An
+                    # ambiguous NVRAM match must not silently collapse to "no
+                    # NVRAM": guessing the wrong UEFI varstore can break Secure
+                    # Boot / BitLocker on the clone. rc 1 keeps the not-found path
+                    # (define without a paired NVRAM, exactly as before).
+                    _ni_chain_nvram=$(find_chain_nvram "$data_dir" "$vm_name" "$_ni_endpoint") || _ni_fcn_rc=$?
+                    if (( _ni_fcn_rc == 2 )); then
+                        die "Ambiguous chain NVRAM for '$vm_name' at endpoint cp ${_ni_endpoint}: more than one *_VARS*.fd backup matches (candidates logged above). Refusing to guess which UEFI/NVRAM state to pair with the restored disks — a wrong choice can break Secure Boot or BitLocker unlock on the clone. Resolve the duplicates in '$data_dir' and retry." "restore_vm" "$EXIT_VM"
+                    fi
                 fi
                 new_uuid=$(define_new_identity "$out_xml" "$OPT_NAME" false "$disk_rename_map" "$_ni_chain_nvram") || \
                     log_warn "vmrestore.sh" "restore_vm" "VM define failed (restore disks OK — define manually)"
@@ -2510,10 +3035,14 @@ restore_vm() {
             # disk, causing "BdsDxe: No mapping" / boot failure for SecureBoot
             # guests. The previous live NVRAM is preserved as a timestamped
             # backup so manual rollback is possible.
-            local _ip_endpoint _ip_chain_nvram=""
+            local _ip_endpoint _ip_chain_nvram="" _ip_fcn_rc=0
             _ip_endpoint=$(chain_endpoint_cp "$data_dir" "${OPT_RESTORE_POINT:-}")
             if [[ -n "$_ip_endpoint" ]]; then
-                _ip_chain_nvram=$(find_chain_nvram "$data_dir" "$vm_name" "$_ip_endpoint") || _ip_chain_nvram=""
+                # VMR4: ambiguous (rc 2) => fail closed; rc 1 => unchanged not-found.
+                _ip_chain_nvram=$(find_chain_nvram "$data_dir" "$vm_name" "$_ip_endpoint") || _ip_fcn_rc=$?
+                if (( _ip_fcn_rc == 2 )); then
+                    die "Ambiguous chain NVRAM for '$vm_name' at endpoint cp ${_ip_endpoint}: more than one *_VARS*.fd backup matches (candidates logged above). Refusing to guess which UEFI/NVRAM state to restore in place — a wrong choice can break Secure Boot or BitLocker unlock. Resolve the duplicates in '$data_dir' and retry." "restore_vm" "$EXIT_VM"
+                fi
             fi
             if [[ -n "$_ip_chain_nvram" && -f "$_ip_chain_nvram" ]]; then
                 local _ip_cfg_xml="" _ip_live_nvram=""
@@ -2539,10 +3068,18 @@ restore_vm() {
                         chmod 600 "$_ip_live_nvram" 2>/dev/null || true
                         log_info "vmrestore.sh" "restore_vm" "NVRAM restored from chain endpoint cp ${_ip_endpoint}: $_ip_chain_nvram → $_ip_live_nvram"
                     else
-                        log_warn "vmrestore.sh" "restore_vm" "Failed to copy chain NVRAM into place — UEFI vars unchanged"
+                        # VMR5: an in-place DR restore is identity-bearing. We have
+                        # restored disks AND a chain NVRAM to pair, but the copy
+                        # failed — leaving UEFI/NVRAM vars drifted from the restored
+                        # disk is a failed identity restore, not a warning.
+                        die "In-place restore of '$vm_name': failed to copy chain NVRAM into place ($_ip_chain_nvram → $_ip_live_nvram). Refusing to leave UEFI/NVRAM vars drifted from the restored disks — the VM may fail Secure Boot or BitLocker unlock. The previous live NVRAM was saved alongside as *.before-restore.* for manual recovery." "restore_vm" "$EXIT_VM"
                     fi
                 else
-                    log_warn "vmrestore.sh" "restore_vm" "Could not resolve live NVRAM path from backup vmconfig — UEFI vars unchanged"
+                    # VMR5: chain NVRAM exists in the backup but we cannot resolve
+                    # where the live NVRAM lives — we cannot pair them. For an
+                    # in-place DR restore that is a failed identity restore, not a
+                    # warning: fail closed rather than imply success with drift.
+                    die "In-place restore of '$vm_name': the backup has chain NVRAM to restore but the live NVRAM path could not be resolved from the backup vmconfig. Refusing to leave UEFI/NVRAM vars drifted from the restored disks (Secure Boot / BitLocker may break). Restore the NVRAM manually from '$_ip_chain_nvram'." "restore_vm" "$EXIT_VM"
                 fi
             else
                 log_warn "vmrestore.sh" "restore_vm" \
@@ -2556,6 +3093,12 @@ restore_vm() {
                     log_info "vmrestore.sh" "restore_vm" "Defining VM from backup config: $fb_xml"
                     lv_define_xml "$fb_xml" >/dev/null || log_warn "vmrestore.sh" "restore_vm" "virsh define failed"
                 fi
+            fi
+            # VMR2: a DR restore (--skip-config is false here) must end with a
+            # defined VM. If neither virtnbdrestore -D nor the fallback define
+            # produced one, fail loudly now rather than print a false "defined ✓".
+            if ! lv_domain_exists "$vm_name"; then
+                die "DR restore of '$vm_name' could not define the VM (virtnbdrestore -D and the fallback define both failed) — restore the domain XML manually from $data_dir/config" "restore_vm" "$EXIT_VM"
             fi
 
             # virtnbdrestore -D always strips UUID — re-inject original so TPM/identity is preserved
@@ -2579,9 +3122,15 @@ restore_vm() {
                     current_uuid=$(lv_domain_uuid "$vm_name" || true)
                     if [[ "$current_uuid" != "$orig_uuid" ]]; then
                         log_info "vmrestore.sh" "restore_vm" "Re-injecting original UUID: $orig_uuid (virtnbdrestore assigned: $current_uuid)"
-                        local _fixxml
+                        local _fixxml _origxml
                         _fixxml=$(mktemp /tmp/vmrestore-fixuuid-XXXXXX.xml)
+                        # VMR2: keep a pre-sed, known-good copy (the domain exactly
+                        # as virtnbdrestore defined it) so a failed re-inject define
+                        # can fall back to a working definition instead of leaving
+                        # the VM undefined.
+                        _origxml=$(mktemp /tmp/vmrestore-origxml-XXXXXX.xml)
                         lv_dump_xml "$vm_name" --inactive > "$_fixxml"
+                        cp "$_fixxml" "$_origxml"
                         sed -i "s|<uuid>[^<]*</uuid>|<uuid>$orig_uuid</uuid>|" "$_fixxml"
                         # Must undefine first — virsh refuses UUID change on existing domain
                         # Backup NVRAM before undefine --nvram (which deletes it)
@@ -2599,10 +3148,18 @@ restore_vm() {
                         fi
                         if lv_define_xml "$_fixxml" >/dev/null 2>&1; then
                             log_info "vmrestore.sh" "restore_vm" "UUID restored to $orig_uuid"
+                        elif lv_define_xml "$_origxml" >/dev/null 2>&1; then
+                            # Re-inject failed but the VM is back with its prior
+                            # (virtnbdrestore-assigned) identity — disks are safe and
+                            # the domain exists; only the original UUID is missing.
+                            log_warn "vmrestore.sh" "restore_vm" "UUID re-inject failed; VM re-defined with assigned UUID $current_uuid (original $orig_uuid NOT restored — TPM may need manual unlock)"
                         else
-                            log_warn "vmrestore.sh" "restore_vm" "Failed to re-inject UUID (TPM may be misaligned)"
+                            # Both defines failed: the VM is now undefined. That is a
+                            # VM-level failure, not a soft warning — surface it and
+                            # name the XML the operator can recover from by hand.
+                            die "DR UUID re-inject left '$vm_name' undefined and re-define failed — recover manually: virsh define $_origxml" "restore_vm" "$EXIT_VM"
                         fi
-                        rm -f "$_fixxml"
+                        rm -f "$_fixxml" "$_origxml"
                     fi
                 fi
                 # Log preserved MAC addresses for DR verification
@@ -2616,24 +3173,42 @@ restore_vm() {
             fi
         fi
 
-        # Clean up provisioned vmconfig if we created one
+        # Clean up provisioned vmconfig if we created one (happy path); clear
+        # the trap global so _vmrestore_cleanup no-ops on a clean exit (F-vmr2514).
         [[ -n "${_provisioned_vmconfig:-}" && -f "$_provisioned_vmconfig" ]] && rm -f "$_provisioned_vmconfig"
+        _VMRESTORE_PROVISIONED_VMCONFIG=""
 
         # Post-restore validation: only check files we actually restored
         if [[ "$restore_ok" == true && "$_predicted_ok" == true && ${#_PREDICTED_FILES[@]} -gt 0 ]]; then
             local _any_corrupt=false
+            local _any_unverified=false
             for _qcow in "${_PREDICTED_FILES[@]}"; do
-                [[ -f "$_qcow" ]] || continue
-                if qemu-img check "$_qcow" &>/dev/null; then
+                # FF-169: _PREDICTED_FILES is the definitive expected output set
+                # (it gated the collision preflight). virtnbdrestore can exit 0
+                # having written nothing for a disk, so a MISSING predicted file
+                # after a "successful" engine run means the restore is INCOMPLETE
+                # relative to the VM's own domain configuration — fail, not skip.
+                if [[ ! -f "$_qcow" ]]; then
+                    log_error "vmrestore.sh" "restore_vm" "Restore INCOMPLETE: predicted output missing (engine reported success but did not write it): $_qcow"
+                    _any_corrupt=true
+                    continue
+                fi
+                if _qcow_check_classified "$_qcow"; then
                     log_info "vmrestore.sh" "restore_vm" "Disk integrity OK: $(basename "$_qcow")"
+                elif [[ "${_QIMG_VERDICT:-}" == "UNVERIFIABLE" ]]; then
+                    log_error "vmrestore.sh" "restore_vm" "Restored image COULD NOT BE VERIFIED: $_qcow"
+                    _any_unverified=true
                 else
                     log_error "vmrestore.sh" "restore_vm" "Restored image FAILED integrity check: $_qcow"
                     _any_corrupt=true
                 fi
             done
             if [[ "$_any_corrupt" == true ]]; then
-                log_error "vmrestore.sh" "restore_vm" "One or more restored images are corrupt (possible ENOSPC or I/O error)"
-                die "Restore produced corrupt disk images" "restore_vm" "$EXIT_STORAGE"
+                log_error "vmrestore.sh" "restore_vm" "One or more restored images are corrupt or INCOMPLETE (never written, ENOSPC, or I/O error)"
+                die "Restore produced corrupt or incomplete disk images" "restore_vm" "$EXIT_STORAGE"
+            elif [[ "$_any_unverified" == true ]]; then
+                log_error "vmrestore.sh" "restore_vm" "One or more restored images COULD NOT BE VERIFIED (integrity check did not complete)"
+                die "Restore verification incomplete — could not verify restored disk images" "restore_vm" "$EXIT_STORAGE"
             fi
         fi
 
@@ -2694,12 +3269,32 @@ restore_vm() {
         _summary="$_summary [DRY RUN — no changes made]"
     else
         local _parts=()
-        _parts+=("disk ✓")
+        # X2: every ✓ below is a verified post-condition (mirroring the INT-22
+        # TPM token), not an intent — a partial/failed restore can no longer
+        # render an all-green summary.
+        local _tgt="${OPT_NAME:-$vm_name}" _defined=0
+        lv_domain_exists "$_tgt" && _defined=1
+        # disk: the restore engine (or its disk-only retry) reported success; in
+        # clone mode VMR1 guarantees promotion ran before we reach this point.
+        if [[ "${restore_ok:-false}" == true ]]; then
+            _parts+=("disk ✓")
+        else
+            _parts+=("disk ✗")
+        fi
         if [[ "$OPT_SKIP_CONFIG" == false ]]; then
+            if [[ "$_defined" -eq 1 ]]; then _parts+=("defined ✓"); else _parts+=("defined ✗"); fi
             if [[ "$new_identity" == true ]]; then
-                _parts+=("defined ✓" "new identity ✓")
+                # new identity ✓ only if define_new_identity read a new UUID back.
+                if [[ -n "$new_uuid" ]]; then _parts+=("new identity ✓"); else _parts+=("new identity ✗"); fi
             else
-                _parts+=("defined ✓" "UUID ✓" "MACs ✓")
+                # UUID ✓ only if the live domain UUID matches the re-injected original.
+                if [[ "$_defined" -eq 1 && -n "${orig_uuid:-}" && "$(lv_domain_uuid "$_tgt" 2>/dev/null)" == "${orig_uuid:-}" ]]; then
+                    _parts+=("UUID ✓")
+                else
+                    _parts+=("UUID ✗")
+                fi
+                # MACs ride with the domain definition: present iff the VM is defined.
+                if [[ "$_defined" -eq 1 ]]; then _parts+=("MACs ✓"); else _parts+=("MACs ✗"); fi
             fi
         else
             _parts+=("data-only")
@@ -2728,8 +3323,9 @@ run_virtnbd_action() {
     if has_backup_data "$OPT_BACKUP_PATH"; then
         data_dir="$OPT_BACKUP_PATH"
     else
-        local vm_dir="$OPT_BACKUP_PATH/$vm_name"
-        [[ -d "$vm_dir" ]] || die "VM directory not found: $vm_dir" "run_virtnbd_action" "$EXIT_VM"
+        local vm_dir
+        vm_dir=$(resolve_vm_backup_dir "$vm_name" "$OPT_BACKUP_PATH") \
+            || die "VM directory not found for '$vm_name'" "run_virtnbd_action" "$EXIT_VM"
         data_dir=$(resolve_data_dir "$vm_dir" "${OPT_PERIOD:-}") || \
             die "Cannot resolve data directory" "run_virtnbd_action" "$EXIT_VM"
     fi
@@ -2973,6 +3569,9 @@ parse_args() {
     if [[ -n "${OPT_DISK:-}" && -n "${OPT_NAME:-}" ]]; then
         die "--disk and --name cannot be combined (disk restore replaces disk files, it does not create a VM)" "parse_args" "$EXIT_USAGE"
     fi
+    if [[ "${OPT_SKIP_CONFIG:-false}" == true && -n "${OPT_NAME:-}" ]]; then
+        die "--skip-config and --name cannot be combined (--name requests a clone, which requires defining the restored VM; --skip-config skips VM definition)" "parse_args" "$EXIT_USAGE"
+    fi
 
     # Normalise paths: strip trailing slashes to avoid ugly double-slash //
     OPT_RESTORE_PATH=$(pu_strip_trailing_slash "$OPT_RESTORE_PATH")
@@ -3004,8 +3603,9 @@ main() {
                 list)    list_vms "$OPT_BACKUP_PATH" ;;
                 list-rp)
                     [[ -n "$OPT_VM_NAME" ]] || { echo "VM name required for --list-restore-points" >&2; return 1; }
-                    local vm_dir="$OPT_BACKUP_PATH/$OPT_VM_NAME"
-                    [[ -d "$vm_dir" ]] || { echo "VM not found: $vm_dir" >&2; return 1; }
+                    local vm_dir
+                    vm_dir=$(resolve_vm_backup_dir "$OPT_VM_NAME" "$OPT_BACKUP_PATH") \
+                        || { echo "VM not found: $OPT_VM_NAME" >&2; return 1; }
 
                     echo ""
                     echo "Restore Points: $OPT_VM_NAME"
@@ -3114,10 +3714,21 @@ main() {
     log_info "vmrestore.sh" "main" "====== vmrestore v$VMBACKUP_VERSION ======"
     [[ -d "$OPT_BACKUP_PATH" ]] || die "Backup path not found: $OPT_BACKUP_PATH" "main" "$EXIT_STORAGE"
 
-    # UNI-002: Initialise lock dir for create_lock/remove_lock. Same layout as
-    # vmbackup ("${BACKUP_PATH}_state/locks"), so vmbackup and vmrestore on
-    # the same VM mutually exclude via the shared "vmbackup-<vm>.lock" file.
-    LOCK_DIR="${OPT_BACKUP_PATH%/}_state/locks"
+    # INT-22: derive STATE_DIR once here (hoisted above the lock line, and above
+    # the sqlite-init block that also assigns it) so the lock dir and the
+    # catalogue dir can never drift. vmrestore normalizes OPT_BACKUP_PATH to NO
+    # trailing slash at parse-time (pu_strip_trailing_slash), so we re-add the
+    # "/_state" segment explicitly — exactly as vmbackup.sh does off its slashed
+    # BACKUP_PATH. Guarded ${STATE_DIR:-...} keeps -u happy (first read self-guards)
+    # and is idempotent (the later sqlite-init assignment becomes a no-op).
+    STATE_DIR="${STATE_DIR:-${OPT_BACKUP_PATH%/}/_state}"
+
+    # UNI-002: per-VM lock dir for create_lock/remove_lock, layout identical to
+    # vmbackup ("${STATE_DIR}/locks" = "<root>/_state/locks"), so vmbackup and
+    # vmrestore on the same VM mutually exclude via the shared "vmbackup-<vm>.lock".
+    # Previously this glued the "_state" segment onto the no-slash-normalized root,
+    # producing a "<root>_state/locks" SIBLING that defeated the cross-tool lock (INT-22).
+    LOCK_DIR="${STATE_DIR}/locks"
 
     # UNI-010: Register signal handlers now that LOG_FILE and LOCK_DIR are
     # known. EXIT trap is the safety net for both signal-induced and normal
@@ -3158,7 +3769,7 @@ main() {
             # rather than inside restore_vm so the lock-acquisition error
             # message mentions the same name the user typed.
             local _safe_lock_vm
-            _safe_lock_vm=$(sanitize_vm_name "$OPT_VM_NAME") || exit $?
+            _safe_lock_vm=$(vm_fs_name "$OPT_VM_NAME") || exit $?
             if ! create_lock "$_safe_lock_vm"; then
                 die "Another vmbackup or vmrestore is already running on VM '$_safe_lock_vm' (lock held)" \
                     "main" "$EXIT_LOCK"

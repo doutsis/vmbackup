@@ -86,6 +86,7 @@ NC='\033[0m' # No Color
 #################################################################################
 
 RCLONE_REMOTE_NAME="sharepoint"
+REMOTE_SET_VIA_CLI=false          # FF-65: track an explicit --remote so --instance won't clobber it
 RCLONE_CONFIG_FILE="/root/.config/rclone/rclone.conf"
 FOLDER_PATH=""
 CONFIG_INSTANCE=""
@@ -129,10 +130,12 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --remote)
             RCLONE_REMOTE_NAME="$2"
+            REMOTE_SET_VIA_CLI=true
             shift 2
             ;;
         --remote=*)
             RCLONE_REMOTE_NAME="${1#*=}"
+            REMOTE_SET_VIA_CLI=true
             shift
             ;;
         --folder)
@@ -179,6 +182,24 @@ done
 # LOAD SETTINGS FROM VMBACKUP CONFIG INSTANCE
 #################################################################################
 
+# Extract a single config value from KEY=... lines robustly: handles both
+# quoted ("value") and unquoted (value) forms, with or without a trailing
+# "# comment", without mangling a '#' inside a quoted value. Prints the
+# cleaned value (empty if the key is absent). No sourcing.
+extract_conf_value() {
+    local conf="$1" key="$2" line val
+    line=$(grep -E "^\s*${key}=" "$conf" 2>/dev/null | tail -1)
+    val="${line#*=}"
+    val="${val#"${val%%[![:space:]]*}"}"
+    if [[ "$val" == '"'* ]]; then
+        val="${val#\"}"
+        val="${val%%\"*}"
+    else
+        val="${val%%[[:space:]]*}"
+    fi
+    printf '%s\n' "$val"
+}
+
 load_instance_settings() {
     local instance="$1"
     local config_dir="${SCRIPT_DIR}/config/${instance}"
@@ -194,11 +215,12 @@ load_instance_settings() {
 
     # Extract specific variables safely (no sourcing)
     local remote_val folder_val
-    remote_val=$(grep -E '^\s*CLOUD_DEST_1_REMOTE=' "$cloud_conf" 2>/dev/null | tail -1 | cut -d'"' -f2)
-    folder_val=$(grep -E '^\s*CLOUD_DEST_1_PATH=' "$cloud_conf" 2>/dev/null | tail -1 | cut -d'"' -f2)
+    remote_val=$(extract_conf_value "$cloud_conf" "CLOUD_DEST_1_REMOTE")
+    folder_val=$(extract_conf_value "$cloud_conf" "CLOUD_DEST_1_PATH")
 
     # Only override if not already set via CLI args
-    if [[ -n "$remote_val" ]]; then
+    # FF-65: an explicit --remote wins over --instance-derived settings.
+    if [[ -n "$remote_val" ]] && [[ "${REMOTE_SET_VIA_CLI:-false}" != "true" ]]; then
         # Strip trailing colon if present (remote_val might be "sharepoint:")
         RCLONE_REMOTE_NAME="${remote_val%:}"
         echo -e "  Remote name: ${GREEN}${RCLONE_REMOTE_NAME}${NC}"
@@ -232,8 +254,8 @@ elif [[ -z "$FOLDER_PATH" ]]; then
         echo ""
         for i in "${!available_instances[@]}"; do
             local_instance="${available_instances[$i]}"
-            local_folder=$(grep -E '^\s*CLOUD_DEST_1_PATH=' "${SCRIPT_DIR}/config/${local_instance}/replication_cloud.conf" 2>/dev/null | tail -1 | cut -d'"' -f2)
-            local_remote=$(grep -E '^\s*CLOUD_DEST_1_REMOTE=' "${SCRIPT_DIR}/config/${local_instance}/replication_cloud.conf" 2>/dev/null | tail -1 | cut -d'"' -f2)
+            local_folder=$(extract_conf_value "${SCRIPT_DIR}/config/${local_instance}/replication_cloud.conf" "CLOUD_DEST_1_PATH")
+            local_remote=$(extract_conf_value "${SCRIPT_DIR}/config/${local_instance}/replication_cloud.conf" "CLOUD_DEST_1_REMOTE")
             echo -e "  $((i+1)). ${GREEN}${local_instance}${NC}  →  ${local_remote}${local_folder}"
         done
         echo ""
@@ -332,13 +354,13 @@ fi
 #################################################################################
 
 # Check if remote already exists
-if rclone listremotes 2>/dev/null | grep -q "^${RCLONE_REMOTE_NAME}:$"; then
+if rclone listremotes --config "$RCLONE_CONFIG_FILE" 2>/dev/null | grep -q "^${RCLONE_REMOTE_NAME}:$"; then
     echo -e "${YELLOW}Existing '${RCLONE_REMOTE_NAME}' remote found.${NC}"
     echo ""
     
     # Test current connection
     echo "Testing current connection..."
-    if rclone lsd "${RCLONE_REMOTE_NAME}:" &>/dev/null; then
+    if rclone lsd "${RCLONE_REMOTE_NAME}:" --config "$RCLONE_CONFIG_FILE" &>/dev/null; then
         echo -e "${GREEN}✓ Current authentication is still valid!${NC}"
         echo ""
         echo "No re-authentication needed. If you're still having issues,"
@@ -364,7 +386,7 @@ if rclone listremotes 2>/dev/null | grep -q "^${RCLONE_REMOTE_NAME}:$"; then
     
     # Delete existing remote
     echo "Removing existing '${RCLONE_REMOTE_NAME}' remote..."
-    rclone config delete "$RCLONE_REMOTE_NAME" 2>/dev/null || true
+    rclone config delete "$RCLONE_REMOTE_NAME" --config "$RCLONE_CONFIG_FILE" 2>/dev/null || true
 fi
 
 echo ""

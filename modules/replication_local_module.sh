@@ -84,6 +84,7 @@ declare -gA REPLICATION_DEST_DURATION=()     # Duration in seconds
 declare -gA REPLICATION_DEST_ERROR=()        # Last error message (for failed status)
 declare -gA REPLICATION_DEST_TRANSPORT=()    # Transport type: local/ssh/smb
 declare -gA REPLICATION_DEST_PATH=()         # Destination path
+declare -gA REPLICATION_DEST_SYNC_MODE=()    # Configured sync mode (name-keyed)
 
 # Per-destination transport metrics (for DB logging, metrics contract v1.0)
 declare -gA REPLICATION_DEST_AVAIL_BYTES=()  # Free bytes at dest (0 if unknown)
@@ -97,7 +98,7 @@ declare -gA REPLICATION_DEST_BWLIMIT=()      # Final bwlimit after adjustments
 # Used by get_replication_summary() to show "Total Replicated: X to N destination(s)"
 REPLICATION_TOTAL_SUCCESS=0     # Count of successful replication operations
 REPLICATION_TOTAL_FAILED=0      # Count of failed replication operations
-REPLICATION_TOTAL_SKIPPED=0     # Count of skipped destinations (disabled or mode override)
+REPLICATION_TOTAL_SKIPPED=0     # Count of skipped destinations (disabled in config)
 
 # Session timing - set by replicate_batch() for duration calculation
 REPLICATION_START_TIME=""       # ISO timestamp when replication phase started
@@ -446,7 +447,7 @@ _check_destination_space() {
     
     if [[ -z "$free_bytes" ]] || [[ "$free_bytes" -eq 0 ]]; then
         log_warn "replication_local_module.sh" "_check_destination_space" "Could not determine free space for: $dest_name"
-        if [[ "${REPLICATION_SPACE_CHECK}" == "skip" ]]; then
+        if [[ "${REPLICATION_SPACE_CHECK:-skip}" == "skip" ]]; then
             return 1
         fi
         return 0  # warn mode: proceed anyway
@@ -478,7 +479,7 @@ _check_destination_space() {
         log_error "replication_local_module.sh" "_check_destination_space" "Insufficient space on $dest_name"
         log_error "replication_local_module.sh" "_check_destination_space" "Required: $required_human, Available: $free_human"
         
-        if [[ "${REPLICATION_SPACE_CHECK}" == "skip" ]]; then
+        if [[ "${REPLICATION_SPACE_CHECK:-skip}" == "skip" ]]; then
             return 1
         fi
         log_warn "replication_local_module.sh" "_check_destination_space" "Proceeding anyway (space_check=warn)"
@@ -489,7 +490,7 @@ _check_destination_space() {
     if [[ $free_after_percent -lt $min_free_percent ]]; then
         log_warn "replication_local_module.sh" "_check_destination_space" "Low space warning: ${free_after_percent}% free after sync (min: ${min_free_percent}%)"
         
-        if [[ "${REPLICATION_SPACE_CHECK}" == "skip" ]]; then
+        if [[ "${REPLICATION_SPACE_CHECK:-skip}" == "skip" ]]; then
             log_error "replication_local_module.sh" "_check_destination_space" "Skipping replication due to low space"
             return 1
         fi
@@ -549,27 +550,34 @@ replicate_batch() {
     
     REPLICATION_START_TIME=$(date -u '+%Y-%m-%d %H:%M:%S')
     
-    # Check for pre-existing cancellation request
+    # Check for pre-existing cancellation request. Operator cancellation is treated
+    # as success (rc 0) to match the mid-run cancel path (which breaks and returns 0)
+    # and vmbackup.sh's own replicate-only cancel handling ("cancelled, exit=0").
     if type is_replication_cancelled &>/dev/null && is_replication_cancelled; then
         log_warn "replication_local_module.sh" "replicate_batch" "Replication cancellation flag detected before start - skipping all local replication"
         REPLICATION_END_TIME=$(date -u '+%Y-%m-%d %H:%M:%S')
-        return 1
+        return 0
     fi
     
     log_info "replication_local_module.sh" "replicate_batch" "Starting batch replication to $enabled_count enabled destination(s)"
     log_info "replication_local_module.sh" "replicate_batch" "Source: $backup_root"
     
-    # Calculate source size for space checking
-    log_info "replication_local_module.sh" "replicate_batch" "Calculating source size for space check..."
-    local source_size
-    source_size=$(du -sb "$backup_root" 2>/dev/null | cut -f1)
-    if [[ -n "$source_size" ]] && [[ "$source_size" =~ ^[0-9]+$ ]]; then
-        local source_human
-        source_human=$(numfmt --to=iec-i --suffix=B "$source_size" 2>/dev/null || echo "$source_size bytes")
-        log_info "replication_local_module.sh" "replicate_batch" "Source size: $source_human"
+    # Calculate source size for space checking — skip the potentially multi-TB
+    # du entirely when the space check is disabled (the size is unused there).
+    local source_size=0
+    if [[ "${REPLICATION_SPACE_CHECK:-skip}" != "disabled" ]]; then
+        log_info "replication_local_module.sh" "replicate_batch" "Calculating source size for space check..."
+        source_size=$(du -sb "$backup_root" 2>/dev/null | cut -f1)
+        if [[ -n "$source_size" ]] && [[ "$source_size" =~ ^[0-9]+$ ]]; then
+            local source_human
+            source_human=$(numfmt --to=iec-i --suffix=B "$source_size" 2>/dev/null || echo "$source_size bytes")
+            log_info "replication_local_module.sh" "replicate_batch" "Source size: $source_human"
+        else
+            source_size=0
+            log_warn "replication_local_module.sh" "replicate_batch" "Could not determine source size"
+        fi
     else
-        source_size=0
-        log_warn "replication_local_module.sh" "replicate_batch" "Could not determine source size"
+        log_debug "replication_local_module.sh" "replicate_batch" "Space check disabled — skipping source size du"
     fi
     
     local date_str=$(date '+%Y-%m-%d')
@@ -588,7 +596,6 @@ replicate_batch() {
         local sync_mode_var="DEST_${dest_num}_SYNC_MODE"
         local bwlimit_var="DEST_${dest_num}_BWLIMIT"
         local verify_var="DEST_${dest_num}_VERIFY"
-        local mode_override_var="DEST_${dest_num}_MODE_OVERRIDE"
         
         local dest_name="${!name_var:-dest_$dest_num}"
         local dest_enabled="${!enabled_var:-no}"
@@ -597,20 +604,12 @@ replicate_batch() {
         local sync_mode="${!sync_mode_var:-mirror}"
         local bwlimit="${!bwlimit_var:-0}"
         local verify_mode="${!verify_var:-size}"
-        local mode_override="${!mode_override_var:-}"
         
-        # Track transport and path for email reporting (Option B format)
+        # Track transport, path and sync mode for email reporting / DB logging
+        # (name-keyed so the DB-logging loop reads the true per-destination mode).
         REPLICATION_DEST_TRANSPORT["$dest_name"]="$dest_transport"
         REPLICATION_DEST_PATH["$dest_name"]="$dest_path"
-        
-        # Check if this destination should use per-vm mode instead
-        if [[ "$mode_override" == "per-vm" ]]; then
-            log_debug "replication_local_module.sh" "replicate_batch" "Destination $dest_name uses per-vm mode override, skipping batch"
-            REPLICATION_DEST_STATUS["$dest_name"]="skipped"
-            REPLICATION_DEST_ERROR["$dest_name"]="per-vm mode override"
-            ((REPLICATION_TOTAL_SKIPPED++))
-            continue
-        fi
+        REPLICATION_DEST_SYNC_MODE["$dest_name"]="$sync_mode"
         
         if [[ "$dest_enabled" != "yes" ]]; then
             log_debug "replication_local_module.sh" "replicate_batch" "Destination $dest_name disabled, skipping"
@@ -683,10 +682,19 @@ replicate_batch() {
                 fi
             fi
             if ! _check_destination_space "$dest_path" "$effective_required" "$dest_name"; then
+                # Fail-closed: no replica was made, so classify as FAILED (not a
+                # silent skip). Skip left replicate_batch returning 0 and exit-code
+                # monitoring seeing success for a permanently-unreplicable target;
+                # also honour REPLICATION_ON_FAILURE=abort like the other failures.
                 log_error "replication_local_module.sh" "replicate_batch" "Insufficient space at: $dest_name"
-                REPLICATION_DEST_STATUS["$dest_name"]="skipped"
+                REPLICATION_DEST_STATUS["$dest_name"]="failed"
                 REPLICATION_DEST_ERROR["$dest_name"]="Insufficient space"
-                ((REPLICATION_TOTAL_SKIPPED++))
+                ((REPLICATION_TOTAL_FAILED++))
+                
+                if [[ "${REPLICATION_ON_FAILURE}" == "abort" ]]; then
+                    log_error "replication_local_module.sh" "replicate_batch" "Aborting replication (on_failure=abort)"
+                    break
+                fi
                 continue
             fi
         fi
@@ -695,7 +703,7 @@ replicate_batch() {
         local sync_start
         sync_start=$(date +%s)
         
-        if transport_sync "$backup_root" "$dest_path" "$sync_mode" "$bwlimit" "$REPLICATION_DRY_RUN"; then
+        if transport_sync "$backup_root" "$dest_path" "$sync_mode" "$bwlimit" "$REPLICATION_DRY_RUN" "$dest_name"; then
             local sync_end
             sync_end=$(date +%s)
             local sync_duration=$((sync_end - sync_start))
@@ -805,8 +813,11 @@ replicate_batch() {
     } > "$state_file"
     log_debug "replication_local_module.sh" "replicate_batch" "Wrote state to $state_file"
     
-    # Log to SQLite database (parallel to state file)
-    if type sqlite_is_available &>/dev/null && sqlite_is_available; then
+    # Log to SQLite database (parallel to state file). Skip entirely in
+    # REPLICATION_DRY_RUN: transport_sync ran rsync --dry-run and transferred
+    # nothing, so a status='success' row here is a fake replica that retention
+    # counts (only status='success' rows unblock deletions).
+    if [[ "${REPLICATION_DRY_RUN:-false}" != "true" ]] && type sqlite_is_available &>/dev/null && sqlite_is_available; then
         for dest_name in "${!REPLICATION_DEST_STATUS[@]}"; do
             local status="${REPLICATION_DEST_STATUS[$dest_name]:-unknown}"
             local bytes="${REPLICATION_DEST_BYTES[$dest_name]:-0}"
@@ -819,10 +830,10 @@ replicate_batch() {
             # Don't record log_file if it doesn't actually exist on disk
             [[ -n "$log_file" && ! -f "$log_file" ]] && log_file=""
             
-            # Get sync_mode from destination config
-            local sync_mode_var="DEST_${dest_name^^}_SYNC_MODE"
-            sync_mode_var="${sync_mode_var//-/_}"
-            local sync_mode="${!sync_mode_var:-mirror}"
+            # Get sync_mode from the name-keyed array captured during the batch
+            # loop. Config vars are number-keyed (DEST_N_SYNC_MODE), so building
+            # DEST_<NAME>_SYNC_MODE here never resolved and every row logged 'mirror'.
+            local sync_mode="${REPLICATION_DEST_SYNC_MODE[$dest_name]:-mirror}"
             
             local run_id
             run_id=$(sqlite_log_replication_run \
@@ -947,6 +958,7 @@ get_replication_summary() {
             failed)   status_icon="❌ FAILED" ;;
             skipped)  status_icon="⏭️ SKIPPED" ;;
             disabled) status_icon="⏭️ DISABLED" ;;
+            cancelled) status_icon="🚫 CANCELLED" ;;
             *)        status_icon="❓ $status" ;;
         esac
         
@@ -1231,6 +1243,7 @@ get_local_replication_details() {
             case "$status" in
                 disabled) status_display="⏭️ DISABLED" ;;
                 skipped)  status_display="⏭️ SKIPPED" ;;
+                cancelled) status_display="🚫 CANCELLED" ;;
                 *)        status_display="? $status" ;;
             esac
             output+="│ ${dest_name}: ${status_display}

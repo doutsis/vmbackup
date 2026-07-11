@@ -36,6 +36,14 @@
 # UNI-321: idempotency guard — re-source is a no-op once sqlite_init_readonly is defined.
 declare -F sqlite_init_readonly >/dev/null 2>&1 && return 0
 
+# Module-state default (FF-87): sqlite_ro.sh may be sourced standalone on a
+# DR/restore host where sqlite_module.sh (whose declare -g normally supplies the
+# 0-default) is absent. Initialise the availability flag at load so the read
+# gates and sqlite_is_available never expand an unset var under the restore
+# binary's `set -u` (an rc-127 abort at the start of restore). Preserve any
+# value an already-loaded writer module set.
+declare -g SQLITE_MODULE_AVAILABLE="${SQLITE_MODULE_AVAILABLE:-0}"
+
 # Escape single quotes for SQL strings.
 # Single-quote doubling ('→'') is the ONLY escape needed for SQLite string
 # literals. Unlike MySQL/PostgreSQL, SQLite does not interpret backslash
@@ -68,7 +76,7 @@ sqlite_init_readonly() {
         return 1
     fi
 
-    local state_dir="${STATE_DIR:-${BACKUP_PATH}/_state}"
+    local state_dir="${STATE_DIR:-${BACKUP_PATH%/}/_state}"
     SQLITE_DB_PATH="${state_dir}/vmbackup.db"
 
     if [[ ! -f "$SQLITE_DB_PATH" ]]; then
@@ -113,6 +121,9 @@ _sqlite_query_formatted() {
 sqlite_query_today_sessions() {
     local days="${1:-1}"
     local output_mode="${2:-pipe}"
+    # FF-177: reject a non-integer days (e.g. a '7d' typo) before it splices
+    # into datetime('now','-$days days') and yields a silently empty report.
+    [[ "$days" =~ ^[1-9][0-9]*$ ]] || days=1
 
     if [[ "$SQLITE_MODULE_AVAILABLE" -ne 1 ]]; then
         return 1
@@ -147,6 +158,9 @@ sqlite_query_today_sessions() {
 # Returns: One row per VM in the session: vm_name, state, type, status, bytes, duration_sec
 sqlite_query_session_vm_backups_display() {
     local session_id="$1"
+    # FF-177: numeric-only session_id (rejects empty and non-integer) before it
+    # splices into "WHERE session_id = $session_id".
+    [[ "$session_id" =~ ^[0-9]+$ ]] || return 1
 
     [[ "$SQLITE_MODULE_AVAILABLE" -ne 1 ]] && return 1
     [[ -z "$session_id" ]] && return 1
@@ -183,6 +197,9 @@ sqlite_query_session_vm_backups_display() {
 #   $1 - session_id
 sqlite_query_session_retention_summary() {
     local session_id="$1"
+    # FF-177: numeric-only session_id (rejects empty and non-integer) before it
+    # splices into "WHERE session_id = $session_id".
+    [[ "$session_id" =~ ^[0-9]+$ ]] || return 1
 
     [[ "$SQLITE_MODULE_AVAILABLE" -ne 1 ]] && return 1
     [[ -z "$session_id" ]] && return 1
@@ -210,6 +227,9 @@ sqlite_query_session_retention_summary() {
 #   $1 - session_id
 sqlite_query_session_replication_summary() {
     local session_id="$1"
+    # FF-177: numeric-only session_id (rejects empty and non-integer) before it
+    # splices into "WHERE session_id = $session_id".
+    [[ "$session_id" =~ ^[0-9]+$ ]] || return 1
 
     [[ "$SQLITE_MODULE_AVAILABLE" -ne 1 ]] && return 1
     [[ -z "$session_id" ]] && return 1
@@ -238,6 +258,8 @@ sqlite_query_vm_history() {
     local vm_name="$1"
     local limit="${2:-10}"
     local output_mode="${3:-pipe}"
+    # FF-177: reject a non-integer limit before it splices into LIMIT $limit.
+    [[ "$limit" =~ ^[1-9][0-9]*$ ]] || limit=10
     
     if [[ "$SQLITE_MODULE_AVAILABLE" -ne 1 ]]; then
         return 1
@@ -284,6 +306,9 @@ sqlite_query_last_success() {
 sqlite_query_recent_failures() {
     local days="${1:-7}"
     local output_mode="${2:-pipe}"
+    # FF-177: reject a non-integer days (e.g. a '7d' typo) before it splices
+    # into datetime('now','-$days days') and yields a silently empty report.
+    [[ "$days" =~ ^[1-9][0-9]*$ ]] || days=7
     
     if [[ "$SQLITE_MODULE_AVAILABLE" -ne 1 ]]; then
         return 1
@@ -307,6 +332,9 @@ sqlite_query_recent_failures() {
 sqlite_query_today_replications() {
     local days="${1:-1}"
     local output_mode="${2:-pipe}"
+    # FF-177: reject a non-integer days (e.g. a '7d' typo) before it splices
+    # into datetime('now','-$days days') and yields a silently empty report.
+    [[ "$days" =~ ^[1-9][0-9]*$ ]] || days=1
     
     if [[ "$SQLITE_MODULE_AVAILABLE" -ne 1 ]]; then
         return 1
@@ -525,6 +553,9 @@ sqlite_query_recent_restores() {
     local days="${1:-7}"
     local vm_name="${2:-}"
     local output_mode="${3:-pipe}"
+    # FF-177: reject a non-integer days (e.g. a '7d' typo) before it splices
+    # into datetime('now','-$days days') and yields a silently empty report.
+    [[ "$days" =~ ^[1-9][0-9]*$ ]] || days=7
 
     [[ "$SQLITE_MODULE_AVAILABLE" -ne 1 ]] && return 1
 
@@ -560,6 +591,9 @@ sqlite_query_recent_restores() {
 #   qemu_agent|vm_paused|chain_archived|rotation_policy
 sqlite_query_session_vm_backups() {
     local session_id="${1:-$SQLITE_CURRENT_SESSION_ID}"
+    # FF-177: numeric-only session_id (rejects empty and non-integer) before it
+    # splices into "WHERE session_id = $session_id".
+    [[ "$session_id" =~ ^[0-9]+$ ]] || return 1
 
     if [[ "$SQLITE_MODULE_AVAILABLE" -ne 1 ]] || [[ -z "$session_id" ]]; then
         return 1
@@ -595,6 +629,9 @@ SQL_EOF
 #   files_transferred|duration_sec|destination|error_message
 sqlite_query_session_replication() {
     local session_id="${1:-$SQLITE_CURRENT_SESSION_ID}"
+    # FF-177: numeric-only session_id (rejects empty and non-integer) before it
+    # splices into "WHERE session_id = $session_id".
+    [[ "$session_id" =~ ^[0-9]+$ ]] || return 1
 
     if [[ "$SQLITE_MODULE_AVAILABLE" -ne 1 ]] || [[ -z "$session_id" ]]; then
         return 1
@@ -618,6 +655,9 @@ SQL_EOF
 #   vms_total|vms_success|vms_failed|vms_skipped|vms_excluded|bytes_total|status
 sqlite_query_session_summary() {
     local session_id="${1:-$SQLITE_CURRENT_SESSION_ID}"
+    # FF-177: numeric-only session_id (rejects empty and non-integer) before it
+    # splices into "WHERE id = $session_id".
+    [[ "$session_id" =~ ^[0-9]+$ ]] || return 1
 
     if [[ "$SQLITE_MODULE_AVAILABLE" -ne 1 ]] || [[ -z "$session_id" ]]; then
         return 1
@@ -691,13 +731,27 @@ sqlite_get_marked_chains() {
 # Returns: 0 if a session IS active (caller should NOT proceed), 1 if safe
 # Output:  prints running session count to stdout
 sqlite_is_session_active() {
-    [[ "$SQLITE_MODULE_AVAILABLE" -ne 1 ]] && return 1
+    # Fail CLOSED: this gates destructive ops (bulk deletes / Tier-3 sweeps).
+    # If the catalogue is unavailable or the COUNT query errors we cannot prove
+    # the store is idle, so report "at least one session may be active": stdout
+    # '1' (a nonzero integer, honoring the documented stdout contract for
+    # numeric consumers) and rc 0 (caller must NOT proceed). AMENDED E18.
+    if [[ "${SQLITE_MODULE_AVAILABLE:-0}" -ne 1 ]]; then
+        echo "1"
+        return 0
+    fi
 
-    local running_count
+    local running_count _rc_q
     running_count=$(sqlite3 "$SQLITE_DB_PATH" \
         "SELECT COUNT(*) FROM sessions WHERE status = 'running';" 2>/dev/null)
+    _rc_q=$?
 
-    if [[ "${running_count:-0}" -gt 0 ]]; then
+    if [[ $_rc_q -ne 0 ]] || ! [[ "$running_count" =~ ^[0-9]+$ ]]; then
+        echo "1"
+        return 0
+    fi
+
+    if [[ "$running_count" -gt 0 ]]; then
         echo "$running_count"
         return 0
     fi
@@ -713,7 +767,8 @@ sqlite_get_restorable_chains() {
     
     [[ "$SQLITE_MODULE_AVAILABLE" -ne 1 ]] && { echo "[]"; return 1; }
     
-    local esc_vm=$(_sql_escape "$vm_name")
+    local esc_vm
+    esc_vm=$(_sql_escape "$vm_name")
     
     sqlite3 "$SQLITE_DB_PATH" << SQL_EOF
 SELECT json_group_array(json_object(
@@ -721,11 +776,13 @@ SELECT json_group_array(json_object(
     'chain_status', chain_status, 'restorable_count', restorable_count,
     'total_checkpoints', total_checkpoints, 'broken_at', broken_at,
     'first_backup', first_backup, 'last_backup', last_backup
-)) FROM chain_health
-WHERE vm_name = '$esc_vm' 
-  AND chain_status IN ('active', 'archived', 'broken')
-  AND restorable_count > 0
-ORDER BY updated_at DESC;
+)) FROM (
+    SELECT * FROM chain_health
+    WHERE vm_name = '$esc_vm'
+      AND chain_status IN ('active', 'archived', 'broken')
+      AND restorable_count > 0
+    ORDER BY updated_at DESC
+);
 SQL_EOF
 }
 
@@ -755,7 +812,8 @@ SQL_EOF
 #
 # Arguments:
 #   $1 - setting_name to look up
-# Returns: previous value on stdout (empty if no previous session or setting not found)
+# Returns: previous value on stdout (empty if no previous session or setting
+#          not found); rc 2 on a sqlite3 query failure (FF-90 fail-closed)
 sqlite_query_previous_config_value() {
     local setting_name="$1"
     
@@ -782,6 +840,12 @@ LIMIT 1;
 PREV_SQL
 )
     
+    local _rc_prev=$?
+    # FF-90 fail-closed: a query failure (rc 2, per this file's Phase-4
+    # read-helper exit-code convention: 0 ok, 1 unavailable, 2 sqlite3 query
+    # failure) must be distinguishable from 'setting absent' (rc 0, empty),
+    # not silently read as a removed/absent setting.
+    [[ $_rc_prev -ne 0 ]] && return 2
     echo "$prev_value"
     return 0
 }
@@ -803,9 +867,13 @@ sqlite_query_previous_config_settings() {
         "SELECT instance FROM sessions WHERE id = $SQLITE_CURRENT_SESSION_ID LIMIT 1;")
     [[ -z "$current_instance" ]] && return 1
     
+    # Escape the prefix's LIKE metachars, then append a literal '%' wildcard
+    # (F-sql862 idiom). '_' in the real prefixes (LOCAL_DEST_ / CLOUD_DEST_) is
+    # otherwise LIKE's single-char wildcard; over-match set is empty today,
+    # defensive-by-consistency with the two escaped readers below.
     sqlite3 "$SQLITE_DB_PATH" 2>/dev/null << PREV_SETTINGS_SQL
 SELECT setting_name FROM config_events
-WHERE setting_name LIKE '$(_sql_escape "$prefix")%'
+WHERE setting_name LIKE REPLACE(REPLACE('$(_sql_escape "$prefix")','%','\%'),'_','\_') || '%' ESCAPE '\'
   AND event_type = 'config_loaded'
   AND session_id = (
     SELECT MAX(id) FROM sessions
@@ -865,6 +933,12 @@ sqlite_get_vm_period_replication_count() {
     local esc_vm esc_p out
     esc_vm=$(_sql_escape "$vm")
     esc_p=$(_sql_escape "$period")
+    # Anchor the period as the FINAL path segment. backup_path stores the bare
+    # period leaf (…/<vm>/<period>, get_vm_backup_dir), so ends-with ('%/'||<p>)
+    # isolates the period's own rows; the old '%/${period}%' substring let a
+    # monthly id over-match same-prefix daily dirs (61→3 live). REPLACE escapes
+    # LIKE metachars _/% (period ids have none today; defensive). NOT a trailing
+    # '/%' — that matches zero bare-leaf rows → fail-open data loss (F-sql862).
     out=$(sqlite3 "$db_path" \
         "SELECT COUNT(*) FROM replication_vms rv
          JOIN replication_runs rr ON rv.run_id = rr.id
@@ -873,7 +947,7 @@ sqlite_get_vm_period_replication_count() {
          AND rr.session_id IN (
              SELECT session_id FROM vm_backups
              WHERE vm_name = '$esc_vm'
-             AND backup_path LIKE '%/${period}%'
+             AND backup_path LIKE '%/' || REPLACE(REPLACE('$esc_p','%','\%'),'_','\_') ESCAPE '\'
              AND status = 'success'
          );" 2>/dev/null) || return 2
     echo "${out:-0}"
@@ -887,10 +961,14 @@ sqlite_get_last_successful_backup_at() {
     local esc_vm esc_p out
     esc_vm=$(_sql_escape "$vm")
     esc_p=$(_sql_escape "$period")
+    # Ends-with anchor on the bare period leaf (see sqlite_get_vm_period_replication_count):
+    # excludes same-prefix daily dirs so orphan-age reads THIS period's newest
+    # backup, not a foreign daily's. NOT trailing '/%' (zero rows → age 9999 →
+    # delete-everything). F-sql862.
     out=$(sqlite3 "$db_path" \
         "SELECT MAX(created_at) FROM vm_backups
          WHERE vm_name='$esc_vm'
-         AND backup_path LIKE '%/${period}%'
+         AND backup_path LIKE '%/' || REPLACE(REPLACE('$esc_p','%','\%'),'_','\_') ESCAPE '\'
          AND status='success';" 2>/dev/null) || return 2
     echo "$out"
 }
@@ -922,6 +1000,24 @@ sqlite_chain_period_exists_count() {
     out=$(sqlite3 "$db_path" \
         "SELECT COUNT(*) FROM chain_health
          WHERE vm_name='$esc_vm' AND period_id='$esc_p';" 2>/dev/null) || return 2
+    echo "${out:-0}"
+}
+
+# Count chain_created events already recorded for a VM's chain (FF-130 dedup).
+# post_backup_hook uses this to fire the chain_created lifecycle event exactly
+# once per logical chain, keyed on chain_id (the canonical chain identity).
+# Read-only SELECT — complies with the sqlite_ro.sh read-only contract.
+# Args: $1 db_path, $2 vm_name, $3 chain_id
+sqlite_get_chain_created_count() {
+    local db_path="$1" vm="$2" chain="$3"
+    [[ -z "$db_path" || ! -f "$db_path" ]] && return 1
+    local esc_vm esc_chain out
+    esc_vm=$(_sql_escape "$vm")
+    esc_chain=$(_sql_escape "$chain")
+    out=$(sqlite3 "$db_path" \
+        "SELECT COUNT(*) FROM chain_events
+         WHERE vm_name='$esc_vm' AND chain_id='$esc_chain'
+         AND event_type='chain_created';" 2>/dev/null) || return 2
     echo "${out:-0}"
 }
 
@@ -980,4 +1076,5 @@ export -f sqlite_get_vm_period_replication_count
 export -f sqlite_get_last_successful_backup_at
 export -f sqlite_get_tracked_periods
 export -f sqlite_chain_period_exists_count
+export -f sqlite_get_chain_created_count
 export -f sqlite_query_chain_health_email

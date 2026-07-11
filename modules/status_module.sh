@@ -68,15 +68,35 @@ _format_duration() {
 # SHARED OUTPUT FORMATTER
 #################################################################################
 
+# Convert a stored UTC timestamp ('YYYY-MM-DD HH:MM:SS', as written by
+# `date -u`) to local time for terminal display. USE-05: every catalogue
+# timestamp is stored UTC, but the rest of the operator-facing surface (journal,
+# session log, email report) prints local time — so `--status` rendered raw UTC,
+# producing a ~10h, prior-day mismatch next to the journal. Only values shaped
+# exactly like the stored format are touched; anything else (empty, '(never)',
+# already-formatted) passes through unchanged. CSV output is intentionally NOT
+# converted — machine consumers rely on stable UTC.
+_to_localtime() {
+    local ts="$1"
+    if [[ "$ts" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}$ ]]; then
+        date -d "${ts} UTC" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || printf '%s' "$ts"
+    else
+        printf '%s' "$ts"
+    fi
+}
+
 # Format pipe-delimited query output for terminal display
 # Replaces byte and duration columns with human-readable values
 # Arguments:
 #   $1 - byte_cols: comma-separated 1-based column indices for byte fields
 #   $2 - dur_cols: comma-separated 1-based column indices for duration fields
+#   $3 - tz_cols:  comma-separated 1-based column indices for UTC timestamp
+#                  fields to render in local time (USE-05)
 # Reads from stdin, writes to stdout
 _format_status_output() {
     local byte_cols="${1:-}"
     local dur_cols="${2:-}"
+    local tz_cols="${3:-}"
 
     local header_done=false
     while IFS='|' read -ra cols; do
@@ -112,6 +132,15 @@ _format_status_output() {
             # Format duration columns
             if [[ ",$dur_cols," == *",$col_num,"* ]]; then
                 val=$(_format_duration "$val")
+            fi
+
+            # Format timestamp columns (USE-05: stored UTC -> local for display)
+            if [[ -n "$tz_cols" && ",$tz_cols," == *",$col_num,"* ]]; then
+                if [[ -n "$val" ]]; then
+                    val=$(_to_localtime "$val")
+                else
+                    val="-"
+                fi
             fi
 
             [[ -n "$out" ]] && out+="|"
@@ -210,6 +239,18 @@ _format_csv_output() {
     done
 }
 
+# FF-121: quote a single CSV field (RFC4180) when it contains a comma, double
+# quote, or newline, so a libvirt VM name with a comma/quote cannot shift columns
+# for machine consumers. Plain fields pass through unchanged.
+_csv_field() {
+    local f="$1"
+    if [[ "$f" == *,* || "$f" == *'"'* || "$f" == *$'\n'* ]]; then
+        printf '%s' "\"${f//\"/\"\"}\""
+    else
+        printf '%s' "$f"
+    fi
+}
+
 #################################################################################
 # REPORT FUNCTIONS
 #################################################################################
@@ -306,16 +347,18 @@ _render_session_header() {
                    _vs _vf _vsk bytes_total _vmr _repr _retr <<< "$row"
 
     local label="${label_override:-${session_type:-standard}}"
-    local dur_fmt size_fmt
+    local dur_fmt size_fmt start_local
     dur_fmt=$(_format_duration "$duration_sec")
+    # USE-05: sessions.start_time is stored UTC; show local to match journal/log.
+    start_local=$(_to_localtime "$start_time")
 
     if [[ "$include_bytes" == "true" ]]; then
         size_fmt=$(_format_bytes "$bytes_total")
         printf "SESSION %s — %s  [%s]  %s  %s  %s  %s\n" \
-            "$sess_id" "$instance" "$label" "$start_time" "$status" "$dur_fmt" "$size_fmt"
+            "$sess_id" "$instance" "$label" "$start_local" "$status" "$dur_fmt" "$size_fmt"
     else
         printf "SESSION %s — %s  [%s]  %s  %s  %s\n" \
-            "$sess_id" "$instance" "$label" "$start_time" "$status" "$dur_fmt"
+            "$sess_id" "$instance" "$label" "$start_local" "$status" "$dur_fmt"
     fi
 }
 
@@ -519,7 +562,8 @@ _status_vm_history() {
         # bytes_written=col4, duration_sec=col5
         echo "$data" | _format_csv_output "4" "5"
     else
-        echo "$data" | _format_status_output "4" "5"
+        # USE-05: start_time=col1
+        echo "$data" | _format_status_output "4" "5" "1"
     fi
 }
 
@@ -535,7 +579,8 @@ _status_failures() {
     if [[ "$csv" == "true" ]]; then
         echo "$data"
     else
-        echo "$data" | _format_status_output "" ""
+        # USE-05: last_failure=col3
+        echo "$data" | _format_status_output "" "" "3"
     fi
 }
 
@@ -552,7 +597,8 @@ _status_replication() {
         # bytes_transferred=col6, duration_sec=col7 (start_time added at col1)
         echo "$data" | _format_csv_output "6" "7"
     else
-        echo "$data" | _format_status_output "6" "7"
+        # USE-05: start_time=col1
+        echo "$data" | _format_status_output "6" "7" "1"
     fi
 }
 
@@ -575,9 +621,11 @@ _status_chains() {
         fi
     else
         if [[ -z "$vm_name" ]]; then
-            echo "$data" | _format_status_output "8" ""
+            # USE-05: summary first_backup=col9, last_backup=col10
+            echo "$data" | _format_status_output "8" "" "9,10"
         else
-            echo "$data" | _format_status_output "7" ""
+            # USE-05: detail first_backup=col8, last_backup=col9
+            echo "$data" | _format_status_output "7" "" "8,9"
         fi
     fi
 }
@@ -629,7 +677,11 @@ _status_storage() {
     # until disk_used reaches (1 - abort_pct/100) * disk_total.
     # Render "(insufficient history)" if <7 v2.1+ sessions per spec §5.2.
     local projection_text="(insufficient history)"
-    if (( sample_count >= 7 )) && [[ -n "$oldest_time" ]] && [[ -n "$newest_time" ]] \
+    # FF-120: also require a live df total > 0 — when df fails, live_total_bytes /
+    # live_free_bytes stay 0, so abort_threshold=0 and headroom=0 fire the
+    # `<= 0` branch and print a FALSE 'ALREADY below DISK_ABORT_PCT' right under
+    # the 'Free space: (df failed ...)' line. No df total -> no projection.
+    if (( sample_count >= 7 )) && (( live_total_bytes > 0 )) && [[ -n "$oldest_time" ]] && [[ -n "$newest_time" ]] \
        && [[ "$oldest_used" =~ ^[0-9]+$ ]] && [[ "$newest_used" =~ ^[0-9]+$ ]]; then
         local days_span growth_bytes bytes_per_day
         days_span=$(sqlite3 "$SQLITE_DB_PATH" \
@@ -672,7 +724,7 @@ _status_storage() {
                 ls=${ls# } ls=${ls% }
                 af=${af# } af=${af% } af=${af%.*}
                 ai=${ai# } ai=${ai% } ai=${ai%.*}
-                echo "$vm,${af:-0},${ai:-0},${lw},${ls:-0},${trend}"
+                echo "$(_csv_field "$vm"),${af:-0},${ai:-0},$(_csv_field "$lw"),${ls:-0},${trend}"
             done <<< "$data"
         fi
         # Destination row (separate, second logical block)
@@ -754,13 +806,16 @@ _storage_trend_symbol() {
         return
     fi
 
-    # Percent change (integer math): (last5 - prev5) * 100 / prev5
-    local delta_pct=$(( (last5 - prev5) * 100 / prev5 ))
-    if   (( delta_pct >  10 )); then echo "↑↑"
-    elif (( delta_pct >=  1 )); then echo "↑"
-    elif (( delta_pct >  -1 )); then echo "→"
-    elif (( delta_pct >= -1 )); then echo "→"
-    else                              echo "↓"
+    # FF-122: rescaled comparison (num vs prev5*threshold) instead of a truncating
+    # `/prev5` — truncation toward zero mis-binned 10.1-10.9% as ↑ (should be ↑↑)
+    # and -1.01--1.99% as → (should be ↓). prev5>0 is guaranteed by the prev5==0
+    # guard above. Band boundaries preserved (stable = [-1%, 1%)); the two dead
+    # duplicate `→` branches are collapsed into one.
+    local num=$(( (last5 - prev5) * 100 ))
+    if   (( num >  10 * prev5 )); then echo "↑↑"
+    elif (( num >=       prev5 )); then echo "↑"
+    elif (( num >=      -prev5 )); then echo "→"
+    else                               echo "↓"
     fi
 }
 
@@ -772,11 +827,21 @@ _status_policies() {
     # Provide log stubs if logging module not loaded (status runs without full init)
     declare -f log_debug &>/dev/null || log_debug() { :; }
     declare -f log_info &>/dev/null  || log_info()  { :; }
+    # FF-123: status runs before lib/logging.sh is sourced, so stub log_warn/
+    # log_error too — else load_rotation_config's config-error paths hit
+    # 'command not found' (rc 127) instead of the intended diagnostic.
+    declare -f log_warn &>/dev/null  || log_warn()  { :; }
+    declare -f log_error &>/dev/null || log_error() { :; }
     source "$script_dir/modules/rotation_module.sh" 2>/dev/null || {
         echo "Error: rotation module not found" >&2
         return 1
     }
-    load_rotation_config "${CONFIG_INSTANCE:-default}"
+    # FF-123: honour load_rotation_config's rc (now fail-closed, FF-119) — a config
+    # source failure must not render default policy/retention as configured truth.
+    load_rotation_config "${CONFIG_INSTANCE:-default}" || {
+        echo "Error: failed to load rotation config for instance '${CONFIG_INSTANCE:-default}'" >&2
+        return 1
+    }
 
     # Get raw chain/orphan data from DB
     local data
@@ -824,8 +889,11 @@ _status_policies() {
             continue
         fi
 
-        # Trim whitespace
-        vm_name=$(echo "$vm_name" | xargs)
+        # Trim whitespace. 118-spaces: trim vm_name with parameter expansion, not
+        # `xargs` — xargs collapses internal whitespace and strips quotes, which
+        # would mangle a spaced name before the policy lookup below (the policy
+        # map is keyed by the exact real name). The numeric fields are space-free.
+        vm_name="${vm_name#"${vm_name%%[![:space:]]*}"}"; vm_name="${vm_name%"${vm_name##*[![:space:]]}"}"
         chains=$(echo "$chains" | xargs)
         orphans=$(echo "$orphans" | xargs)
         oldest_backup=$(echo "$oldest_backup" | xargs)
@@ -864,7 +932,7 @@ _status_policies() {
             local o_max_val="$orphan_max"
             local o_min_val="$orphan_min"
             [[ "$orphan_enabled" != "true" ]] && o_max_val="—" && o_min_val="—"
-            output+=$'\n'"$vm_name,$vm_policy,$override,$vm_ret_limit,$chains,$orphans,$oldest_backup,$retention_status,$orphan_ages_out,$default_policy,$default_limit,$o_max_val,$o_min_val"
+            output+=$'\n'"$(_csv_field "$vm_name"),$vm_policy,$override,$vm_ret_limit,$chains,$orphans,$oldest_backup,$retention_status,$orphan_ages_out,$default_policy,$default_limit,$o_max_val,$o_min_val"
         else
             output+=$'\n'"$vm_name|$vm_policy|$override|$vm_ret_limit|$chains|$orphans|$oldest_backup|$retention_status|$orphan_ages_out"
         fi
@@ -893,7 +961,9 @@ _status_restores() {
     if [[ "$csv" == "true" ]]; then
         echo "$data" | _format_csv_output "" "8"
     else
-        echo "$data" | _format_status_output "" "8"
+        # USE-05 (FF-124): start_time=col1, end_time=col2 are stored UTC — render
+        # local for terminal display, as every sibling report does. CSV stays UTC.
+        echo "$data" | _format_status_output "" "8" "1,2"
     fi
 }
 
@@ -909,6 +979,15 @@ _status_restores() {
 #   $4 - csv flag: true or false
 run_status_report() {
     local sub_mode="${1:-default}" vm_name="$2" days="${3:-1}" csv="${4:-false}"
+
+    # FF-125: days is interpolated raw into datetime('now','-$days days') by the
+    # sqlite_ro helpers and into $((days*3)) arithmetic. A non-numeric value (typo
+    # '7d', or an injection attempt) yields NULL WHERE-clauses (fail-open zero
+    # results) or an arithmetic error. Reject non-integers up front.
+    if [[ ! "$days" =~ ^[0-9]+$ ]]; then
+        echo "Error: --days must be a non-negative integer (got: '$days')" >&2
+        return 1
+    fi
 
     sqlite_init_readonly || return 1
 

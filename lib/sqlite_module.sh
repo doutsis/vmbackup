@@ -116,13 +116,14 @@ sqlite_init_database() {
         return 1
     fi
     
-    # Database path: ${STATE_DIR}/vmbackup.db
-    local state_dir="${STATE_DIR:-${BACKUP_PATH}/_state}"
+    # Database path: ${STATE_DIR}/vmbackup.db. %/} on the fallback so a slashed
+    # BACKUP_PATH (vmbackup's convention) yields a single-slash /_state, not //_state.
+    local state_dir="${STATE_DIR:-${BACKUP_PATH%/}/_state}"
     SQLITE_DB_PATH="${state_dir}/vmbackup.db"
 
     # INT-19 guard: the canonical state dir is "${BACKUP_PATH}/_state" at the
     # configured backup root. Any state_dir that lands inside .archives, inside
-    # a period directory (YYYY-MM-DD, YYYY-MM, YYYY-Www), or alongside .archives
+    # a period directory (YYYYMMDD, YYYYMM, YYYY-Www), or alongside .archives
     # via the "${dir}_state" no-slash composition pattern indicates a caller has
     # reassigned BACKUP_PATH/STATE_DIR to a sub-tree by mistake. We refuse to
     # mkdir there (would create a split-brain DB invisible to the real catalogue)
@@ -144,8 +145,8 @@ sqlite_init_database() {
             ;;
     esac
     case "$state_dir" in
-        */[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]/_state|*/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_state|\
-*/[0-9][0-9][0-9][0-9]-[0-9][0-9]/_state|*/[0-9][0-9][0-9][0-9]-[0-9][0-9]_state|\
+        */[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]/_state|*/[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_state|\
+*/[0-9][0-9][0-9][0-9][0-9][0-9]/_state|*/[0-9][0-9][0-9][0-9][0-9][0-9]_state|\
 */[0-9][0-9][0-9][0-9]-W[0-9][0-9]/_state|*/[0-9][0-9][0-9][0-9]-W[0-9][0-9]_state)
             log_error "$SQLITE_MODULE_NAME" "sqlite_init_database" \
                 "INT-19: refusing to initialise state dir inside a period dir: '$state_dir' (BACKUP_PATH='${BACKUP_PATH:-}' STATE_DIR='${STATE_DIR:-}'). Caller must use the configured backup-root BACKUP_PATH."
@@ -188,15 +189,58 @@ sqlite_init_database() {
     # busy_timeout prevents SQLITE_BUSY errors when writer holds the lock briefly
     sqlite3 "$SQLITE_DB_PATH" "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;" &>/dev/null
     
-    # Run schema migrations for existing databases
-    _sqlite_migrate_schema
-    
+    # Run schema migrations for existing databases. A failed migration must
+    # fail closed: declaring a wrong-schema catalogue "available" makes the tool
+    # write against a partially-migrated DB instead of falling back to the
+    # DB-absent walker/period path. Mirrors the _sqlite_create_schema guard
+    # above (F-sql192). (_sqlite_migrate_schema returns 0 on a fully-applied /
+    # already-at-current DB, 1 on any failed step — see its explicit `return 0`.)
+    if ! _sqlite_migrate_schema; then
+        log_error "$SQLITE_MODULE_NAME" "sqlite_init_database" \
+            "Schema migration failed; refusing to declare catalogue available"
+        SQLITE_MODULE_AVAILABLE=0
+        return 1
+    fi
+
+    # SEC-01: defensively normalise catalogue perms to 0640 root:backup on every
+    # init. The DB's mode is otherwise set purely by the umask in force when the
+    # inode was first created — a legacy inode born before the 0.5.6 `umask 027`
+    # hardening (under the old umask 022) stays world-readable 644 forever, since
+    # sqlite writes in place and never recreates the inode. This self-heals such
+    # inodes regardless of creation-time umask, mirroring the explicit-chmod
+    # pattern already used for the central log (logging_module.sh) and TPM
+    # metadata. Best-effort (|| true): a non-root reader (e.g. vmrestore on a DR
+    # recovery host, DOC-01) cannot chmod a root-owned DB and must not fail here.
+    # WAL is enabled above, so -wal/-shm sidecars may exist; tighten them too
+    # when present (they are transient — SQLite may checkpoint them away).
+    chown root:backup "$SQLITE_DB_PATH" 2>/dev/null || true
+    chmod 0640 "$SQLITE_DB_PATH" 2>/dev/null || true
+    local _sqlite_sidecar
+    for _sqlite_sidecar in "${SQLITE_DB_PATH}-wal" "${SQLITE_DB_PATH}-shm"; do
+        if [[ -e "$_sqlite_sidecar" ]]; then
+            chown root:backup "$_sqlite_sidecar" 2>/dev/null || true
+            chmod 0640 "$_sqlite_sidecar" 2>/dev/null || true
+        fi
+    done
+
     SQLITE_MODULE_AVAILABLE=1
     log_info "$SQLITE_MODULE_NAME" "sqlite_init_database" \
         "SQLite database initialized (schema v${SQLITE_SCHEMA_VERSION})"
     return 0
 }
 
+
+# Dotted-version "less than" (FF-81): returns 0 iff $1 orders strictly before
+# $2 under numeric/dotted-version rules. A bash string compare is lexicographic
+# ("2.9" < "2.10" is FALSE because '9' > '1'), which silently mis-sequences the
+# migration ladder at the first two-digit minor (2.10+). sort -V (already used
+# elsewhere in this tree) orders dotted versions correctly.
+_sqlite_version_lt() {
+    [[ "${1:-0}" != "${2:-0}" ]] || return 1
+    local _lowest
+    _lowest=$(printf '%s\n%s\n' "${1:-0}" "${2:-0}" | sort -V | head -n1)
+    [[ "$_lowest" == "${1:-0}" ]]
+}
 
 # Migrate schema for existing databases
 # Adds missing tables/columns from newer schema versions
@@ -209,7 +253,7 @@ _sqlite_migrate_schema() {
     fi
     
     # Migration: 1.2 -> 1.3 (add chain_health table)
-    if [[ "$current_version" < "1.3" ]]; then
+    if _sqlite_version_lt "$current_version" "1.3"; then
         log_info "$SQLITE_MODULE_NAME" "_sqlite_migrate_schema" \
             "Migrating schema from v$current_version to v1.3"
         
@@ -250,7 +294,7 @@ MIGRATE_EOF
     fi
     
     # Migration: 1.3 -> 1.4 (add orphan retention columns to chain_health)
-    if [[ "$current_version" < "1.4" ]]; then
+    if _sqlite_version_lt "$current_version" "1.4"; then
         log_info "$SQLITE_MODULE_NAME" "_sqlite_migrate_schema" \
             "Migrating schema from v$current_version to v1.4"
         
@@ -313,7 +357,7 @@ MIGRATE_1_4_IDX_EOF
     fi
     
     # Migration: 1.4 -> 1.5 (CSV-to-DB migration: new event tables + extended columns)
-    if [[ "$current_version" < "1.5" ]]; then
+    if _sqlite_version_lt "$current_version" "1.5"; then
         log_info "$SQLITE_MODULE_NAME" "_sqlite_migrate_schema" \
             "Migrating schema from v$current_version to v1.5 (CSV-to-DB migration)"
         
@@ -477,7 +521,7 @@ MIGRATE_1_5_EOF
     fi
 
     # Migration: 1.6 -> 1.7 (Backup lifecycle & retention management columns)
-    if [[ "$current_version" < "1.7" ]]; then
+    if _sqlite_version_lt "$current_version" "1.7"; then
         log_info "$SQLITE_MODULE_NAME" "_sqlite_migrate_schema" \
             "Migrating schema from v$current_version to v1.7 (lifecycle management)"
 
@@ -503,7 +547,7 @@ MIGRATE_1_5_EOF
     fi
 
     # Migration: 1.7 -> 1.8 (action_source column on retention_events)
-    if [[ "$current_version" < "1.8" ]]; then
+    if _sqlite_version_lt "$current_version" "1.8"; then
         log_info "$SQLITE_MODULE_NAME" "_sqlite_migrate_schema" \
             "Migrating schema from v$current_version to v1.8 (retention audit: action_source)"
 
@@ -525,7 +569,7 @@ MIGRATE_1_5_EOF
     fi
 
     # Migration: 1.8 -> 1.9 (drop unused bytes_transferred from replication_vms)
-    if [[ "$current_version" < "1.9" ]]; then
+    if _sqlite_version_lt "$current_version" "1.9"; then
         log_info "$SQLITE_MODULE_NAME" "_sqlite_migrate_schema" \
             "Migrating schema from v$current_version to v1.9 (drop unused column)"
 
@@ -548,7 +592,7 @@ MIGRATE_1_5_EOF
     fi
 
     # Migration: 1.9 -> 2.0 (add session_type to sessions)
-    if [[ "$current_version" < "2.0" ]]; then
+    if _sqlite_version_lt "$current_version" "2.0"; then
         log_info "$SQLITE_MODULE_NAME" "_sqlite_migrate_schema" \
             "Migrating schema from v$current_version to v2.0 (session_type column)"
 
@@ -570,7 +614,7 @@ MIGRATE_1_5_EOF
     fi
 
     # Migration: 2.0 -> 2.1 (add disk space snapshot columns to sessions)
-    if [[ "$current_version" < "2.1" ]]; then
+    if _sqlite_version_lt "$current_version" "2.1"; then
         log_info "$SQLITE_MODULE_NAME" "_sqlite_migrate_schema" \
             "Migrating schema from v$current_version to v2.1 (disk space snapshot columns)"
 
@@ -594,7 +638,7 @@ MIGRATE_1_5_EOF
     fi
 
     # Migration: 2.1 -> 2.2 (UNI-902b: restore_sessions table for vmrestore.sh logging)
-    if [[ "$current_version" < "2.2" ]]; then
+    if _sqlite_version_lt "$current_version" "2.2"; then
         log_info "$SQLITE_MODULE_NAME" "_sqlite_migrate_schema" \
             "Migrating schema from v$current_version to v2.2 (restore_sessions table)"
 
@@ -635,6 +679,12 @@ MIGRATE_2_2_EOF
         log_info "$SQLITE_MODULE_NAME" "_sqlite_migrate_schema" \
             "Schema migrated to v2.2 (added restore_sessions table for vmrestore logging)"
     fi
+
+    # Pin success rc explicitly (every failure path above already returns 1, and a
+    # DB already at the current schema falls through here): a future appended
+    # migration block ending in a nonzero command must not silently fail-close a
+    # healthy DB via the sqlite_init_database checked-return guard. Do not remove.
+    return 0
 }
 
 # Create database schema (tables and indexes)
@@ -1283,10 +1333,10 @@ sqlite_log_vm_backup() {
         '$(_sql_escape "$vm_name")', 
         '$(_sql_escape "$vm_status")', 
         '$(_sql_escape "$os_type")',
-        '$backup_type', 
-        '$backup_method', 
-        '$rotation_policy', 
-        '$status',
+        '$(_sql_escape "$backup_type")', 
+        '$(_sql_escape "$backup_method")', 
+        '$(_sql_escape "$rotation_policy")', 
+        '$(_sql_escape "$status")',
         $bytes_written, $chain_size_bytes, $total_dir_bytes, $restore_points,
         $restore_points_before,
         $duration_sec, 
@@ -1338,7 +1388,7 @@ sqlite_log_vm_backup() {
 #   $18 - bwlimit_final (optional, cloud only)
 # Returns: run_id on stdout, empty on failure
 sqlite_log_replication_run() {
-    [[ "${DRY_RUN:-false}" == true ]] && return 0
+    is_dry_run && return 0
     local endpoint_name="$1"
     local endpoint_type="$2"
     local transport="$3"
@@ -1375,14 +1425,14 @@ INSERT INTO replication_runs (
 ) VALUES (
     $SQLITE_CURRENT_SESSION_ID, 
     '$(_sql_escape "$endpoint_name")', 
-    '$endpoint_type',
-    '$transport', 
-    '$sync_mode', 
+    '$(_sql_escape "$endpoint_type")',
+    '$(_sql_escape "$transport")', 
+    '$(_sql_escape "$sync_mode")', 
     '$(_sql_escape "$destination")', 
-    '$start_time', 
-    '$end_time',
+    '$(_sql_escape "$start_time")', 
+    '$(_sql_escape "$end_time")',
     $duration_sec, $bytes_transferred, $files_transferred, 
-    '$status',
+    '$(_sql_escape "$status")',
     '$(_sql_escape "$error_message")', 
     '$(_sql_escape "$log_file")', 
     $dest_avail_bytes, $dest_total_bytes,
@@ -1437,7 +1487,7 @@ sqlite_log_replication_vm() {
 #   $@ - vm names (remaining arguments)
 # Returns: 0 on success, 1 on failure
 sqlite_log_replication_vms() {
-    [[ "${DRY_RUN:-false}" == true ]] && return 0
+    is_dry_run && return 0
     local run_id="$1"
     shift
     local run_status="$1"
@@ -1511,7 +1561,7 @@ sqlite_log_replication_vms() {
 #   $8 - rotation_policy (optional: daily|weekly|monthly)
 # Returns: 0 on success, 1 on failure
 sqlite_update_chain_health() {
-    [[ "${DRY_RUN:-false}" == true ]] && return 0
+    is_dry_run && return 0
     local vm_name="$1"
     local period_id="$2"
     local chain_location="$3"
@@ -1545,7 +1595,7 @@ sqlite_update_chain_health() {
     # Handle rotation_policy - if not provided, try to infer from period_id
     local esc_policy="NULL"
     if [[ -n "$rotation_policy" ]]; then
-        esc_policy="'$rotation_policy'"
+        esc_policy="'$(_sql_escape "$rotation_policy")'"
     elif [[ "$period_id" =~ ^[0-9]{4}-W[0-9]{2}$ ]]; then
         esc_policy="'weekly'"
     elif [[ "$period_id" =~ ^[0-9]{8}$ ]]; then
@@ -1594,7 +1644,7 @@ SQL_EOF
 #   $5 - total_size (optional, bytes)
 # Returns: 0 on success, 1 on failure
 sqlite_archive_chain() {
-    [[ "${DRY_RUN:-false}" == true ]] && return 0
+    is_dry_run && return 0
     local vm_name="$1" period_id="$2" chain_location="$3"
     local archive_path="${4:-}" total_size="${5:-0}"
     
@@ -1610,7 +1660,8 @@ sqlite_archive_chain() {
     local final_location="$esc_location"
     [[ -n "$archive_path" ]] && final_location="$esc_archive"
     
-    sqlite3 "$SQLITE_DB_PATH" << SQL_EOF
+    local _changed
+    _changed=$(sqlite3 "$SQLITE_DB_PATH" << SQL_EOF
 UPDATE chain_health SET
     chain_status = 'archived',
     chain_location = '$final_location',
@@ -1619,14 +1670,22 @@ UPDATE chain_health SET
     updated_at = '$now'
 WHERE vm_name = '$esc_vm' 
   AND period_id = '$esc_period';
+SELECT changes();
 SQL_EOF
+)
     local rc=$?
     if [[ $rc -ne 0 ]]; then
         log_error "$SQLITE_MODULE_NAME" "sqlite_archive_chain" "Failed to archive chain: vm=$vm_name period=$period_id (exit=$rc)"
-    else
-        log_debug "$SQLITE_MODULE_NAME" "sqlite_archive_chain" "Archived: vm=$vm_name period=$period_id location=$final_location"
+        return $rc
     fi
-    return $rc
+    # Fail closed: a zero-row UPDATE means no chain_health row exists for this
+    # (vm, period), so the archive was NOT recorded — do not report success.
+    if [[ "${_changed:-0}" -eq 0 ]]; then
+        log_error "$SQLITE_MODULE_NAME" "sqlite_archive_chain" "No chain_health row matched vm=$vm_name period=$period_id; archive not recorded"
+        return 1
+    fi
+    log_debug "$SQLITE_MODULE_NAME" "sqlite_archive_chain" "Archived: vm=$vm_name period=$period_id location=$final_location"
+    return 0
 }
 
 # Mark chain as broken (interrupted backup)
@@ -1638,7 +1697,7 @@ SQL_EOF
 #   $5 - error_message
 # Returns: 0 on success, 1 on failure
 sqlite_mark_chain_broken() {
-    [[ "${DRY_RUN:-false}" == true ]] && return 0
+    is_dry_run && return 0
     local vm_name="$1" period_id="$2" chain_location="$3"
     local broken_at="${4:-0}" error_message="${5:-interrupted}"
     
@@ -1689,7 +1748,7 @@ SQL_EOF
 #        'purged'  = operator removed via --prune
 # Returns: 0 on success, 1 on failure
 sqlite_mark_chain_deleted() {
-    [[ "${DRY_RUN:-false}" == true ]] && return 0
+    is_dry_run && return 0
     local vm_name="$1" period_id="$2"
     local chain_location="${3:-.}" reason="${4:-retention}"
     local target_status="${5:-deleted}"
@@ -1747,7 +1806,7 @@ SQL_EOF
 #   $5 - target_status (deleted|purged, default: deleted)
 # Returns: 0 on success (including no-row no-op), 1 on failure
 sqlite_mark_chain_deleted_if_exists() {
-    [[ "${DRY_RUN:-false}" == true ]] && return 0
+    is_dry_run && return 0
     local vm_name="$1" period_id="$2"
     local _chain_location="${3:-.}"   # accepted for parity, unused
     local reason="${4:-retention}"
@@ -1800,6 +1859,7 @@ SQL_EOF
 #   $2 - period_id
 # Returns: 0 on success, 1 on failure
 sqlite_mark_phantom_chain() {
+    is_dry_run && return 0
     local vm_name="$1" period_id="$2"
 
     [[ "$SQLITE_MODULE_AVAILABLE" -ne 1 ]] && return 1
@@ -1836,6 +1896,7 @@ SQL_EOF
 #   $3 - rotation_policy (e.g. weekly, monthly)
 # Returns: 0 on success, 1 on failure
 sqlite_register_untracked_period() {
+    is_dry_run && return 0
     local vm_name="$1" period_id="$2" policy="$3"
 
     [[ "$SQLITE_MODULE_AVAILABLE" -ne 1 ]] && return 1
@@ -1886,11 +1947,19 @@ sqlite_mark_chain_for_deletion() {
     local esc_by=$(_sql_escape "$marked_by")
     local now=$(date -u '+%Y-%m-%d %H:%M:%S')
 
-    # Refuse to mark protected chains
-    local protected
+    # Refuse to mark protected chains. Fail CLOSED: a query error (locked DB,
+    # missing column) must NOT be read as "not protected" — that would let a
+    # protected chain be marked. Distinguish a query failure from a real 0 count.
+    local protected _rc_prot
     protected=$(sqlite3 "$SQLITE_DB_PATH" \
         "SELECT COUNT(*) FROM chain_health WHERE vm_name='$esc_vm' AND period_id='$esc_period' AND purge_eligible=0;" 2>/dev/null)
-    if [[ "${protected:-0}" -gt 0 ]]; then
+    _rc_prot=$?
+    if [[ $_rc_prot -ne 0 ]] || ! [[ "$protected" =~ ^[0-9]+$ ]]; then
+        log_error "$SQLITE_MODULE_NAME" "sqlite_mark_chain_for_deletion" \
+            "Protection check failed (rc=$_rc_prot); refusing to mark: vm=$vm_name period=$period_id"
+        return 1
+    fi
+    if [[ "$protected" -gt 0 ]]; then
         log_warn "$SQLITE_MODULE_NAME" "sqlite_mark_chain_for_deletion" \
             "Cannot mark protected chain: vm=$vm_name period=$period_id"
         return 1
@@ -1906,7 +1975,8 @@ UPDATE chain_health SET
     chain_status = 'marked',
     marked_at = '$now', marked_by = '$esc_by', updated_at = '$now'
 WHERE vm_name = '$esc_vm' AND period_id = '$esc_period'
-  AND chain_status IN ('active', 'archived', 'broken');
+  AND chain_status IN ('active', 'archived', 'broken')
+  AND purge_eligible = 1;
 SQL_EOF
     local rc=$?
     if [[ $rc -ne 0 ]]; then
@@ -2037,7 +2107,7 @@ sqlite_unprotect_chain() {
 #   $15 - restore_point_ids (optional)
 # Returns: 0 on success, 1 on failure
 sqlite_log_chain_event() {
-    [[ "${DRY_RUN:-false}" == true ]] && return 0
+    is_dry_run && return 0
     local event_type="$1"
     local vm_name="$2"
     local chain_id="${3:-}"

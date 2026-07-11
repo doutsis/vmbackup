@@ -93,7 +93,7 @@ load_email_config() {
     
     # Apply defaults for optional settings
     EMAIL_HOSTNAME="${EMAIL_HOSTNAME:-$(hostname)}"
-    EMAIL_SUBJECT_PREFIX="${EMAIL_SUBJECT_PREFIX:-[VM Backup]}"
+    EMAIL_SUBJECT_PREFIX="${EMAIL_SUBJECT_PREFIX:-}"
     EMAIL_ON_SUCCESS="${EMAIL_ON_SUCCESS:-yes}"
     EMAIL_ON_FAILURE="${EMAIL_ON_FAILURE:-yes}"
     
@@ -113,7 +113,7 @@ load_email_config() {
 # These are set after config load based on BACKUP_PATH
 _init_email_paths() {
     EMAIL_BACKUP_PATH="${BACKUP_PATH:-/mnt/backup/vms/}"
-    EMAIL_STATE_DIR="${EMAIL_BACKUP_PATH}_state"
+    EMAIL_STATE_DIR="${EMAIL_BACKUP_PATH%/}/_state"
     EMAIL_LOG_DIR="${EMAIL_STATE_DIR}/logs"
 }
 
@@ -324,7 +324,7 @@ get_todays_log() {
             # If start_time contains a date prefix (YYYY-MM-DD HH:MM:SS), extract
             # just the time portion for comparison against log line timestamps.
             local start_time_only="$start_time"
-            if [[ "$start_time" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ (.+)$ ]]; then
+            if [[ "$start_time" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ ([0-9]{2}:[0-9]{2}:[0-9]{2}) ]]; then
                 start_time_only="${BASH_REMATCH[1]}"
             fi
             # Use awk to filter lines >= start_time on matching date
@@ -347,10 +347,14 @@ get_todays_log() {
             grep "^$date_str\|^\[$date_str" "$log_file" > "$temp_log" 2>/dev/null
         fi
         
-        # If no date-prefixed lines, try to get recent portion (last run)
+        # If no date-prefixed lines, try to get recent portion (last session).
+        # Only fire when the real banner ('VM Backup Session Started:', vmbackup.sh)
+        # exists, so a banner-less log falls through to the bounded tail rescue
+        # below instead of attaching the entire multi-session log.
         if [[ ! -s "$temp_log" ]]; then
-            # Get everything after last "Starting backup run" or similar marker
-            tac "$log_file" | sed '/Starting backup run\|BACKUP RUN STARTED/q' | tac > "$temp_log"
+            if grep -q 'VM Backup Session Started:' "$log_file"; then
+                tac "$log_file" | sed '/VM Backup Session Started:/q' | tac > "$temp_log"
+            fi
         fi
         
         # If still empty, just use last 500 lines
@@ -386,8 +390,8 @@ build_email_body() {
     
     # Calculate duration
     local start_epoch end_epoch duration_seconds duration_text
-    start_epoch=$(date -d "$start_time" +%s 2>/dev/null || echo "0")
     end_epoch=$(date -d "$end_time" +%s 2>/dev/null || date +%s)
+    start_epoch=$(date -d "$start_time" +%s 2>/dev/null || echo "$end_epoch")
     duration_seconds=$((end_epoch - start_epoch))
     duration_text=$(format_duration "$duration_seconds")
     
@@ -415,7 +419,7 @@ build_email_body() {
             while IFS='|' read -r ep_name ep_type transport ep_status ep_bytes \
                                ep_files ep_dur ep_dest ep_error; do
                 [[ -z "$ep_name" ]] && continue
-                local si="✓"; case "$ep_status" in failed) si="✗" ;; disabled) si="○" ;; esac
+                local si="✓"; case "$ep_status" in failed) si="✗" ;; disabled) si="○" ;; skipped) si="◇" ;; cancelled) si="🚫" ;; success) si="✓" ;; *) si="?" ;; esac
                 local bf=$(format_bytes "$ep_bytes") df=$(format_duration "$ep_dur")
                 local line="$si $ep_name ($transport): "
                 if [[ "$ep_status" == "success" ]]; then line+="$bf in $df"
@@ -741,6 +745,16 @@ build_subject() {
     local skipped_count=0
     local excluded_count=0
     
+    # FF-97 (v3): EMAIL_SUBJECT_PREFIX REPLACES the hardcoded 'VM Backup' lead on
+    # main subjects and is PREPENDED to replicate-only subjects only when set;
+    # unset/empty leaves every subject byte-identical to the pre-lever format
+    # (the shipped config carries the value ACTIVE, so default installs see the
+    # lead change to '[VM Backup] - ...'; no subject is ever double-stamped).
+    local raw="${EMAIL_SUBJECT_PREFIX:-}"
+    local lead="${raw:-VM Backup}"
+    local rprefix=""
+    [[ -n "$raw" ]] && rprefix="$raw "
+    
     # Query session summary from database
     if declare -f sqlite_query_session_summary >/dev/null 2>&1; then
         local summary_row
@@ -750,9 +764,9 @@ build_subject() {
             # Replicate-only session — distinct subject line
             if [[ "$_stype" == "replicate_only" ]]; then
                 if [[ "$_status" == "failed" ]]; then
-                    echo "Replication Only — $(hostname -s) — FAILED"
+                    echo "${rprefix}Replication Only — ${EMAIL_HOSTNAME:-$(hostname -s)} — FAILED"
                 else
-                    echo "Replication Only — $(hostname -s) — OK"
+                    echo "${rprefix}Replication Only — ${EMAIL_HOSTNAME:-$(hostname -s)} — OK"
                 fi
                 return
             fi
@@ -764,9 +778,9 @@ build_subject() {
     fi
     
     if [[ "$failed_count" -gt 0 ]]; then
-        echo "VM Backup - $success_count backed up, $excluded_count excluded, $failed_count FAILED"
+        echo "${lead} - $success_count backed up, $excluded_count excluded, $failed_count FAILED"
     else
-        echo "VM Backup - $success_count backed up, $excluded_count excluded - OK"
+        echo "${lead} - $success_count backed up, $excluded_count excluded - OK"
     fi
 }
 
@@ -877,11 +891,22 @@ send_backup_report() {
     
     # Use temp log directly for attachment (avoid permission issues)
     local attachment_name="$today_log"
+    local _attach_dir=""
     if [[ -f "$today_log" ]] && [[ -s "$today_log" ]]; then
-        # Rename temp file to have meaningful name (for email attachment)
-        local renamed_log="/tmp/vmbackup-${date_str}.txt"
-        mv "$today_log" "$renamed_log" 2>/dev/null || cp "$today_log" "$renamed_log" 2>/dev/null
-        attachment_name="$renamed_log"
+        # Stage under a private mktemp -d so the attachment keeps a meaningful
+        # filename WITHOUT a predictable /tmp path (symlink clobber as root /
+        # cross-instance race / stale-file attach). Check the mv/cp rc and fall
+        # back to the raw temp log on failure.
+        _attach_dir=$(mktemp -d "${TMPDIR:-/tmp}/vmbackup-mail.XXXXXX" 2>/dev/null)
+        if [[ -n "$_attach_dir" ]]; then
+            local renamed_log="${_attach_dir}/vmbackup-${date_str}.txt"
+            if mv "$today_log" "$renamed_log" 2>/dev/null || cp "$today_log" "$renamed_log" 2>/dev/null; then
+                attachment_name="$renamed_log"
+            else
+                rm -rf "$_attach_dir"
+                _attach_dir=""
+            fi
+        fi
     fi
     
     # Save debug copy of email to STATE_DIR/email/
@@ -918,15 +943,18 @@ send_backup_report() {
     echo "Email debug copy saved: $email_debug_file"
     
     # Send email
+    local _send_rc
     if send_email "$subject" "$body" "$attachment_name"; then
-        # Cleanup temp log
-        [[ -f "$attachment_name" ]] && [[ "$attachment_name" == /tmp/* ]] && rm -f "$attachment_name"
         echo "Email report sent successfully to $EMAIL_RECIPIENT"
-        return 0
+        _send_rc=0
     else
         echo "ERROR: Failed to send email report" >&2
-        return 1
+        _send_rc=1
     fi
+    # Cleanup the staged attachment (private mktemp -d dir) and the raw temp log
+    [[ -n "$_attach_dir" ]] && rm -rf "$_attach_dir"
+    [[ -f "$today_log" ]] && rm -f "$today_log"
+    return "$_send_rc"
 }
 
 # Test function - can be called directly for testing

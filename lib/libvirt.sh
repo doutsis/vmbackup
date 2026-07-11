@@ -95,11 +95,24 @@ lv_dump_xml_to_file() {
   local vm=$1
   local file=$2
   local mode=${3:-}
+  # FF-76: write to a temp sibling and publish with mv only on success, so a
+  # transient virsh failure never leaves a zero-byte / torn XML at $file
+  # (fail-closed: $file appears only when virsh returned 0). Preserves the
+  # "returns virsh's exit code" contract on the virsh-failure path.
+  local _tmp="${file}.tmp.$$" _rc
   if [[ $mode == "--inactive" ]]; then
-    virsh dumpxml --inactive "$vm" > "$file" 2>/dev/null
+    virsh dumpxml --inactive "$vm" > "$_tmp" 2>/dev/null
   else
-    virsh dumpxml "$vm" > "$file" 2>/dev/null
+    virsh dumpxml "$vm" > "$_tmp" 2>/dev/null
   fi
+  _rc=$?
+  if [[ $_rc -eq 0 ]]; then
+    mv -f "$_tmp" "$file" && return 0
+    rm -f "$_tmp"
+    return 1
+  fi
+  rm -f "$_tmp"
+  return "$_rc"
 }
 
 # Return 0 iff the domain XML contains a <tpm> element.
@@ -115,8 +128,33 @@ lv_xml_has_tpm() {
 # Print one disk source path per line (skips '-' entries used for
 # CDROM/floppy with no media). Output preserves original ordering.
 lv_list_disk_paths() {
+  # DISK-01 (118-spaces): read the Source column from `domblklist --details`,
+  # NOT `domblklist | awk '{print $2}'` — the latter truncates any source path
+  # at its first space (so a disk like "/mnt/vm/dev manjaro space.qcow2" came
+  # back as "/mnt/vm/dev") and leaked the "Source" header row. Selecting rows by
+  # device type ($2 ∈ disk/cdrom/floppy) skips the header/separator, and the
+  # Source path is recovered from the 4th field onward. (DISK-01's original
+  # `for i=4..NF` rejoin restored spaces but collapsed runs of whitespace — that
+  # regression was closed by FF-173 below.) Same
+  # internal-whitespace-is-load-bearing lesson as lv_domain_state.
+  # FF-173: the Source is the LAST column, so strip the first three
+  # whitespace-delimited fields (Type/Device/Target) and their padding and keep
+  # the line REMAINDER — internal whitespace verbatim. The previous `for i=4..NF`
+  # rejoin used a single space and collapsed any run of consecutive spaces/tabs
+  # inside the path, failing vmrestore's live-disk overwrite gate OPEN; keeping
+  # the remainder preserves the exact internal whitespace. Only TRAILING
+  # whitespace is stripped — tabular virsh output carries no meaningful trailing
+  # bytes, and a trailing-space path would spuriously mismatch downstream
+  # exact-path comparisons. A media-less entry ("-") is skipped.
+  # AMENDED (E16): NF>=4 — a malformed row with no Source column emits nothing.
   local vm=$1
-  virsh domblklist "$vm" 2>/dev/null | grep -E '^\s+' | awk '{print $2}' | grep -v '^-$'
+  virsh domblklist "$vm" --details 2>/dev/null \
+    | awk '$2 ~ /^(disk|cdrom|floppy)$/ && NF >= 4 {
+             src = $0
+             sub(/^[[:space:]]*[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+/, "", src)
+             sub(/[[:space:]]+$/, "", src)
+             if (src != "-" && src != "") print src
+           }'
 }
 
 # Print one disk target device per line (vda, vdb, sda, ...).
