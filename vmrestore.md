@@ -21,7 +21,7 @@
 - Catalogue-aware listing and restore-session history via the shared SQLite catalogue
 - Dry-run mode to preview every restore before executing
 
-> **Version:** 0.6.0 (ships in the unified vmbackup package)
+> **Version:** 0.6.1 (ships in the unified vmbackup package)
 > **Underlying tools:** virtnbdrestore v2.28
 
 ---
@@ -141,8 +141,8 @@ Even though it now shares vmbackup's `lib/` and SQLite catalogue, vmrestore rema
 vmrestore is installed by the **vmbackup** package — there is no separate vmrestore `.deb`.
 
 ```bash
-wget https://github.com/doutsis/vmbackup/releases/download/v0.6.0/vmbackup_0.6.0_all.deb
-sudo dpkg -i vmbackup_0.6.0_all.deb
+wget https://github.com/doutsis/vmbackup/releases/download/v0.6.1/vmbackup_0.6.1_all.deb
+sudo apt install ./vmbackup_0.6.1_all.deb
 ```
 
 The package declares `Provides: vmrestore` / `Replaces: vmrestore (<< 0.6.0)`, so `apt` removes any old standalone `vmrestore` package automatically on upgrade.
@@ -153,7 +153,7 @@ The package declares `Provides: vmrestore` / `Replaces: vmrestore (<< 0.6.0)`, s
 git clone https://github.com/doutsis/vmbackup.git
 cd vmbackup
 sudo make install                       # or, to build a package:
-make package && sudo dpkg -i build/vmbackup_0.6.0_all.deb
+make package && sudo apt install ./build/vmbackup_0.6.1_all.deb
 ```
 
 ### Uninstall
@@ -2179,7 +2179,7 @@ Symmetric with `vmbackup` — the same number means the same category in both to
 
 ---
 
-*vmrestore 0.6.0 — ships in the unified [vmbackup](https://github.com/doutsis/vmbackup) package*
+*vmrestore 0.6.1 — ships in the unified [vmbackup](https://github.com/doutsis/vmbackup) package*
 
 <p align="center">
   <img src="docs/vibe-coded.png" alt="Vibe Coded" />
