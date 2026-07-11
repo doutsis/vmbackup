@@ -786,7 +786,7 @@ All config files are self-documenting — `config/template/` contains every sett
 
 - **LZ4 level 0** is broken in virtnbdbackup ≤2.28 — vmbackup detects this and bumps to 1. Fast mode (1–2) and HC mode (3–16) produce virtually identical compression ratios for VM disk data (~1.30× vs ~1.31×), but HC is ~15× slower.
 - **Orphan retention** — when a VM's rotation policy changes (e.g. weekly→monthly), old period directories become "orphaned" and invisible to count-based retention. The four `RETENTION_ORPHAN_*` settings provide age-based cleanup. Start with `DRY_RUN=true` to preview what would be removed.
-- **FSTRIM on Windows** is significantly slower without the VirtIO `discard_granularity` XML fix — see [Known Issues](#known-issues). VMs without a QEMU guest agent are skipped automatically; the exclude file is for VMs that *have* an agent but should still be excluded (e.g., database servers where TRIM causes latency spikes, legacy guests with buggy drivers).
+- **FSTRIM on Windows** is significantly slower without the VirtIO `discard_granularity` XML fix — see [Known Issues](#known-issues--mitigations). VMs without a QEMU guest agent are skipped automatically; the exclude file is for VMs that *have* an agent but should still be excluded (e.g., database servers where TRIM causes latency spikes, legacy guests with buggy drivers).
 - **Each config instance should use a unique `BACKUP_PATH`**. The directory structure is `$BACKUP_PATH/<vm_name>/<period>/`, where `<period>` depends on the rotation policy (`YYYYMMDD` daily, `YYYY-Www` weekly, `YYYYMM` monthly; `accumulate` has no period subdirectory). See [Period ID Generation](#period-id-generation).
 
 #### vm_overrides.conf — Per-VM Policies
@@ -1881,7 +1881,7 @@ No modules or library files call `set_backup_permissions()`. All file/directory 
 | `/opt/vmbackup/transports/*.sh` | `root:backup` | `750` | Transport drivers |
 | `/opt/vmbackup/config/default/*.conf` | `root:backup` | `640` | Instance config (conffiles) |
 | `/var/log/vmbackup/` | `root:backup` | `750` | Log directory |
-| `/run/vmbackup/` | `root:backup` | `750` | Lock files |
+| `/run/vmbackup/` | `root:backup` | `750` | Runtime directory (created by the installers; reserved — the product's locks live in `$BACKUP_PATH/_state/locks/`) |
 | `$BACKUP_PATH/` | `root:backup` | `2750` | Backup data root (SGID) |
 | `$BACKUP_PATH/<vm>/` | `root:backup` | `2750` | Per-VM backup dirs (SGID inherited) |
 | `$BACKUP_PATH/<vm>/config/` | `root:backup` | `2750` | VM libvirt XML snapshots |
@@ -2096,7 +2096,7 @@ Databases are migrated automatically to the current schema (v2.2) on first write
 | `restore_sessions` | serial | rowid via `last_insert_rowid()` | `start_time` (+ `created_at`) |
 | `schema_info` | — (key/value) | n/a | `value` where `key='created'` |
 
-**Rule of thumb:** treat `id` as a surrogate key everywhere. Only `sessions` may be time-decoded from `id`, and even there `start_time` is preferred for display. A preventive lint (`tests/schema01-id-semantics-guard.sh`) fails the build if a `datetime(<table>.id,'unixepoch')` is introduced against any serial-id table.
+**Rule of thumb:** treat `id` as a surrogate key everywhere. Only `sessions` may be time-decoded from `id`, and even there `start_time` is preferred for display. A preventive lint in the development tree fails the dev build if a `datetime(<table>.id,'unixepoch')` is introduced against any serial-id table.
 
 ### Module Loading
 

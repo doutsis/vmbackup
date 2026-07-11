@@ -94,7 +94,7 @@ package: clean
 	install -d -m 755 $(PKG_DIR)/usr/share/doc/$(PKG_NAME)
 	install -m 644 debian/copyright $(PKG_DIR)/usr/share/doc/$(PKG_NAME)/copyright
 	# Generate proper Debian-format changelog from upstream CHANGELOG.md
-	printf '%s (%s) unstable; urgency=medium\n\n  * See /opt/vmbackup/CHANGELOG.md or upstream\n    https://github.com/doutsis/vmbackup/blob/main/CHANGELOG.md\n    for the full release history.\n\n -- James Doutsis <james@doutsis.com>  %s\n' \
+	printf '%s (%s) unstable; urgency=medium\n\n  * See the upstream changelog for the full release history:\n    https://github.com/doutsis/vmbackup/blob/main/CHANGELOG.md\n\n -- James Doutsis <james@doutsis.com>  %s\n' \
 	  '$(PKG_NAME)' '$(VERSION)' "$$(date -R)" \
 	  | gzip -9n > $(PKG_DIR)/usr/share/doc/$(PKG_NAME)/changelog.Debian.gz
 	chmod 644 $(PKG_DIR)/usr/share/doc/$(PKG_NAME)/changelog.Debian.gz
@@ -258,6 +258,7 @@ uninstall:
 # sync with copilot/109-phase3.5-spec.md §2 if either ever changes.
 
 lint-baseline:
+	@test -d tests || { echo "lint-baseline: tests/ not shipped in this tree (development-repo target) — skipping"; exit 0; }
 	@find . -name '*.sh' \
 	     -not -path './.git/*' \
 	     -not -path './tests/tmp/*' \
@@ -273,6 +274,7 @@ lint-baseline:
 	@echo "Regenerated tests/lint-baseline.txt ($$(wc -l < tests/lint-baseline.txt) lines)."
 
 lint:
+	@test -f tests/lint-baseline.txt || { echo "lint: tests/ not shipped in this tree (development-repo target) — skipping"; exit 0; }
 	@actual=$$(mktemp); \
 	find . -name '*.sh' \
 	     -not -path './.git/*' \
