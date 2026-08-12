@@ -2689,6 +2689,25 @@ Replication runs after backup completes, copying backups to secondary storage. T
 
 Both systems use a pluggable transport architecture. New endpoints can be added by implementing the corresponding transport contract — see [Transport Function Contract](#transport-function-contract) for local transports and [Cloud Transport Metrics Contract](#cloud-transport-metrics-contract) for cloud transports.
 
+### What Is Replicated
+
+Replication copies the backup data itself — every VM's period directories, chains and archived chains — plus a **consistent point-in-time snapshot of the catalogue**. It deliberately does **not** copy the live `_state/` working files.
+
+| Path | Replicated | Why |
+|------|-----------|-----|
+| `<vm>/<period>/…` (chains, archives) | **Yes** | This is the backup data; it is what a restore reads. |
+| `_state/backups/state-*.tar.gz` | **Yes** | Completed, internally-consistent catalogue snapshots, written once and never mutated. |
+| `_state/vmbackup.db` (+ `-wal`, `-shm`) | No | The live SQLite catalogue, open and being written for the whole session. |
+| `_state/logs/`, `_state/.last_rotation`, `_state/vmbackup.pid` | No | Live working files that change while the session runs. |
+
+**Why the live catalogue is excluded (0.6.2).** Replication runs while a backup session is still open, so the live catalogue and its logs are being written *as the copy is made*. Copying them produced two problems: the post-upload verification compared a file that had changed since it was sent and reported a spurious `[WARN] Found differences` on every run, and the copy that landed in the replica could be a torn, internally inconsistent database. Replicating only the completed `state-*.tar.gz` snapshots removes both: the verification is comparing files that cannot change mid-flight, and the replica's catalogue copy is always consistent.
+
+For the local (rsync) transport the size-based verification subtracts `_state/` from both sides, so an excluded directory can no longer make source and destination sizes disagree.
+
+> **This does not weaken disaster recovery.** `vmrestore` reconstructs from the backup tree itself and falls back to walking the disk when no catalogue is present — the catalogue is an observability layer, not a restore dependency. A replica therefore holds everything a restore needs, plus a consistent catalogue snapshot to rebuild reporting history from.
+>
+> Note that an exclusion stops files being *sent*; it does not delete files a previous release already placed in the replica. After upgrading, a replica may still hold stale `_state/` files frozen at the last pre-0.6.2 run. They are inert, and can be removed at the destination whenever convenient.
+
 ### Replication Order (vmbackup.conf)
 
 The `REPLICATION_ORDER` setting in `vmbackup.conf` controls execution:

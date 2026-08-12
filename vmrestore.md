@@ -1767,8 +1767,10 @@ sudo vmrestore --vm my-vm --restore-path /tmp/restore --skip-tpm
 ### BitLocker and TPM
 
 - **DR restore:** Same UUID → TPM sealed data is accessible → BitLocker unlocks automatically
-- **Clone restore:** New UUID, but TPM state is copied to the new UUID path → BitLocker unlocks automatically (PCR measurements match because firmware and NVRAM are identical)
+- **Clone restore:** New UUID, but TPM state is copied to the new UUID path → BitLocker unlocks automatically (PCR measurements match because firmware and NVRAM are identical). If the clone's own UUID cannot be resolved, the TPM restore is **skipped** rather than guessed — see the 0.6.2 note below.
 - **If TPM state is lost:** BitLocker will request a recovery key (find it in `tpm-state/bitlocker-recovery-keys.txt` in the backup)
+
+> **A clone restore never writes the source VM's TPM (0.6.2):** a clone's TPM state is written to a path derived from the clone's own UUID. If that UUID could not be read back from the newly defined VM, earlier releases fell back to the UUID recorded in the backup's metadata — which is the **original** VM's. On a clone of a VM that is still running, that path is the live original's TPM state, so a restore the operator never aimed at that VM could overwrite it. vmrestore now detects the unresolved-UUID case and **skips the TPM restore entirely**: the source VM is left untouched, a warning names the clone and points at `tpm-state/bitlocker-recovery-keys.txt`, and the summary reports `TPM ✗` rather than success. The clone's disks still restore normally — only its TPM state is absent, so a BitLocker guest will ask for its recovery key on first boot.
 
 > **Restore result reflects TPM outcome (0.6.0):** when the disks restore but TPM/BitLocker state fails to apply, vmrestore no longer reports an unqualified success. The summary line carries a `TPM ✓` token on success or `TPM ✗ (manual unlock required)` on failure (the token is omitted entirely for VMs without TPM), so a half-restored guest cannot look fully healthy.
 >

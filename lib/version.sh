@@ -13,4 +13,4 @@
 # UNI-321: idempotency guard — readonly assignment would error on re-source.
 # Constant-only lib (no functions); use variable-presence guard.
 [[ -n "${VMBACKUP_VERSION+x}" ]] && return 0
-readonly VMBACKUP_VERSION="0.6.1"
+readonly VMBACKUP_VERSION="0.6.2"

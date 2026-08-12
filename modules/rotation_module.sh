@@ -277,7 +277,7 @@ get_vm_backup_dir() {
 # lib/vm_name_utils.sh whenever this module was loaded, which defeated the
 # UNI-011 silent-retargeting fix. The strict validator (sourced by both
 # binaries before any module) is now the single definition. Do not reintroduce
-# a lenient copy here. See copilot/115-B3.md (R3).
+# a lenient copy here.
 
 #################################################################################
 # PERIOD BOUNDARY DETECTION

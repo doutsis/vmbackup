@@ -244,7 +244,7 @@ uninstall:
 	@echo "Backup data was not touched."
 	@echo ""
 
-# ── Lint gate (added 2026-05-06 by Phase 3.5; see copilot/109-phase3.5-spec.md) ──
+# ── Lint gate ──
 #
 # `make lint` runs shellcheck across every tracked *.sh file, diffs against
 # tests/lint-baseline.txt, and fails ONLY on additions. Removals (improvements)
@@ -254,8 +254,8 @@ uninstall:
 # after fixing a real bug surfaced by the gate, or rarely, to absorb a
 # warning that has been judged acceptable noise.
 #
-# The find-pipeline below is the canonical source of truth — keep it in
-# sync with copilot/109-phase3.5-spec.md §2 if either ever changes.
+# The find-pipeline below is the canonical source of truth for which files are
+# linted — keep the `lint` and `lint-baseline` targets in sync if it ever changes.
 
 lint-baseline:
 ifeq (,$(wildcard tests))

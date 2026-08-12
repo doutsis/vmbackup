@@ -309,6 +309,18 @@ cloud_transport_sharepoint_upload() {
             ;;
         everything|"")
             cloud_log_info "Scope: everything"
+            # INT-21: exclude the live-mutating _state/ runtime (torn vmbackup.db,
+            # logs, email, temp, pid, cancel-replication, *_replication_state.txt,
+            # .last_rotation, and the transient .staging/.partial under backups/),
+            # KEEPING only the completed DR snapshots _state/backups/state-*.tar.gz.
+            # rclone --filter +/- rules add NO implicit '- **', so unmatched VM
+            # payload stays included; first-match-wins, so the + backups re-includes
+            # MUST precede the - /_state/** sweep. everything-scope only: archives-only
+            # already excludes _state via its --include.
+            exclude_arr+=(--filter "+ /_state/backups/state-*.tar.gz")
+            exclude_arr+=(--filter "+ /_state/backups/")
+            exclude_arr+=(--filter "+ /_state/")
+            exclude_arr+=(--filter "- /_state/**")
             ;;
         *)
             cloud_log_warn "Unhandled scope '$scope' - failing closed (valid scopes: everything, archives-only)"
@@ -317,10 +329,11 @@ cloud_transport_sharepoint_upload() {
             ;;
     esac
     
-    # Exclude files that are actively being written during backup
-    # These cause "source file is being updated" errors
-    exclude_arr+=(--exclude "_state/logs/vmbackup.log")
-    exclude_arr+=(--exclude "_state/replication_logs/**")  # ALL replication logs (includes rclone's own log!)
+    # Exclude swtpm lock files from the VM payload (e.g. tpm2/.lock) — these are never
+    # under _state/backups/, so this does not touch the completed DR snapshots. The former
+    # _state/logs and _state/replication_logs excludes here are now subsumed by the
+    # everything-scope _state/ filter above (INT-21); archives-only scope excludes _state/
+    # via its --include, so live _state/ never leaks in either scope.
     exclude_arr+=(--exclude "**/*.lock")
     
     # Build VM exclusions
@@ -384,7 +397,8 @@ cloud_transport_sharepoint_upload() {
     rclone_log_file=$(tu_get_replication_log_path "cloud" "$name")
     cloud_log_info "Rclone log: $rclone_log_file"
     
-    # Note: rclone log is already excluded by _state/replication_logs/** pattern
+    # Note: the rclone log (under _state/replication_logs/) is swept from the upload by the
+    # everything-scope - /_state/** filter above (INT-21); archives-only excludes it via its --include.
     
     # FF-61: source size is intentionally NOT computed here. Its only consumer was
     # arg 3 of _cloud_monitor_rclone_progress, which discards it (local _unused="$3";

@@ -3243,8 +3243,43 @@ restore_vm() {
         if [[ -f "$data_dir/.tpm-backup-marker" || -d "$data_dir/tpm-state" ]]; then
             _tpm_applicable=true
         fi
-        restore_tpm "$tpm_name" "$data_dir" "$OPT_DRY_RUN" "$new_uuid" && _tpm_rc=0 || _tpm_rc=$?
-        if [[ "$_tpm_applicable" == true && "$_tpm_rc" -ne 0 && "$OPT_DRY_RUN" != true ]]; then
+        # FF-12: clone-mode TPM guard. In clone mode the clone's OWN UUID is the
+        # only safe restore_tpm target. When it is unresolvable (new_uuid empty —
+        # define_new_identity defined the domain but could not read its UUID
+        # back), restore_tpm's UUID ladder would fall back to BACKUP_METADATA.txt,
+        # which carries the ORIGINAL source VM's UUID (written capture-side at
+        # modules/tpm_backup_module.sh). restore_tpm would then move the RUNNING
+        # source VM's swtpm state aside and copy the backup over it: silent
+        # cross-VM TPM/BitLocker corruption. Gate on the tpm-state/ dir — the exact
+        # precondition restore_tpm mutates under: a marker-only backup with no
+        # tpm-state/ returns 0 at restore_tpm's 1500-1503 arm without ever
+        # computing a target, so it must fall through to the HEAD-identical quiet
+        # path, NOT this skip. When tpm-state/ IS present (incl. archived chains
+        # with no marker), skip entirely, never touch the source, and warn loudly
+        # so the operator brings the clone's recovery credential to first boot.
+        local _tpm_clone_skip=false
+        if [[ "$new_identity" == true && -d "$data_dir/tpm-state" && -z "${new_uuid:-}" ]]; then
+            _tpm_clone_skip=true
+            if [[ "$OPT_DRY_RUN" == true ]]; then
+                log_info "vmrestore.sh" "restore_vm" "[DRY RUN] Clone '$tpm_name' TPM: would restore to the clone's NEW UUID (assigned at define time — unknown in preview), or SKIP with a loud warning if that UUID cannot be read back; the source VM's swtpm is never touched either way"
+            else
+                _tpm_rc=1  # skipped, NOT restored: summary must render TPM ✗, never ✓
+                log_warn "vmrestore.sh" "restore_vm" "TPM restore SKIPPED for clone '$tpm_name' (non-fatal — disk is intact)"
+                log_warn "vmrestore.sh" "restore_vm" "============================================================"
+                log_warn "vmrestore.sh" "restore_vm" "  ACTION REQUIRED: TPM state was NOT restored for clone '$tpm_name'."
+                log_warn "vmrestore.sh" "restore_vm" "  Its UUID could not be resolved, so restoring the TPM could"
+                log_warn "vmrestore.sh" "restore_vm" "  have misdirected onto the SOURCE VM's swtpm state — refused, to keep"
+                log_warn "vmrestore.sh" "restore_vm" "  the source VM untouched. The clone's disk restore succeeded"
+                log_warn "vmrestore.sh" "restore_vm" "  and it will boot, but its TPM is empty until you supply the"
+                log_warn "vmrestore.sh" "restore_vm" "  recovery credential at first boot:"
+                log_warn "vmrestore.sh" "restore_vm" "    - Windows + BitLocker: 48-digit BitLocker recovery key"
+                log_warn "vmrestore.sh" "restore_vm" "    - Linux LUKS-via-TPM: fall back to LUKS passphrase"
+                log_warn "vmrestore.sh" "restore_vm" "============================================================"
+            fi
+        else
+            restore_tpm "$tpm_name" "$data_dir" "$OPT_DRY_RUN" "$new_uuid" && _tpm_rc=0 || _tpm_rc=$?
+        fi
+        if [[ "$_tpm_applicable" == true && "$_tpm_rc" -ne 0 && "$OPT_DRY_RUN" != true && "$_tpm_clone_skip" == false ]]; then
             log_warn "vmrestore.sh" "restore_vm" "TPM restore failed (non-fatal — disk is intact)"
             log_warn "vmrestore.sh" "restore_vm" "============================================================"
             log_warn "vmrestore.sh" "restore_vm" "  ACTION REQUIRED: TPM state was NOT restored for this VM."

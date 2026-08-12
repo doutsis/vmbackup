@@ -141,6 +141,18 @@ _local_parse_rsync_files() {
     echo "${count:-0}"
 }
 
+# INT-21: rsync filter set that excludes the live-mutating _state/ runtime while KEEPING
+# the completed DR snapshots _state/backups/state-*.tar.gz. Shared by transport_sync and
+# _local_verify_checksum so the two sites cannot drift. Anchored (/_state/) to the transfer
+# root; the parent-dir --includes let rsync descend to the snapshot before the --exclude sweep.
+_local_state_exclude_filter() {
+    printf '%s\n' \
+        '--include=/_state/' \
+        '--include=/_state/backups/' \
+        '--include=/_state/backups/state-*.tar.gz' \
+        '--exclude=/_state/**'
+}
+
 #################################################################################
 # transport_init - Verify destination is accessible and writable
 #################################################################################
@@ -277,6 +289,13 @@ transport_sync() {
         _local_log_info "sync" "DRY RUN - no changes will be made"
     fi
     
+    # INT-21: exclude the live-mutating _state/ runtime from the sync (keeping only the
+    # completed DR snapshot state-*.tar.gz), so the torn mid-write vmbackup.db is never
+    # replicated. Same filter set as the checksum verify, via one shared helper.
+    local _state_filter=()
+    mapfile -t _state_filter < <(_local_state_exclude_filter)
+    rsync_opts+=("${_state_filter[@]}")
+
     _local_log_debug "sync" "[RSYNC-CMD] rsync ${rsync_opts[*]} $source_path $dest_path"
     
     # Get source size
@@ -439,7 +458,20 @@ _local_verify_size() {
     local source_size dest_size
     source_size=$(tu_get_dir_size "$source_path")
     dest_size=$(tu_get_dir_size "$dest_path")
-    
+
+    # INT-21: the sync excludes the live _state/ runtime (keeping only the DR snapshot),
+    # so a correct replica legitimately lacks most of _state/. Subtract ALL of _state/ from
+    # BOTH whole-tree sizes before the coarse compare, so the sync-excluded runtime is not
+    # counted as a size mismatch. Numeric-guarded; a missing/unmeasurable _state/ contributes
+    # 0. The snapshot's integrity is covered by checksum verify, not this coarse size mode.
+    local src_state_size dst_state_size
+    src_state_size=$(tu_get_dir_size "$source_path/_state")
+    dst_state_size=$(tu_get_dir_size "$dest_path/_state")
+    [[ "$src_state_size" =~ ^[0-9]+$ ]] || src_state_size=0
+    [[ "$dst_state_size" =~ ^[0-9]+$ ]] || dst_state_size=0
+    [[ "$source_size" =~ ^[0-9]+$ ]] && source_size=$((source_size - src_state_size))
+    [[ "$dest_size" =~ ^[0-9]+$ ]] && dest_size=$((dest_size - dst_state_size))
+
     # FF-136: fail closed when du could not measure a side. If du fails on BOTH
     # source and dest the tolerance math below evaluates 0<=0 and falsely "passes";
     # a zero-byte source is likewise unmeasurable/unexpected for a backup store.
@@ -474,8 +506,14 @@ _local_verify_checksum() {
     
     _local_log_info "verify" "Running checksum verification with rsync --checksum --dry-run"
     
+    # INT-21: apply the SAME _state/ exclusion as the sync (shared helper) so a
+    # _state/-runtime-only difference is not counted as a checksum mismatch (false-fail),
+    # while the completed DR snapshot state-*.tar.gz stays byte-verified.
+    local _state_filter=()
+    mapfile -t _state_filter < <(_local_state_exclude_filter)
+
     local rsync_output
-    rsync_output=$(rsync --archive --checksum --dry-run --itemize-changes "$source_path" "$dest_path" 2>&1)
+    rsync_output=$(rsync --archive --checksum --dry-run --itemize-changes "${_state_filter[@]}" "$source_path" "$dest_path" 2>&1)
     local rsync_exit=$?
     
     if [[ $rsync_exit -ne 0 ]]; then

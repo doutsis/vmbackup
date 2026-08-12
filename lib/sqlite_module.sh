@@ -88,11 +88,23 @@ declare -g SQLITE_MODULE_AVAILABLE=0
 #=============================================================================
 
 
+# Module-local sqlite3 wrapper (FF-174): prepend a per-connection busy-timeout
+# via the `.timeout` dot-command so EVERY sqlite3 invocation in this module waits
+# up to SQLITE_BUSY_TIMEOUT_MS (default 5000 ms) for a contended lock instead of
+# failing instantly with SQLITE_BUSY. `command` bypasses any function/alias named
+# sqlite3; the dot-command runs on the SAME connection before the SQL arg / stdin
+# heredoc, so the timeout governs the statement that follows. A numeric `.timeout`
+# emits nothing (sqlite3 >= 3.8.7), so command-substitution / 2>&1 captures are
+# uncorrupted and the uncontended path is byte-identical.
+_sq3() {
+    command sqlite3 -cmd ".timeout ${SQLITE_BUSY_TIMEOUT_MS:-5000}" "$@"
+}
+
 # Run SQL and get result - helper to consolidate sqlite3 calls
 # Usage: result=$(_sql_exec "SELECT ...")
 _sql_exec() {
     local result
-    result=$(sqlite3 "$SQLITE_DB_PATH" "$1" 2>&1)
+    result=$(_sq3 "$SQLITE_DB_PATH" "$1" 2>&1)
     local rc=$?
     if [[ $rc -ne 0 ]]; then
         log_debug "$SQLITE_MODULE_NAME" "_sql_exec" "SQL error (rc=$rc): $result"
@@ -178,7 +190,7 @@ sqlite_init_database() {
     fi
     
     # Verify database is accessible
-    if ! sqlite3 "$SQLITE_DB_PATH" "SELECT 1;" &>/dev/null; then
+    if ! _sq3 "$SQLITE_DB_PATH" "SELECT 1;" &>/dev/null; then
         log_error "$SQLITE_MODULE_NAME" "sqlite_init_database" \
             "Database not accessible: $SQLITE_DB_PATH"
         SQLITE_MODULE_AVAILABLE=0
@@ -186,8 +198,10 @@ sqlite_init_database() {
     fi
     
     # Enable WAL mode for concurrent read/write access (e.g., TUI reading during backup)
-    # busy_timeout prevents SQLITE_BUSY errors when writer holds the lock briefly
-    sqlite3 "$SQLITE_DB_PATH" "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;" &>/dev/null
+    # The busy timeout for this (and every) connection comes from _sq3's `.timeout`
+    # -cmd (FF-174). Do NOT re-add an inline PRAGMA busy_timeout here — it would
+    # re-set the connection's timeout and override the SQLITE_BUSY_TIMEOUT_MS knob.
+    _sq3 "$SQLITE_DB_PATH" "PRAGMA journal_mode=WAL;" &>/dev/null
     
     # Run schema migrations for existing databases. A failed migration must
     # fail closed: declaring a wrong-schema catalogue "available" makes the tool
@@ -246,7 +260,7 @@ _sqlite_version_lt() {
 # Adds missing tables/columns from newer schema versions
 _sqlite_migrate_schema() {
     local current_version
-    current_version=$(sqlite3 "$SQLITE_DB_PATH" "SELECT value FROM schema_info WHERE key='version';" 2>/dev/null)
+    current_version=$(_sq3 "$SQLITE_DB_PATH" "SELECT value FROM schema_info WHERE key='version';" 2>/dev/null)
     
     if [[ -z "$current_version" ]]; then
         current_version="1.0"
@@ -257,7 +271,7 @@ _sqlite_migrate_schema() {
         log_info "$SQLITE_MODULE_NAME" "_sqlite_migrate_schema" \
             "Migrating schema from v$current_version to v1.3"
         
-        sqlite3 "$SQLITE_DB_PATH" 2>/dev/null << 'MIGRATE_EOF'
+        _sq3 "$SQLITE_DB_PATH" 2>/dev/null << 'MIGRATE_EOF'
 CREATE TABLE IF NOT EXISTS chain_health (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     vm_name             TEXT NOT NULL,
@@ -298,7 +312,7 @@ MIGRATE_EOF
         log_info "$SQLITE_MODULE_NAME" "_sqlite_migrate_schema" \
             "Migrating schema from v$current_version to v1.4"
         
-        sqlite3 "$SQLITE_DB_PATH" 2>/dev/null << 'MIGRATE_1_4_EOF'
+        _sq3 "$SQLITE_DB_PATH" 2>/dev/null << 'MIGRATE_1_4_EOF'
 BEGIN;
 
 -- Add columns for cross-policy retention (idempotent: check before adding)
@@ -318,20 +332,20 @@ MIGRATE_1_4_EOF
         # Run ALTER TABLE statements separately (they auto-commit in SQLite)
         # Check each column exists before adding to handle partial prior migrations
         local _ch_cols
-        _ch_cols=$(sqlite3 "$SQLITE_DB_PATH" "SELECT name FROM pragma_table_info('chain_health');" 2>/dev/null)
+        _ch_cols=$(_sq3 "$SQLITE_DB_PATH" "SELECT name FROM pragma_table_info('chain_health');" 2>/dev/null)
         
         if ! echo "$_ch_cols" | grep -qx 'rotation_policy'; then
-            sqlite3 "$SQLITE_DB_PATH" "ALTER TABLE chain_health ADD COLUMN rotation_policy TEXT;" 2>/dev/null
+            _sq3 "$SQLITE_DB_PATH" "ALTER TABLE chain_health ADD COLUMN rotation_policy TEXT;" 2>/dev/null
         fi
         if ! echo "$_ch_cols" | grep -qx 'archive_size_bytes'; then
-            sqlite3 "$SQLITE_DB_PATH" "ALTER TABLE chain_health ADD COLUMN archive_size_bytes INTEGER DEFAULT 0;" 2>/dev/null
+            _sq3 "$SQLITE_DB_PATH" "ALTER TABLE chain_health ADD COLUMN archive_size_bytes INTEGER DEFAULT 0;" 2>/dev/null
         fi
         if ! echo "$_ch_cols" | grep -qx 'purge_eligible'; then
-            sqlite3 "$SQLITE_DB_PATH" "ALTER TABLE chain_health ADD COLUMN purge_eligible INTEGER DEFAULT 1;" 2>/dev/null
+            _sq3 "$SQLITE_DB_PATH" "ALTER TABLE chain_health ADD COLUMN purge_eligible INTEGER DEFAULT 1;" 2>/dev/null
         fi
 
         # Create index and backfill (idempotent operations)
-        sqlite3 "$SQLITE_DB_PATH" 2>/dev/null << 'MIGRATE_1_4_IDX_EOF'
+        _sq3 "$SQLITE_DB_PATH" 2>/dev/null << 'MIGRATE_1_4_IDX_EOF'
 CREATE INDEX IF NOT EXISTS idx_chain_health_policy 
     ON chain_health(vm_name, rotation_policy, chain_status);
 
@@ -364,36 +378,36 @@ MIGRATE_1_4_IDX_EOF
         # Run ALTER TABLE statements individually with column-existence checks
         # This makes the migration idempotent (safe to re-run after partial failure)
         local _vb_cols _rv_cols _rr_cols
-        _vb_cols=$(sqlite3 "$SQLITE_DB_PATH" "SELECT name FROM pragma_table_info('vm_backups');" 2>/dev/null)
-        _rv_cols=$(sqlite3 "$SQLITE_DB_PATH" "SELECT name FROM pragma_table_info('replication_vms');" 2>/dev/null)
-        _rr_cols=$(sqlite3 "$SQLITE_DB_PATH" "SELECT name FROM pragma_table_info('replication_runs');" 2>/dev/null)
+        _vb_cols=$(_sq3 "$SQLITE_DB_PATH" "SELECT name FROM pragma_table_info('vm_backups');" 2>/dev/null)
+        _rv_cols=$(_sq3 "$SQLITE_DB_PATH" "SELECT name FROM pragma_table_info('replication_vms');" 2>/dev/null)
+        _rr_cols=$(_sq3 "$SQLITE_DB_PATH" "SELECT name FROM pragma_table_info('replication_runs');" 2>/dev/null)
 
         # vm_backups extensions
         echo "$_vb_cols" | grep -qx 'restore_points_before' || \
-            sqlite3 "$SQLITE_DB_PATH" "ALTER TABLE vm_backups ADD COLUMN restore_points_before INTEGER DEFAULT 0;" 2>/dev/null
+            _sq3 "$SQLITE_DB_PATH" "ALTER TABLE vm_backups ADD COLUMN restore_points_before INTEGER DEFAULT 0;" 2>/dev/null
         echo "$_vb_cols" | grep -qx 'retry_attempt' || \
-            sqlite3 "$SQLITE_DB_PATH" "ALTER TABLE vm_backups ADD COLUMN retry_attempt INTEGER DEFAULT 0;" 2>/dev/null
+            _sq3 "$SQLITE_DB_PATH" "ALTER TABLE vm_backups ADD COLUMN retry_attempt INTEGER DEFAULT 0;" 2>/dev/null
         echo "$_vb_cols" | grep -qx 'archived_restore_points' || \
-            sqlite3 "$SQLITE_DB_PATH" "ALTER TABLE vm_backups ADD COLUMN archived_restore_points INTEGER DEFAULT 0;" 2>/dev/null
+            _sq3 "$SQLITE_DB_PATH" "ALTER TABLE vm_backups ADD COLUMN archived_restore_points INTEGER DEFAULT 0;" 2>/dev/null
         echo "$_vb_cols" | grep -qx 'event_type' || \
-            sqlite3 "$SQLITE_DB_PATH" "ALTER TABLE vm_backups ADD COLUMN event_type TEXT;" 2>/dev/null
+            _sq3 "$SQLITE_DB_PATH" "ALTER TABLE vm_backups ADD COLUMN event_type TEXT;" 2>/dev/null
         echo "$_vb_cols" | grep -qx 'event_detail' || \
-            sqlite3 "$SQLITE_DB_PATH" "ALTER TABLE vm_backups ADD COLUMN event_detail TEXT;" 2>/dev/null
+            _sq3 "$SQLITE_DB_PATH" "ALTER TABLE vm_backups ADD COLUMN event_detail TEXT;" 2>/dev/null
 
         # replication_vms extensions
         echo "$_rv_cols" | grep -qx 'status' || \
-            sqlite3 "$SQLITE_DB_PATH" "ALTER TABLE replication_vms ADD COLUMN status TEXT;" 2>/dev/null
+            _sq3 "$SQLITE_DB_PATH" "ALTER TABLE replication_vms ADD COLUMN status TEXT;" 2>/dev/null
 
         # replication_runs extensions
         echo "$_rr_cols" | grep -qx 'retry_attempt' || \
-            sqlite3 "$SQLITE_DB_PATH" "ALTER TABLE replication_runs ADD COLUMN retry_attempt INTEGER DEFAULT 0;" 2>/dev/null
+            _sq3 "$SQLITE_DB_PATH" "ALTER TABLE replication_runs ADD COLUMN retry_attempt INTEGER DEFAULT 0;" 2>/dev/null
         echo "$_rr_cols" | grep -qx 'backup_timestamp' || \
-            sqlite3 "$SQLITE_DB_PATH" "ALTER TABLE replication_runs ADD COLUMN backup_timestamp TEXT;" 2>/dev/null
+            _sq3 "$SQLITE_DB_PATH" "ALTER TABLE replication_runs ADD COLUMN backup_timestamp TEXT;" 2>/dev/null
         echo "$_rr_cols" | grep -qx 'destination_path' || \
-            sqlite3 "$SQLITE_DB_PATH" "ALTER TABLE replication_runs ADD COLUMN destination_path TEXT;" 2>/dev/null
+            _sq3 "$SQLITE_DB_PATH" "ALTER TABLE replication_runs ADD COLUMN destination_path TEXT;" 2>/dev/null
 
         # New tables and indexes (all idempotent via IF NOT EXISTS)
-        sqlite3 "$SQLITE_DB_PATH" 2>/dev/null << 'MIGRATE_1_5_EOF'
+        _sq3 "$SQLITE_DB_PATH" 2>/dev/null << 'MIGRATE_1_5_EOF'
 CREATE TABLE IF NOT EXISTS chain_events (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id          INTEGER REFERENCES sessions(id),
@@ -526,16 +540,16 @@ MIGRATE_1_5_EOF
             "Migrating schema from v$current_version to v1.7 (lifecycle management)"
 
         local _ch_cols_17
-        _ch_cols_17=$(sqlite3 "$SQLITE_DB_PATH" "SELECT name FROM pragma_table_info('chain_health');" 2>/dev/null)
+        _ch_cols_17=$(_sq3 "$SQLITE_DB_PATH" "SELECT name FROM pragma_table_info('chain_health');" 2>/dev/null)
 
         echo "$_ch_cols_17" | grep -qx 'marked_at' || \
-            sqlite3 "$SQLITE_DB_PATH" "ALTER TABLE chain_health ADD COLUMN marked_at TEXT;" 2>/dev/null
+            _sq3 "$SQLITE_DB_PATH" "ALTER TABLE chain_health ADD COLUMN marked_at TEXT;" 2>/dev/null
         echo "$_ch_cols_17" | grep -qx 'marked_by' || \
-            sqlite3 "$SQLITE_DB_PATH" "ALTER TABLE chain_health ADD COLUMN marked_by TEXT;" 2>/dev/null
+            _sq3 "$SQLITE_DB_PATH" "ALTER TABLE chain_health ADD COLUMN marked_by TEXT;" 2>/dev/null
         echo "$_ch_cols_17" | grep -qx 'purged_at' || \
-            sqlite3 "$SQLITE_DB_PATH" "ALTER TABLE chain_health ADD COLUMN purged_at TEXT;" 2>/dev/null
+            _sq3 "$SQLITE_DB_PATH" "ALTER TABLE chain_health ADD COLUMN purged_at TEXT;" 2>/dev/null
 
-        sqlite3 "$SQLITE_DB_PATH" "UPDATE schema_info SET value = '1.7' WHERE key = 'version';" 2>/dev/null
+        _sq3 "$SQLITE_DB_PATH" "UPDATE schema_info SET value = '1.7' WHERE key = 'version';" 2>/dev/null
         if [[ $? -ne 0 ]]; then
             log_error "$SQLITE_MODULE_NAME" "_sqlite_migrate_schema" \
                 "Schema migration v$current_version→v1.7 FAILED"
@@ -552,12 +566,12 @@ MIGRATE_1_5_EOF
             "Migrating schema from v$current_version to v1.8 (retention audit: action_source)"
 
         local _re_cols_18
-        _re_cols_18=$(sqlite3 "$SQLITE_DB_PATH" "SELECT name FROM pragma_table_info('retention_events');" 2>/dev/null)
+        _re_cols_18=$(_sq3 "$SQLITE_DB_PATH" "SELECT name FROM pragma_table_info('retention_events');" 2>/dev/null)
 
         echo "$_re_cols_18" | grep -qx 'action_source' || \
-            sqlite3 "$SQLITE_DB_PATH" "ALTER TABLE retention_events ADD COLUMN action_source TEXT;" 2>/dev/null
+            _sq3 "$SQLITE_DB_PATH" "ALTER TABLE retention_events ADD COLUMN action_source TEXT;" 2>/dev/null
 
-        sqlite3 "$SQLITE_DB_PATH" "UPDATE schema_info SET value = '1.8' WHERE key = 'version';" 2>/dev/null
+        _sq3 "$SQLITE_DB_PATH" "UPDATE schema_info SET value = '1.8' WHERE key = 'version';" 2>/dev/null
         if [[ $? -ne 0 ]]; then
             log_error "$SQLITE_MODULE_NAME" "_sqlite_migrate_schema" \
                 "Schema migration v$current_version→v1.8 FAILED"
@@ -574,13 +588,13 @@ MIGRATE_1_5_EOF
             "Migrating schema from v$current_version to v1.9 (drop unused column)"
 
         local _rv_cols_19
-        _rv_cols_19=$(sqlite3 "$SQLITE_DB_PATH" "SELECT name FROM pragma_table_info('replication_vms');" 2>/dev/null)
+        _rv_cols_19=$(_sq3 "$SQLITE_DB_PATH" "SELECT name FROM pragma_table_info('replication_vms');" 2>/dev/null)
 
         if echo "$_rv_cols_19" | grep -qx 'bytes_transferred'; then
-            sqlite3 "$SQLITE_DB_PATH" "ALTER TABLE replication_vms DROP COLUMN bytes_transferred;" 2>/dev/null
+            _sq3 "$SQLITE_DB_PATH" "ALTER TABLE replication_vms DROP COLUMN bytes_transferred;" 2>/dev/null
         fi
 
-        sqlite3 "$SQLITE_DB_PATH" "UPDATE schema_info SET value = '1.9' WHERE key = 'version';" 2>/dev/null
+        _sq3 "$SQLITE_DB_PATH" "UPDATE schema_info SET value = '1.9' WHERE key = 'version';" 2>/dev/null
         if [[ $? -ne 0 ]]; then
             log_error "$SQLITE_MODULE_NAME" "_sqlite_migrate_schema" \
                 "Schema migration v$current_version→v1.9 FAILED"
@@ -597,12 +611,12 @@ MIGRATE_1_5_EOF
             "Migrating schema from v$current_version to v2.0 (session_type column)"
 
         local _sess_cols_20
-        _sess_cols_20=$(sqlite3 "$SQLITE_DB_PATH" "SELECT name FROM pragma_table_info('sessions');" 2>/dev/null)
+        _sess_cols_20=$(_sq3 "$SQLITE_DB_PATH" "SELECT name FROM pragma_table_info('sessions');" 2>/dev/null)
 
         echo "$_sess_cols_20" | grep -qx 'session_type' || \
-            sqlite3 "$SQLITE_DB_PATH" "ALTER TABLE sessions ADD COLUMN session_type TEXT;" 2>/dev/null
+            _sq3 "$SQLITE_DB_PATH" "ALTER TABLE sessions ADD COLUMN session_type TEXT;" 2>/dev/null
 
-        sqlite3 "$SQLITE_DB_PATH" "UPDATE schema_info SET value = '2.0' WHERE key = 'version';" 2>/dev/null
+        _sq3 "$SQLITE_DB_PATH" "UPDATE schema_info SET value = '2.0' WHERE key = 'version';" 2>/dev/null
         if [[ $? -ne 0 ]]; then
             log_error "$SQLITE_MODULE_NAME" "_sqlite_migrate_schema" \
                 "Schema migration v$current_version→v2.0 FAILED"
@@ -619,14 +633,14 @@ MIGRATE_1_5_EOF
             "Migrating schema from v$current_version to v2.1 (disk space snapshot columns)"
 
         local _sess_cols_21
-        _sess_cols_21=$(sqlite3 "$SQLITE_DB_PATH" "SELECT name FROM pragma_table_info('sessions');" 2>/dev/null)
+        _sess_cols_21=$(_sq3 "$SQLITE_DB_PATH" "SELECT name FROM pragma_table_info('sessions');" 2>/dev/null)
 
         echo "$_sess_cols_21" | grep -qx 'disk_free_bytes' || \
-            sqlite3 "$SQLITE_DB_PATH" "ALTER TABLE sessions ADD COLUMN disk_free_bytes INTEGER DEFAULT 0;" 2>/dev/null
+            _sq3 "$SQLITE_DB_PATH" "ALTER TABLE sessions ADD COLUMN disk_free_bytes INTEGER DEFAULT 0;" 2>/dev/null
         echo "$_sess_cols_21" | grep -qx 'disk_total_bytes' || \
-            sqlite3 "$SQLITE_DB_PATH" "ALTER TABLE sessions ADD COLUMN disk_total_bytes INTEGER DEFAULT 0;" 2>/dev/null
+            _sq3 "$SQLITE_DB_PATH" "ALTER TABLE sessions ADD COLUMN disk_total_bytes INTEGER DEFAULT 0;" 2>/dev/null
 
-        if ! sqlite3 "$SQLITE_DB_PATH" "UPDATE schema_info SET value = '2.1' WHERE key = 'version';" 2>/dev/null; then
+        if ! _sq3 "$SQLITE_DB_PATH" "UPDATE schema_info SET value = '2.1' WHERE key = 'version';" 2>/dev/null; then
             log_error "$SQLITE_MODULE_NAME" "_sqlite_migrate_schema" \
                 "Schema migration v$current_version→v2.1 FAILED"
             return 1
@@ -642,7 +656,7 @@ MIGRATE_1_5_EOF
         log_info "$SQLITE_MODULE_NAME" "_sqlite_migrate_schema" \
             "Migrating schema from v$current_version to v2.2 (restore_sessions table)"
 
-        sqlite3 "$SQLITE_DB_PATH" 2>/dev/null << 'MIGRATE_2_2_EOF'
+        _sq3 "$SQLITE_DB_PATH" 2>/dev/null << 'MIGRATE_2_2_EOF'
 CREATE TABLE IF NOT EXISTS restore_sessions (
     id                   INTEGER PRIMARY KEY,
     vm_name              TEXT NOT NULL,
@@ -692,7 +706,7 @@ MIGRATE_2_2_EOF
 _sqlite_create_schema() {
     # Note: Pipe schema to sqlite3 stdin to avoid issues with -- comments
     # being interpreted as command-line options
-    sqlite3 "$SQLITE_DB_PATH" 2>/dev/null << 'SCHEMA_EOF'
+    _sq3 "$SQLITE_DB_PATH" 2>/dev/null << 'SCHEMA_EOF'
 /* Schema version tracking */
 CREATE TABLE IF NOT EXISTS schema_info (
     key   TEXT PRIMARY KEY,
@@ -1002,7 +1016,7 @@ sqlite_session_start() {
     local sql="INSERT INTO sessions (id, instance, start_time, log_file, status, session_type) 
                VALUES ($session_id, '${instance//\'/\'\'}', '$start_time', '${log_file//\'/\'\'}', 'running', '${session_type//\'/\'\'}');"
     
-    if ! sqlite3 "$SQLITE_DB_PATH" "$sql" 2>/dev/null; then
+    if ! _sq3 "$SQLITE_DB_PATH" "$sql" 2>/dev/null; then
         log_error "$SQLITE_MODULE_NAME" "sqlite_session_start" \
             "Failed to create session record"
         return 1
@@ -1055,7 +1069,7 @@ sqlite_session_end() {
     
     # Calculate actual bytes from vm_backups table (more reliable than parsed human format)
     local actual_bytes
-    actual_bytes=$(sqlite3 "$SQLITE_DB_PATH" \
+    actual_bytes=$(_sq3 "$SQLITE_DB_PATH" \
         "SELECT COALESCE(SUM(bytes_written), 0) FROM vm_backups WHERE session_id=$SQLITE_CURRENT_SESSION_ID;" 2>/dev/null)
     if [[ -n "$actual_bytes" ]] && [[ "$actual_bytes" =~ ^[0-9]+$ ]] && [[ "$actual_bytes" -gt 0 ]]; then
         bytes_total="$actual_bytes"
@@ -1091,7 +1105,7 @@ sqlite_session_end() {
         disk_total_bytes = $_disk_total_bytes
         WHERE id = $SQLITE_CURRENT_SESSION_ID;"
     
-    if ! sqlite3 "$SQLITE_DB_PATH" "$sql" 2>/dev/null; then
+    if ! _sq3 "$SQLITE_DB_PATH" "$sql" 2>/dev/null; then
         log_error "$SQLITE_MODULE_NAME" "sqlite_session_end" \
             "Failed to update session record"
         return 1
@@ -1166,7 +1180,7 @@ sqlite_restore_session_start() {
     SELECT last_insert_rowid();"
 
     local rowid
-    rowid=$(sqlite3 "$SQLITE_DB_PATH" "$sql" 2>/dev/null)
+    rowid=$(_sq3 "$SQLITE_DB_PATH" "$sql" 2>/dev/null)
     if [[ -z "$rowid" ]] || ! [[ "$rowid" =~ ^[0-9]+$ ]]; then
         log_error "$SQLITE_MODULE_NAME" "sqlite_restore_session_start" \
             "Failed to create restore_sessions row for vm=$vm_name"
@@ -1247,7 +1261,7 @@ sqlite_restore_session_end() {
         identity_redefined = $identity_redefined
         WHERE id = $session_id;"
 
-    if ! sqlite3 "$SQLITE_DB_PATH" "$sql" 2>/dev/null; then
+    if ! _sq3 "$SQLITE_DB_PATH" "$sql" 2>/dev/null; then
         log_error "$SQLITE_MODULE_NAME" "sqlite_restore_session_end" \
             "Failed to update restore_sessions row id=$session_id"
         return 1
@@ -1415,7 +1429,7 @@ sqlite_log_replication_run() {
     # Combine INSERT and SELECT last_insert_rowid() in single connection
     # to get the correct row ID
     local run_id
-    run_id=$(sqlite3 "$SQLITE_DB_PATH" 2>/dev/null << REPL_SQL
+    run_id=$(_sq3 "$SQLITE_DB_PATH" 2>/dev/null << REPL_SQL
 INSERT INTO replication_runs (
     session_id, endpoint_name, endpoint_type, transport, sync_mode,
     destination, start_time, end_time, duration_sec, bytes_transferred,
@@ -1604,7 +1618,7 @@ sqlite_update_chain_health() {
         esc_policy="'monthly'"
     fi
     
-    sqlite3 "$SQLITE_DB_PATH" << SQL_EOF
+    _sq3 "$SQLITE_DB_PATH" << SQL_EOF
 INSERT INTO chain_health (
     vm_name, period_id, chain_location, chain_status, rotation_policy,
     total_checkpoints, restorable_count, broken_at, 
@@ -1661,7 +1675,7 @@ sqlite_archive_chain() {
     [[ -n "$archive_path" ]] && final_location="$esc_archive"
     
     local _changed
-    _changed=$(sqlite3 "$SQLITE_DB_PATH" << SQL_EOF
+    _changed=$(_sq3 "$SQLITE_DB_PATH" << SQL_EOF
 UPDATE chain_health SET
     chain_status = 'archived',
     chain_location = '$final_location',
@@ -1710,7 +1724,7 @@ sqlite_mark_chain_broken() {
     local now=$(date -u '+%Y-%m-%d %H:%M:%S')
     local restorable=$((broken_at > 0 ? broken_at : 0))
     
-    sqlite3 "$SQLITE_DB_PATH" << SQL_EOF
+    _sq3 "$SQLITE_DB_PATH" << SQL_EOF
 INSERT INTO chain_health (
     vm_name, period_id, chain_location, chain_status,
     total_checkpoints, restorable_count, broken_at, break_reason,
@@ -1772,7 +1786,7 @@ sqlite_mark_chain_deleted() {
     local ts_col="deleted_at"
     [[ "$target_status" == "purged" ]] && ts_col="purged_at"
     
-    sqlite3 "$SQLITE_DB_PATH" << SQL_EOF
+    _sq3 "$SQLITE_DB_PATH" << SQL_EOF
 INSERT INTO chain_health (vm_name, period_id, chain_location, chain_status, created_at, updated_at)
 VALUES ('$esc_vm', '$esc_period', '$esc_location', 'active', '$now', '$now')
 ON CONFLICT(vm_name, period_id) DO NOTHING;
@@ -1828,7 +1842,7 @@ sqlite_mark_chain_deleted_if_exists() {
     local ts_col="deleted_at"
     [[ "$target_status" == "purged" ]] && ts_col="purged_at"
 
-    sqlite3 "$SQLITE_DB_PATH" << SQL_EOF
+    _sq3 "$SQLITE_DB_PATH" << SQL_EOF
 UPDATE chain_health SET
     chain_status = '$esc_status', restorable_count = 0,
     break_reason = '$esc_reason', ${ts_col} = '$now',
@@ -1870,7 +1884,7 @@ sqlite_mark_phantom_chain() {
     esc_p=$(_sql_escape "$period_id")
     now=$(date -u '+%Y-%m-%d %H:%M:%S')
 
-    sqlite3 "$SQLITE_DB_PATH" << SQL_EOF
+    _sq3 "$SQLITE_DB_PATH" << SQL_EOF
 UPDATE chain_health SET
     chain_status='deleted', restorable_count=0,
     break_reason='reconcile_phantom', deleted_at='$now',
@@ -1908,7 +1922,7 @@ sqlite_register_untracked_period() {
     esc_pol=$(_sql_escape "$policy")
     now=$(date -u '+%Y-%m-%d %H:%M:%S')
 
-    sqlite3 "$SQLITE_DB_PATH" << SQL_EOF
+    _sq3 "$SQLITE_DB_PATH" << SQL_EOF
 INSERT OR IGNORE INTO chain_health
     (vm_name, period_id, chain_location, chain_status, rotation_policy, created_at, updated_at)
 VALUES
@@ -1951,7 +1965,7 @@ sqlite_mark_chain_for_deletion() {
     # missing column) must NOT be read as "not protected" — that would let a
     # protected chain be marked. Distinguish a query failure from a real 0 count.
     local protected _rc_prot
-    protected=$(sqlite3 "$SQLITE_DB_PATH" \
+    protected=$(_sq3 "$SQLITE_DB_PATH" \
         "SELECT COUNT(*) FROM chain_health WHERE vm_name='$esc_vm' AND period_id='$esc_period' AND purge_eligible=0;" 2>/dev/null)
     _rc_prot=$?
     if [[ $_rc_prot -ne 0 ]] || ! [[ "$protected" =~ ^[0-9]+$ ]]; then
@@ -1966,7 +1980,7 @@ sqlite_mark_chain_for_deletion() {
     fi
 
     # Ensure row exists (INSERT OR IGNORE), then update
-    sqlite3 "$SQLITE_DB_PATH" << SQL_EOF
+    _sq3 "$SQLITE_DB_PATH" << SQL_EOF
 INSERT INTO chain_health (vm_name, period_id, chain_location, chain_status, created_at, updated_at)
 VALUES ('$esc_vm', '$esc_period', '.', 'active', '$now', '$now')
 ON CONFLICT(vm_name, period_id) DO NOTHING;
@@ -2005,7 +2019,7 @@ sqlite_unmark_chain() {
     local esc_period=$(_sql_escape "$period_id")
     local now=$(date -u '+%Y-%m-%d %H:%M:%S')
 
-    sqlite3 "$SQLITE_DB_PATH" << SQL_EOF
+    _sq3 "$SQLITE_DB_PATH" << SQL_EOF
 UPDATE chain_health SET
     chain_status = 'active',
     marked_at = NULL, marked_by = NULL, updated_at = '$now'
@@ -2037,7 +2051,7 @@ sqlite_protect_chain() {
     local esc_period=$(_sql_escape "$period_id")
     local now=$(date -u '+%Y-%m-%d %H:%M:%S')
 
-    sqlite3 "$SQLITE_DB_PATH" << SQL_EOF
+    _sq3 "$SQLITE_DB_PATH" << SQL_EOF
 INSERT INTO chain_health (vm_name, period_id, chain_location, chain_status, purge_eligible, created_at, updated_at)
 VALUES ('$esc_vm', '$esc_period', '.', 'active', 0, '$now', '$now')
 ON CONFLICT(vm_name, period_id) DO UPDATE SET purge_eligible=0, updated_at='$now';
@@ -2067,7 +2081,7 @@ sqlite_unprotect_chain() {
     local esc_period=$(_sql_escape "$period_id")
     local now=$(date -u '+%Y-%m-%d %H:%M:%S')
 
-    sqlite3 "$SQLITE_DB_PATH" \
+    _sq3 "$SQLITE_DB_PATH" \
         "UPDATE chain_health SET purge_eligible=1, updated_at='$now'
          WHERE vm_name='$esc_vm' AND period_id='$esc_period'
          AND purge_eligible=0;" 2>/dev/null

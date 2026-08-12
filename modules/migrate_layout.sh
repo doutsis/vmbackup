@@ -9,7 +9,7 @@
 # rewrites the catalogue path columns so the existing chain stays addressable
 # and restorable — once, lazily, at cycle start, with zero operator action.
 #
-# Design (hardened by build-spec pass #2 — see copilot/118-spaces.md § MIG-01):
+# Design (hardened by a second design-review pass):
 #   * Run over EVERY libvirt-enumerated VM at cycle start, BEFORE any backup
 #     derives a path (so a fresh chain never lands in the legacy folder).
 #   * Only UNSAFE-named VMs move; a safe name (token == name) is a no-op, so the

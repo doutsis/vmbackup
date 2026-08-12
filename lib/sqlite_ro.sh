@@ -9,15 +9,25 @@
 #   - any consumer that needs to read the vmbackup database without the
 #     full writer module overhead
 #
-# Read-only contract:
+# Read-only contract (FF-176):
 #   - No INSERT / UPDATE / DELETE / CREATE / ALTER statements.
-#   - sqlite_init_readonly opens the DB with PRAGMA query_only=ON.
+#   - query_only is PER-CONNECTION and does NOT persist across connections,
+#     so enforcement is NOT a one-time init setting: EVERY sqlite3 invocation
+#     in this lib runs through the _sqro wrapper, which sets PRAGMA
+#     query_only=ON on that connection before any SQL executes. A write routed
+#     through any query path is refused at statement level ('attempt to write a
+#     readonly database', non-zero rc) and the DB is left byte-unmodified.
+#   - The DB is opened read-write at the file level (NOT mode=ro / -readonly),
+#     so a live WAL (-wal/-shm) is read/recovered normally; refusal is purely
+#     at the SQL statement level.
 #   - WAL mode is set by the writer at sqlite_init_database time; readers
 #     inherit it (concurrent reader/writer is safe).
 #
 # Entry point:
-#   sqlite_init_readonly        # locate DB, set query_only=ON, set
+#   sqlite_init_readonly        # locate DB, smoke-test readability, set
 #                               # SQLITE_DB_PATH and SQLITE_MODULE_AVAILABLE.
+#                               # (Read-only enforcement is per-connection via
+#                               # _sqro, not a persistent init-time setting.)
 #                               # Caller must export BACKUP_PATH (and
 #                               # optionally STATE_DIR) before calling.
 #
@@ -66,6 +76,21 @@ _sqlite_check_dependency() {
     return 0
 }
 
+# FF-176: read-only SQL enforcement wrapper. query_only is PER-CONNECTION and
+# does NOT persist across connections, so EVERY sqlite3 call in this lib routes
+# through _sqro, which sets PRAGMA query_only=ON on the connection BEFORE any
+# positional SQL or heredoc-fed stdin executes. The assignment form
+# 'query_only=ON' is SILENT (emits no result row) — the bare query form
+# 'query_only;' WOULD echo a value and corrupt captured output. -cmd composes
+# with -csv/-header/-separator flags and heredocs. The DB opens in the normal
+# read-write file mode (NOT mode=ro / -readonly), so a live -wal/-shm is
+# read/recovered normally; a write is refused at STATEMENT level ('attempt to
+# write a readonly database', non-zero rc). `command` bypasses any sqlite3
+# shell function; "$@" is set -u safe (vmrestore sources this under set -u).
+_sqro() {
+    command sqlite3 -cmd 'PRAGMA query_only=ON;' "$@"
+}
+
 # Initialize database in read-only mode for --status queries
 # No mkdir, no WAL, no migrations, no session tracking
 # Sets: SQLITE_DB_PATH, SQLITE_MODULE_AVAILABLE
@@ -84,7 +109,7 @@ sqlite_init_readonly() {
         return 1
     fi
 
-    if ! sqlite3 "$SQLITE_DB_PATH" "PRAGMA query_only=ON; SELECT 1;" &>/dev/null; then
+    if ! _sqro "$SQLITE_DB_PATH" "PRAGMA query_only=ON; SELECT 1;" &>/dev/null; then
         echo "Database not accessible: $SQLITE_DB_PATH" >&2
         return 1
     fi
@@ -103,9 +128,9 @@ _sqlite_query_formatted() {
     local sql="$2"
 
     if [[ "$output_mode" == "csv" ]]; then
-        sqlite3 -csv -header "$SQLITE_DB_PATH" "$sql"
+        _sqro -csv -header "$SQLITE_DB_PATH" "$sql"
     else
-        sqlite3 -separator '|' -header "$SQLITE_DB_PATH" "$sql"
+        _sqro -separator '|' -header "$SQLITE_DB_PATH" "$sql"
     fi
 }
 
@@ -165,7 +190,7 @@ sqlite_query_session_vm_backups_display() {
     [[ "$SQLITE_MODULE_AVAILABLE" -ne 1 ]] && return 1
     [[ -z "$session_id" ]] && return 1
 
-    sqlite3 -separator '|' "$SQLITE_DB_PATH" \
+    _sqro -separator '|' "$SQLITE_DB_PATH" \
         "SELECT vm_name,
                 COALESCE(NULLIF(vm_status, ''), '-') as state,
                 CASE WHEN LOWER(COALESCE(backup_type,'')) IN
@@ -204,7 +229,7 @@ sqlite_query_session_retention_summary() {
     [[ "$SQLITE_MODULE_AVAILABLE" -ne 1 ]] && return 1
     [[ -z "$session_id" ]] && return 1
 
-    sqlite3 -separator '|' "$SQLITE_DB_PATH" \
+    _sqro -separator '|' "$SQLITE_DB_PATH" \
         "SELECT COALESCE(COUNT(*), 0) AS actions_total,
                 COALESCE(SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END), 0) AS actions_ok,
                 COALESCE(SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END), 0) AS actions_failed,
@@ -234,7 +259,7 @@ sqlite_query_session_replication_summary() {
     [[ "$SQLITE_MODULE_AVAILABLE" -ne 1 ]] && return 1
     [[ -z "$session_id" ]] && return 1
 
-    sqlite3 -separator '|' "$SQLITE_DB_PATH" \
+    _sqro -separator '|' "$SQLITE_DB_PATH" \
         "SELECT COALESCE(endpoint_name, '<unknown>') AS endpoint_name,
                 COALESCE(endpoint_type, '-')         AS endpoint_type,
                 COALESCE(transport, '-')             AS transport,
@@ -599,7 +624,7 @@ sqlite_query_session_vm_backups() {
         return 1
     fi
 
-    sqlite3 -separator '|' "$SQLITE_DB_PATH" << SQL_EOF
+    _sqro -separator '|' "$SQLITE_DB_PATH" << SQL_EOF
 SELECT vm_name, vm_status, os_type, backup_type, backup_method,
        status, bytes_written, chain_size_bytes, total_dir_bytes,
        restore_points, restore_points_before, duration_sec,
@@ -637,7 +662,7 @@ sqlite_query_session_replication() {
         return 1
     fi
 
-    sqlite3 -separator '|' "$SQLITE_DB_PATH" << SQL_EOF
+    _sqro -separator '|' "$SQLITE_DB_PATH" << SQL_EOF
 SELECT endpoint_name, endpoint_type, transport,
        status, bytes_transferred, files_transferred,
        duration_sec, COALESCE(destination,''),
@@ -663,7 +688,7 @@ sqlite_query_session_summary() {
         return 1
     fi
 
-    sqlite3 -separator '|' "$SQLITE_DB_PATH" << SQL_EOF
+    _sqro -separator '|' "$SQLITE_DB_PATH" << SQL_EOF
 SELECT COALESCE(vms_total,0), COALESCE(vms_success,0),
        COALESCE(vms_failed,0), COALESCE(vms_skipped,0),
        COALESCE(vms_excluded,0), COALESCE(bytes_total,0),
@@ -691,7 +716,7 @@ sqlite_get_last_rotation_policy() {
     fi
     
     local esc_vm_name="${vm_name//\'/\'\'}"
-    sqlite3 "$SQLITE_DB_PATH" \
+    _sqro "$SQLITE_DB_PATH" \
         "SELECT rotation_policy FROM vm_backups 
          WHERE vm_name = '$esc_vm_name' 
            AND status = 'success'
@@ -711,7 +736,7 @@ sqlite_get_schema_version() {
         return 1
     fi
     
-    sqlite3 "$SQLITE_DB_PATH" \
+    _sqro "$SQLITE_DB_PATH" \
         "SELECT value FROM schema_info WHERE key='version';" 2>/dev/null
 }
 
@@ -721,7 +746,7 @@ sqlite_get_schema_version() {
 sqlite_get_marked_chains() {
     [[ "$SQLITE_MODULE_AVAILABLE" -ne 1 ]] && return 1
 
-    sqlite3 -separator $'\t' "$SQLITE_DB_PATH" \
+    _sqro -separator $'\t' "$SQLITE_DB_PATH" \
         "SELECT vm_name, period_id, marked_at, marked_by FROM chain_health
          WHERE chain_status = 'marked' ORDER BY marked_at;" 2>/dev/null
 }
@@ -742,7 +767,7 @@ sqlite_is_session_active() {
     fi
 
     local running_count _rc_q
-    running_count=$(sqlite3 "$SQLITE_DB_PATH" \
+    running_count=$(_sqro "$SQLITE_DB_PATH" \
         "SELECT COUNT(*) FROM sessions WHERE status = 'running';" 2>/dev/null)
     _rc_q=$?
 
@@ -770,7 +795,7 @@ sqlite_get_restorable_chains() {
     local esc_vm
     esc_vm=$(_sql_escape "$vm_name")
     
-    sqlite3 "$SQLITE_DB_PATH" << SQL_EOF
+    _sqro "$SQLITE_DB_PATH" << SQL_EOF
 SELECT json_group_array(json_object(
     'vm_name', vm_name, 'period_id', period_id, 'chain_location', chain_location,
     'chain_status', chain_status, 'restorable_count', restorable_count,
@@ -791,7 +816,7 @@ SQL_EOF
 sqlite_chain_health_summary() {
     [[ "$SQLITE_MODULE_AVAILABLE" -ne 1 ]] && return 1
     
-    sqlite3 -header -column "$SQLITE_DB_PATH" << 'SQL_EOF'
+    _sqro -header -column "$SQLITE_DB_PATH" << 'SQL_EOF'
 SELECT 
     vm_name,
     COUNT(*) as total_chains,
@@ -822,13 +847,13 @@ sqlite_query_previous_config_value() {
     
     # Get current instance from the sessions table
     local current_instance
-    current_instance=$(sqlite3 "$SQLITE_DB_PATH" 2>/dev/null \
+    current_instance=$(_sqro "$SQLITE_DB_PATH" 2>/dev/null \
         "SELECT instance FROM sessions WHERE id = $SQLITE_CURRENT_SESSION_ID LIMIT 1;")
     [[ -z "$current_instance" ]] && return 1
     
     # Query the most recent previous session with the same instance
     local prev_value
-    prev_value=$(sqlite3 "$SQLITE_DB_PATH" 2>/dev/null << PREV_SQL
+    prev_value=$(_sqro "$SQLITE_DB_PATH" 2>/dev/null << PREV_SQL
 SELECT setting_value FROM config_events
 WHERE setting_name = '$(_sql_escape "$setting_name")'
   AND session_id = (
@@ -863,7 +888,7 @@ sqlite_query_previous_config_settings() {
     [[ -z "$SQLITE_CURRENT_SESSION_ID" ]] && return 1
     
     local current_instance
-    current_instance=$(sqlite3 "$SQLITE_DB_PATH" 2>/dev/null \
+    current_instance=$(_sqro "$SQLITE_DB_PATH" 2>/dev/null \
         "SELECT instance FROM sessions WHERE id = $SQLITE_CURRENT_SESSION_ID LIMIT 1;")
     [[ -z "$current_instance" ]] && return 1
     
@@ -871,7 +896,7 @@ sqlite_query_previous_config_settings() {
     # (F-sql862 idiom). '_' in the real prefixes (LOCAL_DEST_ / CLOUD_DEST_) is
     # otherwise LIKE's single-char wildcard; over-match set is empty today,
     # defensive-by-consistency with the two escaped readers below.
-    sqlite3 "$SQLITE_DB_PATH" 2>/dev/null << PREV_SETTINGS_SQL
+    _sqro "$SQLITE_DB_PATH" 2>/dev/null << PREV_SETTINGS_SQL
 SELECT setting_name FROM config_events
 WHERE setting_name LIKE REPLACE(REPLACE('$(_sql_escape "$prefix")','%','\%'),'_','\_') || '%' ESCAPE '\'
   AND event_type = 'config_loaded'
@@ -906,7 +931,7 @@ sqlite_get_protected_chain_count() {
     local esc_vm esc_p out
     esc_vm=$(_sql_escape "$vm")
     esc_p=$(_sql_escape "$period")
-    out=$(sqlite3 "$db_path" \
+    out=$(_sqro "$db_path" \
         "SELECT COUNT(*) FROM chain_health
          WHERE vm_name='$esc_vm' AND period_id='$esc_p'
          AND purge_eligible = 0;" 2>/dev/null) || return 2
@@ -920,7 +945,7 @@ sqlite_get_successful_replication_count() {
     local db_path="$1"
     [[ -z "$db_path" || ! -f "$db_path" ]] && return 1
     local out
-    out=$(sqlite3 "$db_path" \
+    out=$(_sqro "$db_path" \
         "SELECT COUNT(*) FROM replication_runs WHERE status='success';" 2>/dev/null) || return 2
     echo "${out:-0}"
 }
@@ -939,7 +964,7 @@ sqlite_get_vm_period_replication_count() {
     # monthly id over-match same-prefix daily dirs (61→3 live). REPLACE escapes
     # LIKE metachars _/% (period ids have none today; defensive). NOT a trailing
     # '/%' — that matches zero bare-leaf rows → fail-open data loss (F-sql862).
-    out=$(sqlite3 "$db_path" \
+    out=$(_sqro "$db_path" \
         "SELECT COUNT(*) FROM replication_vms rv
          JOIN replication_runs rr ON rv.run_id = rr.id
          WHERE rv.vm_name = '$esc_vm'
@@ -965,7 +990,7 @@ sqlite_get_last_successful_backup_at() {
     # excludes same-prefix daily dirs so orphan-age reads THIS period's newest
     # backup, not a foreign daily's. NOT trailing '/%' (zero rows → age 9999 →
     # delete-everything). F-sql862.
-    out=$(sqlite3 "$db_path" \
+    out=$(_sqro "$db_path" \
         "SELECT MAX(created_at) FROM vm_backups
          WHERE vm_name='$esc_vm'
          AND backup_path LIKE '%/' || REPLACE(REPLACE('$esc_p','%','\%'),'_','\_') ESCAPE '\'
@@ -981,7 +1006,7 @@ sqlite_get_tracked_periods() {
     [[ -z "$db_path" || ! -f "$db_path" ]] && return 1
     local esc_vm
     esc_vm=$(_sql_escape "$vm")
-    sqlite3 "$db_path" \
+    _sqro "$db_path" \
         "SELECT period_id FROM chain_health
          WHERE vm_name='$esc_vm'
          AND chain_status IN ('active', 'archived', 'broken', 'marked');" 2>/dev/null \
@@ -997,7 +1022,7 @@ sqlite_chain_period_exists_count() {
     local esc_vm esc_p out
     esc_vm=$(_sql_escape "$vm")
     esc_p=$(_sql_escape "$period")
-    out=$(sqlite3 "$db_path" \
+    out=$(_sqro "$db_path" \
         "SELECT COUNT(*) FROM chain_health
          WHERE vm_name='$esc_vm' AND period_id='$esc_p';" 2>/dev/null) || return 2
     echo "${out:-0}"
@@ -1014,7 +1039,7 @@ sqlite_get_chain_created_count() {
     local esc_vm esc_chain out
     esc_vm=$(_sql_escape "$vm")
     esc_chain=$(_sql_escape "$chain")
-    out=$(sqlite3 "$db_path" \
+    out=$(_sqro "$db_path" \
         "SELECT COUNT(*) FROM chain_events
          WHERE vm_name='$esc_vm' AND chain_id='$esc_chain'
          AND event_type='chain_created';" 2>/dev/null) || return 2
@@ -1029,7 +1054,7 @@ sqlite_get_chain_created_count() {
 sqlite_query_chain_health_email() {
     [[ "${SQLITE_MODULE_AVAILABLE:-0}" -ne 1 ]] && return 1
     [[ -z "${SQLITE_DB_PATH:-}" ]] && return 1
-    sqlite3 -separator '|' "$SQLITE_DB_PATH" \
+    _sqro -separator '|' "$SQLITE_DB_PATH" \
         "SELECT vm_name,
                 COUNT(*) as total_chains,
                 SUM(CASE WHEN chain_status='active' THEN 1 ELSE 0 END) as active,

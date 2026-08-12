@@ -58,28 +58,67 @@ create_lock() {
 
   mkdir -p "$LOCK_DIR"
 
-  # Check for stale locks
-  if [[ -f "$lock_file" ]]; then
-    local locked_pid=$(cat "$lock_file" 2>/dev/null)
+  # Bounded acquire loop. The reap of a stale (dead/reused-PID) lock is the RACE
+  # SEAM (FF-196). The old check-then-rm-then-create was non-atomic: a reaper
+  # descheduled (SIGSTOP / NFS stall / starvation) BETWEEN judging the lock stale
+  # and its `rm -f "$lock_file"` would, on resume, delete BY PATH whatever now sat
+  # at "$lock_file" - including a sibling's freshly-acquired lock - yielding TWO
+  # winners for one VM. We instead reap by atomically CLAIMING the CURRENT inode
+  # via rename: mv "$lock_file" into a name only THIS process owns. rename is
+  # atomic, so of N concurrent reapers exactly one moves a given inode - but the
+  # SAFETY INVARIANT is the content re-check below, not the mv: the claim may be a
+  # lock a sibling acquired since the judgment, so we act ONLY on the file we
+  # uniquely own, delete it ONLY after re-verifying it is the judged stale holder,
+  # and NEVER rm "$lock_file" by path after a stale judgment - so a sibling that
+  # has since acquired a NEW "$lock_file" inode (via the noclobber create) can
+  # never be deleted by us. A claimer resumed after a stall holds a uniquely-named
+  # file no one can recreate: deleting THAT harms nobody, and its retry is a
+  # normal noclobber race it can only win if free.
+  local _attempt locked_pid _claim _claimed_pid
+  for (( _attempt=0; _attempt<10; _attempt++ )); do
+    # Fast path / acquire: atomic O_EXCL create. A free path -> we win outright.
+    if ( set -o noclobber; echo "$$" > "$lock_file" ) 2>/dev/null; then
+      log_debug "vm_lock.sh" "create_lock" "Lock acquired for VM '$vm_name' (PID $$, file=$lock_file)"
+      return 0
+    fi
 
+    # Path occupied. Identify the holder from the current file content.
+    locked_pid=$(cat "$lock_file" 2>/dev/null)
     if vm_lock_holder_live "$locked_pid"; then
       # Live legitimate holder (vmbackup/vmrestore/virtnbdbackup) — leave it alone.
       return 1
-    else
+    fi
+
+    # Stale (dead/reused PID). Atomically claim the CURRENT inode. If the rename
+    # fails, another reaper already moved/removed it - just retry the acquire. The
+    # transient name is ".reap-*.lock": it does NOT match the vmbackup-*.lock
+    # namespace globbed by the session reaper / cleanup / emergency sites (so it can
+    # never be mis-reaped or wedge them) yet ends in .lock, so the cloud **/*.lock
+    # exclude and the staging locks/ exclude both drop it from replication.
+    _claim="${LOCK_DIR}/.reap-$$-${_attempt}-${RANDOM}.lock"
+    mv "$lock_file" "$_claim" 2>/dev/null || continue
+
+    # We now uniquely own "$_claim"; "$lock_file" is free. The claimed file's
+    # content is frozen (no other process references this name), so this check
+    # stays valid across ANY stall. Remove it ONLY if it is the SAME dead holder we
+    # judged: a different pid means our rename grabbed a lock a sibling acquired
+    # between the judgment and the mv - never delete THAT; hand its content back to
+    # the free path via noclobber (never clobbering a still-newer winner), stand down.
+    _claimed_pid=$(cat "$_claim" 2>/dev/null)
+    if [[ "$_claimed_pid" == "$locked_pid" ]] && ! vm_lock_holder_live "$_claimed_pid"; then
       log_warn "vm_lock.sh" "create_lock" \
         "Stale lock detected for VM: $vm_name (PID $locked_pid dead or reused) - removing and proceeding"
-      rm -f "$lock_file"
+      rm -f "$_claim"
+      # Loop: retry the noclobber acquire against the now-free path.
+    else
+      ( set -o noclobber; echo "$_claimed_pid" > "$lock_file" ) 2>/dev/null
+      rm -f "$_claim"
+      return 1
     fi
-  fi
+  done
 
-  # Atomic lock creation with noclobber — only one process can succeed
-  if ( set -o noclobber; echo "$$" > "$lock_file" ) 2>/dev/null; then
-    log_debug "vm_lock.sh" "create_lock" "Lock acquired for VM '$vm_name' (PID $$, file=$lock_file)"
-    return 0
-  else
-    log_debug "vm_lock.sh" "create_lock" "Lock acquisition FAILED for VM '$vm_name' (another process holds lock)"
-    return 1
-  fi
+  log_debug "vm_lock.sh" "create_lock" "Lock acquisition FAILED for VM '$vm_name' (another process holds lock)"
+  return 1
 }
 
 # Remove lock file

@@ -538,8 +538,8 @@ backup_vm_tpm() {
 
 # INT-08 (2026-05-23): restore_vm_tpm() removed — dead code per Phase 5
 # audit. vmrestore.sh has its own restore_tpm() implementation that is the
-# sole production path. Zero callers across the codebase (excluding archive/
-# and copilot/). Original body preserved in git history.
+# sole production path. Zero callers across the codebase. Original body
+# preserved in git history.
 
 ##############################################################################
 # Reporting Functions

@@ -323,6 +323,8 @@ All backup and restore activity is logged to a SQLite database at `$BACKUP_PATH/
 
 `vmbackup --status` covers eight report modes: sessions, VM history, failures, replication, chains, storage, policies and restores.
 
+The catalogue is an **observability layer, not a restore dependency**. `vmrestore` reconstructs from the backup tree itself and falls back to walking the disk when no catalogue is present, so disaster recovery on a fresh host works with the backup data alone. Replication reflects this: it copies completed catalogue snapshots rather than the live database — see [Replication Architecture](vmbackup.md#what-is-replicated).
+
 ## Replication
 
 Replication runs after backup completes. Local and cloud replication operate independently and can run in parallel or sequentially.
@@ -389,9 +391,21 @@ Linux guests are unaffected. SATA guests also work fine.
 
 Full details, performance benchmarks and step-by-step XML instructions: [VirtIO discard_granularity & Windows TRIM Performance](vmbackup.md#virtio-discard_granularity--windows-trim-performance).
 
-### Empty `.chain-*` marker directories for offline VMs
+### Large backup sets: nightly stopped at 12 hours
 
-**Fixed in 0.6.1.** Earlier releases left an empty hidden `.chain-<timestamp>/` directory under a skipped VM's backup path on every run — harmless clutter that contained nothing and never affected the backups themselves. New backups no longer create these markers, and any empty markers left behind by earlier releases are swept automatically during routine retention — no manual cleanup required.
+The shipped systemd unit allows a backup run 12 hours. That budget covers the replication upload as well as the backups, so on a large backup set — most often the night a new backup period starts, when every VM takes a full backup and the previous period's chain is re-uploaded — the run can legitimately exceed it. systemd then stops it, and the session is reported as `killed`.
+
+Nothing is lost: the backups already written are on disk and restorable, and the next run reconciles the offsite copy. What is lost is the remainder of that night's upload, and the run reports as killed rather than as having run out of time.
+
+**Fix:** raise the limit with a drop-in, keeping it below your backup interval so a long run always releases its lock before the next run starts:
+
+```bash
+sudo systemctl edit vmbackup.service
+```
+```ini
+[Service]
+TimeoutStartSec=23h
+```
 
 ## Issues
 
